@@ -126,4 +126,20 @@ impl ModelForward for Qwen3Model {
     fn is_stop_token(&self, token_id: u32) -> bool {
         self.config.is_stop_token(token_id)
     }
+
+    fn forward_decode_batch(
+        &self,
+        tokens: &[u32],
+        states: &mut [Self::State],
+        slot_indices: &[usize],
+    ) -> Result<()> {
+        if tokens.len() <= 1 {
+            // Fall back to single-token path for bs=1 (benefits from CUDA Graph)
+            if tokens.len() == 1 {
+                return self.forward(&[tokens[0]], &mut states[slot_indices[0]]);
+            }
+            return Ok(());
+        }
+        self.decode_batch(tokens, states, slot_indices)
+    }
 }

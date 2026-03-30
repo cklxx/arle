@@ -45,4 +45,22 @@ pub trait ModelForward: Send {
         rng: &mut StdRng,
     ) -> Result<u32>;
     fn is_stop_token(&self, token_id: u32) -> bool;
+
+    /// Batched decode: process B tokens from B requests in one forward pass.
+    ///
+    /// `tokens[b]` is decoded using `states[slot_indices[b]]`. Uses GEMM for
+    /// linear projections (batched) and per-request attention.
+    ///
+    /// Default implementation falls back to sequential `forward()` calls.
+    fn forward_decode_batch(
+        &self,
+        tokens: &[u32],
+        states: &mut [Self::State],
+        slot_indices: &[usize],
+    ) -> Result<()> {
+        for (i, &token) in tokens.iter().enumerate() {
+            self.forward(&[token], &mut states[slot_indices[i]])?;
+        }
+        Ok(())
+    }
 }
