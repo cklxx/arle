@@ -70,11 +70,12 @@ async fn completions(
             req.stop_token_ids,
         ),
         stop: req.stop,
+        priority: Default::default(),
         delta_tx,
     };
 
-    if !state.handle.submit(incoming) {
-        error!("Scheduler unavailable");
+    if let Err(e) = state.handle.submit(incoming) {
+        error!("Scheduler unavailable or full: {e}");
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -188,11 +189,12 @@ async fn chat_completions(
             req.stop_token_ids,
         ),
         stop: req.stop,
+        priority: Default::default(),
         delta_tx,
     };
 
-    if !state.handle.submit(incoming) {
-        error!("Scheduler unavailable");
+    if let Err(e) = state.handle.submit(incoming) {
+        error!("Scheduler unavailable or full: {e}");
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 

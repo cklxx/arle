@@ -16,6 +16,7 @@
 //! 4. Starting new prefills only when no decode work is pending
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -39,6 +40,76 @@ use crate::tokenizer::Tokenizer;
 const PREFILL_CHUNK_SIZE: usize = 512;
 
 // ============================================================================
+// SchedulerConfig — always available
+// ============================================================================
+
+/// Preemption strategy when GPU memory is exhausted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum PreemptionMode {
+    /// Evict request KV cache and recompute from scratch when resumed.
+    /// Cheaper in GPU memory, more expensive when rescheduled.
+    #[default]
+    Recompute,
+    /// Swap KV cache to CPU memory and swap back in when resumed.
+    /// Preserves decoded state at the cost of CPU memory.
+    Swap,
+}
+
+/// Scheduler configuration.
+#[derive(Clone, Debug)]
+pub struct SchedulerConfig {
+    /// Maximum number of concurrently active request slots.
+    pub max_slots: usize,
+    /// Chunked prefill chunk size (tokens per prefill step).
+    pub prefill_chunk_size: usize,
+    /// Maximum requests allowed in the waiting queue.
+    /// `submit()` returns `Err(SchedulerFull)` when the queue is at capacity.
+    pub max_waiting_requests: usize,
+    /// Strategy to use when a running request must be preempted.
+    pub preemption_mode: PreemptionMode,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            max_slots: 4,
+            prefill_chunk_size: 512,
+            max_waiting_requests: 256,
+            preemption_mode: PreemptionMode::Recompute,
+        }
+    }
+}
+
+impl SchedulerConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.max_slots == 0 {
+            anyhow::bail!("max_slots must be ≥ 1");
+        }
+        if self.prefill_chunk_size == 0 {
+            anyhow::bail!("prefill_chunk_size must be ≥ 1");
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// RequestPriority — always available
+// ============================================================================
+
+/// Request priority level.  Higher-priority requests are scheduled first
+/// when multiple requests are waiting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]
+pub enum RequestPriority {
+    /// Below-normal priority (background batch jobs).
+    Low = 0,
+    /// Standard priority (default for API requests).
+    #[default]
+    Normal = 1,
+    /// Above-normal priority (interactive / SLA-sensitive requests).
+    High = 2,
+}
+
+// ============================================================================
 // Public types
 // ============================================================================
 
@@ -48,6 +119,8 @@ pub struct IncomingRequest {
     pub max_tokens: usize,
     pub sampling: SamplingParams,
     pub stop: Option<Vec<String>>,
+    /// Scheduling priority. Higher-priority requests are served first.
+    pub priority: RequestPriority,
     /// Channel to send streaming deltas back to the HTTP handler.
     pub delta_tx: mpsc::UnboundedSender<StreamDelta>,
 }
@@ -60,11 +133,27 @@ pub struct SchedulerStats {
     pub total_generated_tokens: u64,
 }
 
+/// Error returned when the scheduler's waiting queue is full.
+#[derive(Debug)]
+pub struct SchedulerFull;
+
+impl std::fmt::Display for SchedulerFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "scheduler waiting queue is full")
+    }
+}
+
+impl std::error::Error for SchedulerFull {}
+
 /// Handle for submitting requests to the scheduler. Cloneable and Send.
 #[derive(Clone)]
 pub struct SchedulerHandle {
     tx: mpsc::UnboundedSender<IncomingRequest>,
     model_id: Arc<str>,
+    /// Shared count of items currently in the waiting channel.
+    waiting_count: Arc<AtomicUsize>,
+    /// Maximum allowed waiting requests (0 = unlimited).
+    max_waiting: usize,
 }
 
 impl SchedulerHandle {
@@ -73,16 +162,62 @@ impl SchedulerHandle {
         Self {
             tx,
             model_id: Arc::from(model_id),
+            waiting_count: Arc::new(AtomicUsize::new(0)),
+            max_waiting: 0,
         }
     }
 
-    /// Submit a request to the scheduler. Returns false if scheduler is shut down.
-    pub fn submit(&self, req: IncomingRequest) -> bool {
-        self.tx.send(req).is_ok()
+    /// Create a handle with a maximum waiting queue size.
+    pub fn with_max_waiting(
+        tx: mpsc::UnboundedSender<IncomingRequest>,
+        model_id: &str,
+        max_waiting: usize,
+    ) -> Self {
+        Self {
+            tx,
+            model_id: Arc::from(model_id),
+            waiting_count: Arc::new(AtomicUsize::new(0)),
+            max_waiting,
+        }
+    }
+
+    /// Submit a request to the scheduler.
+    ///
+    /// Returns `Ok(())` on success.
+    /// Returns `Err(SchedulerFull)` if the waiting queue is at capacity.
+    /// Returns `Err(SchedulerFull)` if the scheduler has shut down.
+    pub fn submit(&self, req: IncomingRequest) -> std::result::Result<(), SchedulerFull> {
+        // Backpressure check.
+        if self.max_waiting > 0 {
+            let current = self.waiting_count.load(Ordering::Relaxed);
+            if current >= self.max_waiting {
+                return Err(SchedulerFull);
+            }
+        }
+        self.waiting_count.fetch_add(1, Ordering::Relaxed);
+        self.tx.send(req).map_err(|_| {
+            self.waiting_count.fetch_sub(1, Ordering::Relaxed);
+            SchedulerFull
+        })
+    }
+
+    /// Decrement the waiting count (called by the scheduler when it consumes a request).
+    pub fn consume_one(&self) {
+        self.waiting_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Current number of requests in the waiting channel.
+    pub fn waiting_count(&self) -> usize {
+        self.waiting_count.load(Ordering::Relaxed)
     }
 
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// Whether the queue is currently full.
+    pub fn is_full(&self) -> bool {
+        self.max_waiting > 0 && self.waiting_count() >= self.max_waiting
     }
 }
 
@@ -698,5 +833,115 @@ impl<M: ModelForward> Scheduler<M> {
                 i += 1;
             }
         }
+    }
+}
+
+// ============================================================================
+// CPU-verifiable tests (no GPU required)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sampler::SamplingParams;
+    use crate::server_engine::StreamDelta;
+
+    fn make_request() -> IncomingRequest {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<StreamDelta>();
+        IncomingRequest {
+            prompt: "hello".to_string(),
+            max_tokens: 32,
+            sampling: SamplingParams::default(),
+            stop: None,
+            priority: RequestPriority::Normal,
+            delta_tx: tx,
+        }
+    }
+
+    // ---------------------------------------------------------------- SchedulerConfig
+
+    #[test]
+    fn scheduler_config_default_valid() {
+        SchedulerConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn scheduler_config_zero_slots_invalid() {
+        let cfg = SchedulerConfig { max_slots: 0, ..Default::default() };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_zero_chunk_invalid() {
+        let cfg = SchedulerConfig { prefill_chunk_size: 0, ..Default::default() };
+        assert!(cfg.validate().is_err());
+    }
+
+    // ---------------------------------------------------------------- RequestPriority ordering
+
+    #[test]
+    fn priority_ordering() {
+        assert!(RequestPriority::High > RequestPriority::Normal);
+        assert!(RequestPriority::Normal > RequestPriority::Low);
+    }
+
+    #[test]
+    fn priority_default_is_normal() {
+        assert_eq!(RequestPriority::default(), RequestPriority::Normal);
+    }
+
+    // ---------------------------------------------------------------- SchedulerHandle backpressure
+
+    #[tokio::test]
+    async fn submit_succeeds_when_queue_not_full() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SchedulerHandle::with_max_waiting(tx, "test", 3);
+        assert!(handle.submit(make_request()).is_ok());
+        assert!(handle.submit(make_request()).is_ok());
+        assert!(handle.submit(make_request()).is_ok());
+        assert_eq!(handle.waiting_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn submit_fails_when_queue_full() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SchedulerHandle::with_max_waiting(tx, "test", 2);
+        assert!(handle.submit(make_request()).is_ok());
+        assert!(handle.submit(make_request()).is_ok());
+        assert!(handle.submit(make_request()).is_err());
+        assert!(handle.is_full());
+    }
+
+    #[tokio::test]
+    async fn consume_decrements_waiting_count() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SchedulerHandle::with_max_waiting(tx, "test", 5);
+        handle.submit(make_request()).unwrap();
+        handle.submit(make_request()).unwrap();
+        assert_eq!(handle.waiting_count(), 2);
+        handle.consume_one();
+        assert_eq!(handle.waiting_count(), 1);
+        handle.submit(make_request()).unwrap();
+        handle.submit(make_request()).unwrap();
+        handle.submit(make_request()).unwrap();
+        handle.submit(make_request()).unwrap();
+        assert_eq!(handle.waiting_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn unlimited_queue_never_rejects() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SchedulerHandle::from_parts(tx, "test");
+        for _ in 0..100 {
+            assert!(handle.submit(make_request()).is_ok());
+        }
+        assert_eq!(handle.waiting_count(), 100);
+    }
+
+    // ---------------------------------------------------------------- PreemptionMode
+
+    #[test]
+    fn preemption_mode_default_is_recompute() {
+        assert_eq!(PreemptionMode::default(), PreemptionMode::Recompute);
     }
 }

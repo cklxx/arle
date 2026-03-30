@@ -48,6 +48,7 @@ cc = "1.0"
 criterion = { version = "0.8", features = ["html_reports"] }
 base64 = "0.22"
 tower = "0.5"
+tempfile = "3"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -2 }
