@@ -674,6 +674,14 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
 }
 
 fn main() {
+    // When the `no-cuda` feature is active (e.g. macOS dev machines without a GPU),
+    // skip all CUDA/Triton compilation. GPU ops will panic at runtime.
+    if std::env::var("CARGO_FEATURE_NO_CUDA").is_ok() {
+        println!("cargo:warning=no-cuda feature active: skipping CUDA/Triton kernel compilation.");
+        println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_CUDA");
+        return;
+    }
+
     let cuda_path = std::env::var("CUDA_HOME")
         .or_else(|_| std::env::var("CUDA_PATH"))
         .unwrap_or_else(|_| "/usr/local/cuda".to_string());

@@ -1,20 +1,29 @@
 use std::fmt;
+#[cfg(feature = "cuda")]
 use std::path::Path;
+#[cfg(feature = "cuda")]
 use std::time::Instant;
 
 use anyhow::Result;
+#[cfg(feature = "cuda")]
 use fastrace::local::LocalSpan;
+#[cfg(feature = "cuda")]
 use log::{debug, info};
+#[cfg(feature = "cuda")]
 use rand::SeedableRng;
+#[cfg(feature = "cuda")]
 use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedSender;
 
+#[cfg(feature = "cuda")]
 use crate::model::{GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model};
 use crate::sampler::SamplingParams;
+#[cfg(feature = "cuda")]
 use crate::tokenizer::Tokenizer;
 
 /// Truncate at the first occurrence of any stop string (OpenAI-compatible).
 /// Returns the prefix of `text` up to (but not including) the earliest stop.
+#[cfg(feature = "cuda")]
 fn truncate_at_first_stop(text: &str, stops: &[String]) -> Option<String> {
     let mut earliest = None::<usize>;
     for s in stops {
@@ -35,6 +44,7 @@ fn truncate_at_first_stop(text: &str, stops: &[String]) -> Option<String> {
 /// If `new_full` (accumulated text) ends with any of `stops`, return the delta to send
 /// (from `sent_len` up to but not including the stop) and the matching stop.
 /// Prefers the longest matching stop when several match at the end.
+#[cfg(feature = "cuda")]
 fn truncate_at_stop<'a>(
     new_full: &str,
     sent_len: usize,
@@ -118,15 +128,17 @@ pub trait ServerEngine: Send {
 }
 
 // ============================================================================
-// Model type detection
+// Model type detection (CUDA-only — requires model weights + GPU)
 // ============================================================================
 
+#[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelType {
     Qwen3,
     Qwen35,
 }
 
+#[cfg(feature = "cuda")]
 impl fmt::Display for ModelType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -137,6 +149,7 @@ impl fmt::Display for ModelType {
 }
 
 /// Detect model type from config.json.
+#[cfg(feature = "cuda")]
 pub fn detect_model_type(model_path: &str) -> Result<ModelType> {
     let config_path = format!("{}/config.json", model_path);
     let content = std::fs::read_to_string(&config_path)?;
@@ -153,11 +166,13 @@ pub fn detect_model_type(model_path: &str) -> Result<ModelType> {
 // Engine options
 // ============================================================================
 
+#[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug)]
 pub struct EngineOptions {
     pub enable_cuda_graph: bool,
 }
 
+#[cfg(feature = "cuda")]
 impl Default for EngineOptions {
     fn default() -> Self {
         Self {
@@ -170,12 +185,14 @@ impl Default for EngineOptions {
 // Shared generation loop — uses ModelForward trait
 // ============================================================================
 
+#[cfg(feature = "cuda")]
 struct StreamingStats {
     emitted_tokens: usize,
     hit_eos: bool,
     consumer_dropped: bool,
 }
 
+#[cfg(feature = "cuda")]
 fn generate<M: ModelForward>(
     model: &M,
     state: &mut M::State,
@@ -251,6 +268,7 @@ fn generate<M: ModelForward>(
     Ok(tokens)
 }
 
+#[cfg(feature = "cuda")]
 fn generate_streaming_with_callback<M: ModelForward>(
     model: &M,
     state: &mut M::State,
@@ -348,6 +366,7 @@ fn generate_streaming_with_callback<M: ModelForward>(
 // Generic server engine — shared complete/complete_stream logic
 // ============================================================================
 
+#[cfg(feature = "cuda")]
 pub struct GenericServerEngine<M: ModelForward> {
     model_id: String,
     model: M,
@@ -358,6 +377,7 @@ pub struct GenericServerEngine<M: ModelForward> {
     cached_prompt: Vec<u32>,
 }
 
+#[cfg(feature = "cuda")]
 impl<M: ModelForward> GenericServerEngine<M> {
     /// Set the maximum KV cache tokens to keep on GPU.
     /// Tokens beyond this are offloaded to CPU. Used to simulate memory pressure.
@@ -417,6 +437,7 @@ impl<M: ModelForward> GenericServerEngine<M> {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
     fn model_id(&self) -> &str {
         &self.model_id
@@ -621,6 +642,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
 // Public engine constructors
 // ============================================================================
 
+#[cfg(feature = "cuda")]
 pub fn model_id_from_path(model_path: &str) -> String {
     Path::new(model_path)
         .file_name()
@@ -629,9 +651,12 @@ pub fn model_id_from_path(model_path: &str) -> String {
         .to_string()
 }
 
+#[cfg(feature = "cuda")]
 pub type RealServerEngine = GenericServerEngine<Qwen3Model>;
+#[cfg(feature = "cuda")]
 pub type Qwen35ServerEngine = GenericServerEngine<Qwen35Model>;
 
+#[cfg(feature = "cuda")]
 impl RealServerEngine {
     pub fn load(model_path: &str, seed: u64) -> Result<Self> {
         Self::load_with_options(model_path, seed, EngineOptions::default())
@@ -662,6 +687,7 @@ impl RealServerEngine {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl Qwen35ServerEngine {
     pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(model_path)?;
@@ -684,7 +710,7 @@ impl Qwen35ServerEngine {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::{truncate_at_first_stop, truncate_at_stop};
 
