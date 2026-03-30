@@ -85,7 +85,10 @@ impl AsyncEngine<SingleIn<String>, ManyOut<Annotated<String>>, Error> for AgentE
         }
 
         let response_stream = stream::iter(results);
-        Ok(ResponseStream::new(Box::pin(response_stream), ctx.context()))
+        Ok(ResponseStream::new(
+            Box::pin(response_stream),
+            ctx.context(),
+        ))
     }
 }
 

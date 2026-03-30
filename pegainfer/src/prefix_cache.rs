@@ -115,7 +115,7 @@ impl RadixCache {
     }
 
     /// Returns the root node index (always 0).
-    fn root(&self) -> usize {
+    fn root() -> usize {
         0
     }
 
@@ -134,7 +134,7 @@ impl RadixCache {
     /// when the request is done with them.
     pub fn lookup(&mut self, tokens: &[u32]) -> (usize, Vec<BlockId>) {
         let now = self.tick();
-        let mut node_idx = self.root();
+        let mut node_idx = Self::root();
         let mut pos = 0;
         let mut matched_blocks = Vec::new();
 
@@ -147,9 +147,8 @@ impl RadixCache {
             }
 
             let next_token = tokens[pos];
-            let child_idx = match self.nodes[node_idx].children.get(&next_token).copied() {
-                Some(idx) => idx,
-                None => break,
+            let Some(child_idx) = self.nodes[node_idx].children.get(&next_token).copied() else {
+                break;
             };
 
             // Check how many tokens of the child's edge match.
@@ -212,7 +211,7 @@ impl RadixCache {
         let tokens = &tokens[..tokens.len().min(total_tokens)];
         let now = self.tick();
 
-        let mut node_idx = self.root();
+        let mut node_idx = Self::root();
         let mut pos = 0;
         let mut block_idx = 0;
 
@@ -260,15 +259,11 @@ impl RadixCache {
                     self.nodes[child_idx].children = old_children;
 
                     let first_old = self.nodes[child_idx].tokens[0];
-                    self.nodes[shared_idx]
-                        .children
-                        .insert(first_old, child_idx);
+                    self.nodes[shared_idx].children.insert(first_old, child_idx);
 
                     // Replace the original child pointer with the shared node.
                     self.nodes[node_idx].children.insert(next_token, shared_idx);
 
-                    pos += split_point;
-                    node_idx = shared_idx;
                     // Don't advance block_idx — the shared node has < block_size tokens.
                     break;
                 }
@@ -345,7 +340,7 @@ impl RadixCache {
             .iter()
             .enumerate()
             .filter(|(idx, node)| {
-                *idx != self.root()
+                *idx != Self::root()
                     && node.is_leaf()
                     && node.ref_count == 0
                     && node.block_id.is_some()
@@ -368,11 +363,11 @@ impl RadixCache {
 
         // Remove evicted leaf nodes from their parents.
         // We do this by scanning all nodes for children pointing to evicted nodes.
-        let evicted_set: std::collections::HashSet<usize> =
-            to_evict.iter().copied().collect();
+        let evicted_set: std::collections::HashSet<usize> = to_evict.iter().copied().collect();
 
         for node in &mut self.nodes {
-            node.children.retain(|_, child_idx| !evicted_set.contains(child_idx));
+            node.children
+                .retain(|_, child_idx| !evicted_set.contains(child_idx));
         }
 
         freed
@@ -389,10 +384,7 @@ impl RadixCache {
 
     /// Number of cached blocks (nodes with a `block_id`).
     pub fn cached_block_count(&self) -> usize {
-        self.nodes
-            .iter()
-            .filter(|n| n.block_id.is_some())
-            .count()
+        self.nodes.iter().filter(|n| n.block_id.is_some()).count()
     }
 }
 

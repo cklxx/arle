@@ -228,23 +228,32 @@ FFI bindings are declared in `pegainfer/src/ffi.rs`.
 | Decode attention kernel (Triton) | ✅ |
 | KV cache with CPU offload | ✅ |
 | CUDA graph for decode | ✅ |
+| CUDA graph batch pool (CPU tracking + GPU stub) | ✅ |
 | Continuous batching scheduler | ✅ |
 | Chunked prefill (512-token chunks) | ✅ |
 | Decode-priority scheduling | ✅ |
-| top-k / top-p / temperature sampling | ✅ |
+| Request priority + backpressure | ✅ |
+| top-k / top-p / temperature / min-p sampling | ✅ |
+| Repetition / frequency / presence penalties | ✅ |
 | OpenAI `/v1/completions` API | ✅ |
+| OpenAI `/v1/chat/completions` API | ✅ |
 | SSE streaming | ✅ |
+| Prometheus `/metrics` endpoint | ✅ |
+| Stats `/v1/stats` endpoint | ✅ |
+| Model architecture registry (9 architectures) | ✅ |
+| Quantization format detection (GPTQ/AWQ/FP8/INT8/GGUF) | ✅ (detection only) |
+| Radix tree prefix cache (data structure) | ✅ (CPU, not yet GPU-wired) |
+| Paged KV block manager (accounting) | ✅ (CPU, not yet GPU-wired) |
+| Speculative decoding framework | ✅ (CPU stubs, GPU pending) |
+| Tensor parallel config + sharding math | ✅ (CPU, NCCL stubs) |
 | Rust agent binary (tool calling) | ✅ |
 | Python agent (async HTTP) | ✅ |
 | Dynamo distributed runtime integration | ✅ (optional feature) |
-| Radix tree prefix caching | ❌ |
-| PagedAttention | ❌ |
+| PagedAttention CUDA kernel | ❌ |
 | Llama / DeepSeek / Mistral / Gemma / Phi models | ❌ |
 | FlashAttention-3 | ❌ |
 | MLA attention (DeepSeek) | ❌ |
-| Repetition penalty / beam search | ❌ |
-| Speculative decoding | ❌ |
-| Tensor/Pipeline parallel | ❌ |
-| Quantization (GPTQ/AWQ/FP8/INT8) | ❌ |
-| `/v1/chat/completions` API | ❌ |
+| Beam search | ❌ |
+| Quantization GPU kernels (GPTQ/AWQ/FP8/INT8) | ❌ |
+| NCCL all-reduce / all-gather | ❌ |
 | Benchmark suite (TTFT/TBT) | partial |

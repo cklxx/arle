@@ -13,8 +13,7 @@ use clap::Parser;
 use log::info;
 
 use pegainfer::server_engine::{
-    EngineOptions, ModelType, Qwen35ServerEngine, RealServerEngine, ServerEngine,
-    detect_model_type,
+    EngineOptions, ModelType, Qwen35ServerEngine, RealServerEngine, ServerEngine, detect_model_type,
 };
 
 use crate::tools::builtin_tools;
@@ -66,8 +65,18 @@ fn run_repl(
     println!();
     println!("=== agent-infer REPL ===");
     println!("Model: {}", engine.model_id());
-    println!("Tools: {}", tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "));
-    println!("Max turns: {}, Max tokens: {}, Temperature: {}", max_turns, max_tokens, temperature);
+    println!(
+        "Tools: {}",
+        tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "Max turns: {}, Max tokens: {}, Temperature: {}",
+        max_turns, max_tokens, temperature
+    );
     println!("Type your query and press Enter. Type 'quit' or 'exit' to stop.");
     println!();
 
@@ -124,7 +133,7 @@ fn main() -> Result<()> {
         {
             use pegainfer::model::{ModelRuntimeConfig, Qwen3Model, Qwen35Model};
             use pegainfer::scheduler::Scheduler;
-            use pegainfer::server_engine::{model_id_from_path, detect_model_type as detect};
+            use pegainfer::server_engine::{detect_model_type as detect, model_id_from_path};
             use pegainfer::tokenizer::Tokenizer;
 
             info!("Starting Dynamo distributed runtime registration...");
@@ -148,8 +157,7 @@ fn main() -> Result<()> {
                         },
                     )?;
                     let tokenizer = Tokenizer::from_file(&args.model_path)?;
-                    let (scheduler, handle) =
-                        Scheduler::new(model, tokenizer, &model_id, 4, 42)?;
+                    let (scheduler, handle) = Scheduler::new(model, tokenizer, &model_id, 4, 42)?;
                     std::thread::spawn(move || scheduler.run());
                     handle
                 }
@@ -159,8 +167,7 @@ fn main() -> Result<()> {
                         options.enable_cuda_graph,
                     )?;
                     let tokenizer = Tokenizer::from_file(&args.model_path)?;
-                    let (scheduler, handle) =
-                        Scheduler::new(model, tokenizer, &model_id, 4, 42)?;
+                    let (scheduler, handle) = Scheduler::new(model, tokenizer, &model_id, 4, 42)?;
                     std::thread::spawn(move || scheduler.run());
                     handle
                 }
@@ -191,24 +198,38 @@ fn main() -> Result<()> {
 
     match model_type {
         ModelType::Qwen3 => {
-            let mut engine =
-                RealServerEngine::load_with_options(&args.model_path, 42, options)?;
+            let mut engine = RealServerEngine::load_with_options(&args.model_path, 42, options)?;
             if let Some(max_kv) = args.max_gpu_kv {
-                info!("Setting max GPU KV to {} tokens (offload test mode)", max_kv);
+                info!(
+                    "Setting max GPU KV to {} tokens (offload test mode)",
+                    max_kv
+                );
                 engine.set_max_gpu_kv(max_kv);
             }
             info!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
-            run_repl(&mut engine, args.max_turns, args.max_tokens, args.temperature)?;
+            run_repl(
+                &mut engine,
+                args.max_turns,
+                args.max_tokens,
+                args.temperature,
+            )?;
         }
         ModelType::Qwen35 => {
-            let mut engine =
-                Qwen35ServerEngine::load_with_options(&args.model_path, 42, options)?;
+            let mut engine = Qwen35ServerEngine::load_with_options(&args.model_path, 42, options)?;
             if let Some(max_kv) = args.max_gpu_kv {
-                info!("Setting max GPU KV to {} tokens (offload test mode)", max_kv);
+                info!(
+                    "Setting max GPU KV to {} tokens (offload test mode)",
+                    max_kv
+                );
                 engine.set_max_gpu_kv(max_kv);
             }
             info!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
-            run_repl(&mut engine, args.max_turns, args.max_tokens, args.temperature)?;
+            run_repl(
+                &mut engine,
+                args.max_turns,
+                args.max_tokens,
+                args.temperature,
+            )?;
         }
     }
 

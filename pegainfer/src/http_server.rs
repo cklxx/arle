@@ -5,15 +5,22 @@ use std::sync::Arc;
 
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router, extract::State, http::StatusCode, routing::{get, post}};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+};
 use futures_util::{StreamExt, stream};
 use log::{error, info, warn};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::metrics::ServerMetrics;
 use crate::sampler::sampling_params_from_request;
-use crate::scheduler::{IncomingRequest, SchedulerHandle};
-use crate::server_engine::{CompleteOutput, FinishReason, StreamDelta, Usage};
+use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerHandle};
+#[cfg(test)]
+use crate::server_engine::StreamDelta;
+use crate::server_engine::{CompleteOutput, FinishReason, Usage};
 use openai_v1::{
     ChatCompletionRequest, ChatCompletionResponse, ChatStreamChunk, ChatStreamUsageChunk,
     CompletionRequest, CompletionResponse, StreamChunk, StreamUsageChunk,
@@ -27,7 +34,7 @@ struct AppState {
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
 }
 
@@ -70,7 +77,7 @@ async fn completions(
             req.stop_token_ids,
         ),
         stop: req.stop,
-        priority: Default::default(),
+        priority: RequestPriority::default(),
         delta_tx,
     };
 
@@ -89,7 +96,8 @@ async fn completions(
 
             let chunk = StreamChunk::from_delta(&request_id, created, &model_id, delta);
             let mut events = vec![Ok::<_, Infallible>(
-                Event::default().data(serde_json::to_string(&chunk).unwrap()),
+                Event::default()
+                    .data(serde_json::to_string(&chunk).expect("StreamChunk serialization")),
             )];
 
             if include_usage
@@ -98,9 +106,9 @@ async fn completions(
             {
                 let usage_chunk =
                     StreamUsageChunk::from_usage(&request_id, created, &model_id, usage);
-                events.push(Ok(
-                    Event::default().data(serde_json::to_string(&usage_chunk).unwrap())
-                ));
+                events.push(Ok(Event::default().data(
+                    serde_json::to_string(&usage_chunk).expect("StreamUsageChunk serialization"),
+                )));
             }
 
             stream::iter(events)
@@ -189,7 +197,7 @@ async fn chat_completions(
             req.stop_token_ids,
         ),
         stop: req.stop,
-        priority: Default::default(),
+        priority: RequestPriority::default(),
         delta_tx,
     };
 
@@ -205,34 +213,37 @@ async fn chat_completions(
         // First chunk carries the role field.
         let role_event = {
             let chunk = ChatStreamChunk::role_chunk(&request_id, created, &model_id);
-            Ok::<_, Infallible>(Event::default().data(serde_json::to_string(&chunk).unwrap()))
+            Ok::<_, Infallible>(
+                Event::default()
+                    .data(serde_json::to_string(&chunk).expect("ChatStreamChunk serialization")),
+            )
         };
 
-        let req_id = request_id.clone();
+        let req_id = request_id;
         let mid = model_id.clone();
-        let content_stream =
-            UnboundedReceiverStream::new(delta_rx).flat_map(move |delta| {
-                let usage = delta.usage;
-                let is_terminal = delta.finish_reason.is_some();
+        let content_stream = UnboundedReceiverStream::new(delta_rx).flat_map(move |delta| {
+            let usage = delta.usage;
+            let is_terminal = delta.finish_reason.is_some();
 
-                let chunk = ChatStreamChunk::content_chunk(&req_id, created, &mid, delta);
-                let mut events = vec![Ok::<_, Infallible>(
-                    Event::default().data(serde_json::to_string(&chunk).unwrap()),
-                )];
+            let chunk = ChatStreamChunk::content_chunk(&req_id, created, &mid, delta);
+            let mut events = vec![Ok::<_, Infallible>(
+                Event::default()
+                    .data(serde_json::to_string(&chunk).expect("ChatStreamChunk serialization")),
+            )];
 
-                if include_usage
-                    && is_terminal
-                    && let Some(u) = usage
-                {
-                    let usage_chunk =
-                        ChatStreamUsageChunk::from_usage(&req_id, created, &mid, u);
-                    events.push(Ok(
-                        Event::default().data(serde_json::to_string(&usage_chunk).unwrap())
-                    ));
-                }
+            if include_usage
+                && is_terminal
+                && let Some(u) = usage
+            {
+                let usage_chunk = ChatStreamUsageChunk::from_usage(&req_id, created, &mid, u);
+                events.push(Ok(Event::default().data(
+                    serde_json::to_string(&usage_chunk)
+                        .expect("ChatStreamUsageChunk serialization"),
+                )));
+            }
 
-                stream::iter(events)
-            });
+            stream::iter(events)
+        });
 
         let done_stream =
             stream::once(async { Ok::<_, Infallible>(Event::default().data("[DONE]")) });
@@ -267,13 +278,8 @@ async fn chat_completions(
             usage.prompt_tokens, usage.completion_tokens
         );
 
-        let response = ChatCompletionResponse::from_output(
-            model_id,
-            now_secs(),
-            &text,
-            finish_reason,
-            usage,
-        );
+        let response =
+            ChatCompletionResponse::from_output(model_id, now_secs(), &text, finish_reason, usage);
         Ok(Json(response).into_response())
     }
 }
@@ -281,7 +287,10 @@ async fn chat_completions(
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let body = state.metrics.render_prometheus();
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         body,
     )
 }
@@ -289,15 +298,20 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
 async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let body = state.metrics.render_summary();
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         body,
     )
 }
 
+/// Build the Axum router with default (empty) metrics.
 pub fn build_app(handle: SchedulerHandle) -> Router {
     build_app_with_metrics(handle, ServerMetrics::new(""))
 }
 
+/// Build the Axum router with a pre-configured `ServerMetrics` instance.
 pub fn build_app_with_metrics(handle: SchedulerHandle, metrics: ServerMetrics) -> Router {
     let state = Arc::new(AppState { handle, metrics });
 
@@ -509,7 +523,10 @@ mod tests {
         );
         assert!(payload.contains("[DONE]"), "payload={payload}");
         // First chunk must carry role.
-        assert!(payload.contains(r#""role":"assistant""#), "payload={payload}");
+        assert!(
+            payload.contains(r#""role":"assistant""#),
+            "payload={payload}"
+        );
     }
 
     #[tokio::test]
@@ -527,8 +544,14 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(payload.contains("pegainfer_requests_total"), "payload={payload}");
-        assert!(payload.contains("pegainfer_requests_active"), "payload={payload}");
+        assert!(
+            payload.contains("pegainfer_requests_total"),
+            "payload={payload}"
+        );
+        assert!(
+            payload.contains("pegainfer_requests_active"),
+            "payload={payload}"
+        );
     }
 
     #[tokio::test]

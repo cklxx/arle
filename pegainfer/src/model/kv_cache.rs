@@ -186,7 +186,9 @@ impl KVCache {
         }
         info!(
             "KV cache truncated to {} tokens (offloaded: {}, gpu: {})",
-            self.seq_len, self.offloaded_len, self.gpu_seq_len()
+            self.seq_len,
+            self.offloaded_len,
+            self.gpu_seq_len()
         );
     }
 
@@ -248,12 +250,18 @@ impl KVCache {
                     let mut temp = vec![bf16::ZERO; gpu_elems];
 
                     self.k_cache[layer].copy_region_to_host(
-                        ctx, offloaded_elems, gpu_elems, &mut temp,
+                        ctx,
+                        offloaded_elems,
+                        gpu_elems,
+                        &mut temp,
                     )?;
                     self.k_cache[layer].copy_region_from_host(ctx, 0, &temp)?;
 
                     self.v_cache[layer].copy_region_to_host(
-                        ctx, offloaded_elems, gpu_elems, &mut temp,
+                        ctx,
+                        offloaded_elems,
+                        gpu_elems,
+                        &mut temp,
                     )?;
                     self.v_cache[layer].copy_region_from_host(ctx, 0, &temp)?;
                 }
@@ -269,11 +277,11 @@ impl KVCache {
 
         // Calculate how many tokens to offload (in whole blocks).
         let excess = gpu_tokens - self.max_gpu_seq_len;
-        let blocks_to_offload =
-            (excess + OFFLOAD_BLOCK_SIZE - 1) / OFFLOAD_BLOCK_SIZE;
+        let blocks_to_offload = (excess + OFFLOAD_BLOCK_SIZE - 1) / OFFLOAD_BLOCK_SIZE;
         let tokens_to_offload = blocks_to_offload * OFFLOAD_BLOCK_SIZE;
         // Don't offload more than what's on GPU.
-        let tokens_to_offload = tokens_to_offload.min(gpu_tokens.saturating_sub(OFFLOAD_BLOCK_SIZE));
+        let tokens_to_offload =
+            tokens_to_offload.min(gpu_tokens.saturating_sub(OFFLOAD_BLOCK_SIZE));
 
         if tokens_to_offload == 0 {
             return Ok(());
@@ -307,12 +315,18 @@ impl KVCache {
                 let mut temp = vec![bf16::ZERO; remaining_elems];
 
                 self.k_cache[layer].copy_region_to_host(
-                    ctx, src_offset, remaining_elems, &mut temp,
+                    ctx,
+                    src_offset,
+                    remaining_elems,
+                    &mut temp,
                 )?;
                 self.k_cache[layer].copy_region_from_host(ctx, 0, &temp)?;
 
                 self.v_cache[layer].copy_region_to_host(
-                    ctx, src_offset, remaining_elems, &mut temp,
+                    ctx,
+                    src_offset,
+                    remaining_elems,
+                    &mut temp,
                 )?;
                 self.v_cache[layer].copy_region_from_host(ctx, 0, &temp)?;
             }
@@ -364,16 +378,8 @@ impl KVCache {
             }
 
             // 2. Copy offloaded prefix from CPU to GPU [0..offloaded_elems].
-            self.k_cache[layer].copy_region_from_host(
-                ctx,
-                0,
-                &self.k_host[layer],
-            )?;
-            self.v_cache[layer].copy_region_from_host(
-                ctx,
-                0,
-                &self.v_host[layer],
-            )?;
+            self.k_cache[layer].copy_region_from_host(ctx, 0, &self.k_host[layer])?;
+            self.v_cache[layer].copy_region_from_host(ctx, 0, &self.v_host[layer])?;
         }
 
         ctx.sync()?;
@@ -404,12 +410,18 @@ impl KVCache {
                 let mut temp = vec![bf16::ZERO; gpu_elems];
 
                 self.k_cache[layer].copy_region_to_host(
-                    ctx, offloaded_elems, gpu_elems, &mut temp,
+                    ctx,
+                    offloaded_elems,
+                    gpu_elems,
+                    &mut temp,
                 )?;
                 self.k_cache[layer].copy_region_from_host(ctx, 0, &temp)?;
 
                 self.v_cache[layer].copy_region_to_host(
-                    ctx, offloaded_elems, gpu_elems, &mut temp,
+                    ctx,
+                    offloaded_elems,
+                    gpu_elems,
+                    &mut temp,
                 )?;
                 self.v_cache[layer].copy_region_from_host(ctx, 0, &temp)?;
             }

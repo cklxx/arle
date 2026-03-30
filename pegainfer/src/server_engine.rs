@@ -1,3 +1,4 @@
+#[cfg(feature = "cuda")]
 use std::fmt;
 #[cfg(feature = "cuda")]
 use std::path::Path;
@@ -116,10 +117,13 @@ pub struct StreamDelta {
 }
 
 pub trait ServerEngine: Send {
+    /// Returns the model identifier (e.g. `"Qwen3-8B"`).
     fn model_id(&self) -> &str;
 
+    /// Run a complete generation request synchronously and return the full output.
     fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput>;
 
+    /// Run a generation request, streaming token deltas through `tx` as they are produced.
     fn complete_stream(
         &mut self,
         req: CompleteRequest,
@@ -445,8 +449,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
 
     fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
-        let (tokens_to_process, _prefix_len) =
-            self.prepare_with_prefix_cache(&prompt_tokens)?;
+        let (tokens_to_process, _prefix_len) = self.prepare_with_prefix_cache(&prompt_tokens)?;
         // tokens_to_process is the suffix that still needs prefill.
         // If empty (full cache hit), use just the last token to get logits.
         let effective = if tokens_to_process.is_empty() {
@@ -467,9 +470,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
         self.state.offload_kv_if_needed()?;
         // output_tokens = effective_prompt + generated tokens
         let completion_tokens = output_tokens.len().saturating_sub(effective.len());
-        let mut text = self
-            .tokenizer
-            .decode(&output_tokens[effective.len()..])?;
+        let mut text = self.tokenizer.decode(&output_tokens[effective.len()..])?;
         let mut finish_reason = if completion_tokens >= req.max_tokens {
             FinishReason::Length
         } else {
@@ -499,8 +500,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
         tx: UnboundedSender<StreamDelta>,
     ) -> Result<()> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
-        let (tokens_to_process, _prefix_len) =
-            self.prepare_with_prefix_cache(&prompt_tokens)?;
+        let (tokens_to_process, _prefix_len) = self.prepare_with_prefix_cache(&prompt_tokens)?;
         let effective_prompt = if tokens_to_process.is_empty() {
             vec![*prompt_tokens.last().unwrap()]
         } else {

@@ -80,7 +80,13 @@ pub struct GptqConfig {
 
 impl Default for GptqConfig {
     fn default() -> Self {
-        Self { bits: 4, group_size: 128, desc_act: false, sym: true, checkpoint_format: None }
+        Self {
+            bits: 4,
+            group_size: 128,
+            desc_act: false,
+            sym: true,
+            checkpoint_format: None,
+        }
     }
 }
 
@@ -99,7 +105,12 @@ pub struct AwqConfig {
 
 impl Default for AwqConfig {
     fn default() -> Self {
-        Self { bits: 4, group_size: 128, zero_point: true, version: AwqVersion::Gemm }
+        Self {
+            bits: 4,
+            group_size: 128,
+            zero_point: true,
+            version: AwqVersion::Gemm,
+        }
     }
 }
 
@@ -135,7 +146,10 @@ pub struct Fp8Config {
 
 impl Default for Fp8Config {
     fn default() -> Self {
-        Self { activation_scheme: Fp8ActivationScheme::Dynamic, weight_fp8: true }
+        Self {
+            activation_scheme: Fp8ActivationScheme::Dynamic,
+            weight_fp8: true,
+        }
     }
 }
 
@@ -159,7 +173,10 @@ pub struct Int8Config {
 
 impl Default for Int8Config {
     fn default() -> Self {
-        Self { is_smoothquant: false, per_channel: true }
+        Self {
+            is_smoothquant: false,
+            per_channel: true,
+        }
     }
 }
 
@@ -261,7 +278,9 @@ struct RawModelConfig {
 ///
 /// Fast path — just looks at which files are present.
 pub fn detect_quant_format(model_path: &str) -> QuantFormat {
-    load_quant_meta(model_path).map(|m| m.format()).unwrap_or(QuantFormat::None)
+    load_quant_meta(model_path)
+        .map(|m| m.format())
+        .unwrap_or(QuantFormat::None)
 }
 
 /// Fully parse and return quantization metadata for a model directory.
@@ -321,10 +340,10 @@ fn try_load_gguf(dir: &Path) -> Option<QuantMeta> {
 }
 
 fn load_gptq_from_file(path: &Path) -> Result<QuantMeta> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let raw: RawGptqConfig = serde_json::from_str(&content)
-        .with_context(|| "parsing quantize_config.json")?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let raw: RawGptqConfig =
+        serde_json::from_str(&content).with_context(|| "parsing quantize_config.json")?;
     Ok(QuantMeta::Gptq(GptqConfig {
         bits: raw.bits.unwrap_or(4),
         group_size: raw.group_size.unwrap_or(128),
@@ -335,15 +354,18 @@ fn load_gptq_from_file(path: &Path) -> Result<QuantMeta> {
 }
 
 fn load_awq_from_file(path: &Path) -> Result<QuantMeta> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let raw: RawAwqConfig = serde_json::from_str(&content)
-        .with_context(|| "parsing quant_config.json")?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let raw: RawAwqConfig =
+        serde_json::from_str(&content).with_context(|| "parsing quant_config.json")?;
     Ok(QuantMeta::Awq(AwqConfig {
         bits: raw.bits.unwrap_or(4),
         group_size: raw.group_size.unwrap_or(128) as usize,
         zero_point: raw.zero_point.unwrap_or(true),
-        version: raw.version.as_deref().map(AwqVersion::from_str).unwrap_or(AwqVersion::Gemm),
+        version: raw
+            .version
+            .as_deref()
+            .map_or(AwqVersion::Gemm, AwqVersion::from_str),
     }))
 }
 
@@ -364,7 +386,7 @@ fn try_parse_config_json(json: &str) -> Result<Option<QuantMeta>> {
     let meta = match qtype.as_str() {
         "gptq" => QuantMeta::Gptq(GptqConfig {
             bits: qc.bits.unwrap_or(4),
-            group_size: qc.group_size.map(|g| g as i32).unwrap_or(128),
+            group_size: qc.group_size.map_or(128, |g| g as i32),
             desc_act: qc.desc_act.unwrap_or(false),
             sym: qc.sym.unwrap_or(true),
             checkpoint_format: qc.checkpoint_format,
@@ -373,14 +395,13 @@ fn try_parse_config_json(json: &str) -> Result<Option<QuantMeta>> {
             bits: qc.bits.unwrap_or(4),
             group_size: qc.group_size.unwrap_or(128) as usize,
             zero_point: qc.zero_point.unwrap_or(true),
-            version: qc.version.as_deref().map(AwqVersion::from_str).unwrap_or(AwqVersion::Gemm),
+            version: qc
+                .version
+                .as_deref()
+                .map_or(AwqVersion::Gemm, AwqVersion::from_str),
         }),
         "fp8" | "float8" | "fp8_e4m3" => QuantMeta::Fp8(Fp8Config {
-            activation_scheme: match qc
-                .activation_scheme
-                .as_deref()
-                .unwrap_or("dynamic")
-            {
+            activation_scheme: match qc.activation_scheme.as_deref().unwrap_or("dynamic") {
                 "static" => Fp8ActivationScheme::Static,
                 _ => Fp8ActivationScheme::Dynamic,
             },

@@ -53,6 +53,7 @@ pub enum BlockLocation {
 /// A single managed KV block.
 #[derive(Debug)]
 struct Block {
+    #[allow(dead_code)]
     id: BlockId,
     location: BlockLocation,
     /// Number of requests (or cache nodes) currently pinning this block.
@@ -78,6 +79,7 @@ pub struct BlockManager {
     free_gpu: VecDeque<BlockId>,
     free_cpu: VecDeque<BlockId>,
     block_size: usize, // tokens per block
+    #[allow(dead_code)]
     next_id: u32,
 }
 
@@ -97,14 +99,28 @@ impl BlockManager {
         for _ in 0..num_gpu_blocks {
             let id = BlockId(next_id);
             next_id += 1;
-            blocks.insert(id, Block { id, location: BlockLocation::Gpu, ref_count: 0 });
+            blocks.insert(
+                id,
+                Block {
+                    id,
+                    location: BlockLocation::Gpu,
+                    ref_count: 0,
+                },
+            );
             free_gpu.push_back(id);
         }
 
         for _ in 0..num_cpu_blocks {
             let id = BlockId(next_id);
             next_id += 1;
-            blocks.insert(id, Block { id, location: BlockLocation::Cpu, ref_count: 0 });
+            blocks.insert(
+                id,
+                Block {
+                    id,
+                    location: BlockLocation::Cpu,
+                    ref_count: 0,
+                },
+            );
             free_cpu.push_back(id);
         }
 
@@ -178,7 +194,10 @@ impl BlockManager {
         let mut allocated = Vec::with_capacity(n);
         for _ in 0..n {
             let id = self.free_gpu.pop_front().expect("checked above");
-            self.blocks.get_mut(&id).expect("block must exist").ref_count = 1;
+            self.blocks
+                .get_mut(&id)
+                .expect("block must exist")
+                .ref_count = 1;
             allocated.push(id);
         }
         Ok(allocated)
@@ -196,7 +215,10 @@ impl BlockManager {
         let mut allocated = Vec::with_capacity(n);
         for _ in 0..n {
             let id = self.free_cpu.pop_front().expect("checked above");
-            self.blocks.get_mut(&id).expect("block must exist").ref_count = 1;
+            self.blocks
+                .get_mut(&id)
+                .expect("block must exist")
+                .ref_count = 1;
             allocated.push(id);
         }
         Ok(allocated)
@@ -230,13 +252,16 @@ impl BlockManager {
     /// Increment ref_count for the given blocks (e.g. when sharing with prefix cache).
     pub fn pin(&mut self, blocks: &[BlockId]) {
         for &id in blocks {
-            self.blocks.get_mut(&id).expect("block must be managed").ref_count += 1;
+            self.blocks
+                .get_mut(&id)
+                .expect("block must be managed")
+                .ref_count += 1;
         }
     }
 
     /// Get the current ref_count for a block.
     pub fn ref_count(&self, id: BlockId) -> u32 {
-        self.blocks.get(&id).map(|b| b.ref_count).unwrap_or(0)
+        self.blocks.get(&id).map_or(0, |b| b.ref_count)
     }
 
     // -----------------------------------------------------------------------
@@ -268,13 +293,14 @@ impl BlockManager {
     /// the actual memory copy, then calls `commit_swap_out` to finalize.
     ///
     /// Returns `Err` if insufficient CPU blocks.
-    pub fn plan_swap_out(
-        &mut self,
-        gpu_blocks: &[BlockId],
-    ) -> Result<SwapPlan, AllocationError> {
+    pub fn plan_swap_out(&mut self, gpu_blocks: &[BlockId]) -> Result<SwapPlan, AllocationError> {
         let cpu_blocks = self.allocate_cpu(gpu_blocks.len())?;
         let plan = SwapPlan {
-            gpu_to_cpu: gpu_blocks.iter().copied().zip(cpu_blocks.iter().copied()).collect(),
+            gpu_to_cpu: gpu_blocks
+                .iter()
+                .copied()
+                .zip(cpu_blocks.iter().copied())
+                .collect(),
             cpu_to_gpu: vec![],
         };
         Ok(plan)
@@ -301,14 +327,15 @@ impl BlockManager {
     /// Plan a swap-in for the given CPU blocks (CPU → GPU).
     ///
     /// Returns `Err` if insufficient GPU blocks.
-    pub fn plan_swap_in(
-        &mut self,
-        cpu_blocks: &[BlockId],
-    ) -> Result<SwapPlan, AllocationError> {
+    pub fn plan_swap_in(&mut self, cpu_blocks: &[BlockId]) -> Result<SwapPlan, AllocationError> {
         let gpu_blocks = self.allocate_gpu(cpu_blocks.len())?;
         let plan = SwapPlan {
             gpu_to_cpu: vec![],
-            cpu_to_gpu: cpu_blocks.iter().copied().zip(gpu_blocks.iter().copied()).collect(),
+            cpu_to_gpu: cpu_blocks
+                .iter()
+                .copied()
+                .zip(gpu_blocks.iter().copied())
+                .collect(),
         };
         Ok(plan)
     }
@@ -351,10 +378,16 @@ pub enum AllocationError {
 impl std::fmt::Display for AllocationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InsufficientGpuBlocks { requested, available } => {
+            Self::InsufficientGpuBlocks {
+                requested,
+                available,
+            } => {
                 write!(f, "OOM: need {requested} GPU blocks, only {available} free")
             }
-            Self::InsufficientCpuBlocks { requested, available } => {
+            Self::InsufficientCpuBlocks {
+                requested,
+                available,
+            } => {
                 write!(f, "OOM: need {requested} CPU blocks, only {available} free")
             }
         }
@@ -401,7 +434,10 @@ mod tests {
         let result = m.allocate_gpu(9);
         assert!(result.is_err());
         match result {
-            Err(AllocationError::InsufficientGpuBlocks { requested, available }) => {
+            Err(AllocationError::InsufficientGpuBlocks {
+                requested,
+                available,
+            }) => {
                 assert_eq!(requested, 9);
                 assert_eq!(available, 8);
             }

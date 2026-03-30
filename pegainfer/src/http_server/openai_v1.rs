@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::chat::{ChatMessage, ParsedToolCall, ToolDefinition};
+use crate::chat::{ChatMessage, ToolDefinition};
 use crate::server_engine::{CompleteOutput, StreamDelta};
 
 // OpenAI-compatible /v1/completions request
 #[derive(Debug, Deserialize)]
 pub(super) struct CompletionRequest {
+    #[allow(dead_code)]
     pub(super) model: Option<String>,
     pub(super) prompt: String,
     pub(super) max_tokens: Option<usize>,
@@ -291,10 +292,10 @@ impl ChatCompletionResponse {
             tool_calls,
         };
 
-        let fr_str = if !message.tool_calls.is_empty() {
-            "tool_calls"
-        } else {
+        let fr_str = if message.tool_calls.is_empty() {
             finish_reason.as_openai_str()
+        } else {
+            "tool_calls"
         };
 
         Self {
@@ -371,9 +372,7 @@ impl ChatStreamChunk {
         model: &str,
         delta: StreamDelta,
     ) -> Self {
-        let finish_reason = delta
-            .finish_reason
-            .map(|r| r.as_openai_str().to_string());
+        let finish_reason = delta.finish_reason.map(|r| r.as_openai_str().to_string());
         Self {
             id: request_id.to_string(),
             object: "chat.completion.chunk",

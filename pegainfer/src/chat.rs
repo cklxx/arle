@@ -4,6 +4,7 @@
 //! that the model expects as input.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Map;
 
 // ============================================================================
 // Message types (OpenAI-compatible)
@@ -138,7 +139,9 @@ pub fn messages_to_prompt(messages: &[ChatMessage], tools: &[ToolDefinition]) ->
             other => {
                 // Unknown role — pass through as user turn to avoid dropping context.
                 let content = msg.content.as_deref().unwrap_or("");
-                prompt.push_str(&format!("<|im_start|>{other}\n"));
+                prompt.push_str("<|im_start|>");
+                prompt.push_str(other);
+                prompt.push('\n');
                 prompt.push_str(content);
                 prompt.push_str("<|im_end|>\n");
             }
@@ -220,7 +223,7 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
                 let arguments = val
                     .get("arguments")
                     .cloned()
-                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                    .unwrap_or(serde_json::Value::Object(Map::default()));
                 tool_calls.push(ParsedToolCall { name, arguments });
             }
             remaining = &remaining[end + close_tag.len()..];
@@ -329,7 +332,8 @@ mod tests {
 
     #[test]
     fn parse_tool_call_basic() {
-        let text = "Sure.\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"cmd\":\"ls\"}}\n</tool_call>";
+        let text =
+            "Sure.\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"cmd\":\"ls\"}}\n</tool_call>";
         let (content, calls) = parse_tool_calls(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
