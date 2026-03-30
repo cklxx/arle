@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
+use crate::chat::{ChatMessage, ParsedToolCall, ToolDefinition};
 use crate::server_engine::{CompleteOutput, StreamDelta};
 
 // OpenAI-compatible /v1/completions request
@@ -11,12 +13,18 @@ pub(super) struct CompletionRequest {
     pub(super) temperature: Option<f32>,
     pub(super) top_p: Option<f32>,
     pub(super) top_k: Option<i32>,
+    pub(super) min_p: Option<f32>,
+    pub(super) repetition_penalty: Option<f32>,
+    pub(super) frequency_penalty: Option<f32>,
+    pub(super) presence_penalty: Option<f32>,
     #[allow(dead_code)]
     pub(super) n: Option<usize>,
     pub(super) stream: Option<bool>,
     pub(super) stream_options: Option<StreamOptions>,
     pub(super) stop: Option<Vec<String>>,
+    pub(super) stop_token_ids: Option<Vec<u32>>,
     pub(super) ignore_eos: Option<bool>,
+    pub(super) seed: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +158,262 @@ impl StreamUsageChunk {
         Self {
             id: request_id.to_string(),
             object: "text_completion",
+            created,
+            model: model.to_string(),
+            usage: Usage {
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
+            },
+        }
+    }
+}
+
+// ============================================================================
+// /v1/chat/completions — request
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ChatCompletionRequest {
+    #[allow(dead_code)]
+    pub(super) model: Option<String>,
+    pub(super) messages: Vec<ChatMessage>,
+    pub(super) max_tokens: Option<usize>,
+    pub(super) temperature: Option<f32>,
+    pub(super) top_p: Option<f32>,
+    pub(super) top_k: Option<i32>,
+    pub(super) min_p: Option<f32>,
+    pub(super) repetition_penalty: Option<f32>,
+    pub(super) frequency_penalty: Option<f32>,
+    pub(super) presence_penalty: Option<f32>,
+    pub(super) stream: Option<bool>,
+    pub(super) stream_options: Option<StreamOptions>,
+    pub(super) stop: Option<Vec<String>>,
+    pub(super) stop_token_ids: Option<Vec<u32>>,
+    pub(super) ignore_eos: Option<bool>,
+    pub(super) seed: Option<u64>,
+    /// Tool definitions (OpenAI format).
+    #[serde(default)]
+    pub(super) tools: Vec<ToolDefinition>,
+}
+
+impl ChatCompletionRequest {
+    pub(super) fn max_tokens_or_default(&self) -> usize {
+        self.max_tokens.unwrap_or(16)
+    }
+
+    pub(super) fn stream_or_default(&self) -> bool {
+        self.stream.unwrap_or(false)
+    }
+
+    pub(super) fn include_usage_or_default(&self) -> bool {
+        self.stream_options
+            .as_ref()
+            .and_then(|o| o.include_usage)
+            .unwrap_or(false)
+    }
+}
+
+// ============================================================================
+// /v1/chat/completions — non-streaming response
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+pub(super) struct ChatCompletionResponse {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<ChatChoice>,
+    usage: Usage,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatChoice {
+    index: usize,
+    message: AssistantMessage,
+    finish_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AssistantMessage {
+    role: &'static str,
+    /// `null` when there are tool calls and no text content.
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<ChatToolCall>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: &'static str,
+    function: ChatFunctionCall,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatFunctionCall {
+    name: String,
+    /// JSON-encoded arguments string (OpenAI wire format).
+    arguments: String,
+}
+
+impl ChatCompletionResponse {
+    pub(super) fn from_output(
+        model: String,
+        created: u64,
+        text: &str,
+        finish_reason: crate::server_engine::FinishReason,
+        usage: crate::server_engine::Usage,
+    ) -> Self {
+        let (content, parsed_calls) = crate::chat::parse_tool_calls(text);
+
+        let tool_calls: Vec<ChatToolCall> = parsed_calls
+            .iter()
+            .map(|tc| ChatToolCall {
+                id: format!("call_{}", Uuid::new_v4().simple()),
+                call_type: "function",
+                function: ChatFunctionCall {
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.to_string(),
+                },
+            })
+            .collect();
+
+        let message = AssistantMessage {
+            role: "assistant",
+            content: if tool_calls.is_empty() || !content.is_empty() {
+                Some(content)
+            } else {
+                None
+            },
+            tool_calls,
+        };
+
+        let fr_str = if !message.tool_calls.is_empty() {
+            "tool_calls"
+        } else {
+            finish_reason.as_openai_str()
+        };
+
+        Self {
+            id: format!("chatcmpl-{}", Uuid::new_v4()),
+            object: "chat.completion",
+            created,
+            model,
+            choices: vec![ChatChoice {
+                index: 0,
+                message,
+                finish_reason: fr_str.to_string(),
+            }],
+            usage: Usage {
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
+            },
+        }
+    }
+}
+
+// ============================================================================
+// /v1/chat/completions — streaming chunks
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+pub(super) struct ChatStreamChunk {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<ChatStreamChoice>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatStreamChoice {
+    index: usize,
+    delta: ChatDelta,
+    finish_reason: Option<String>,
+}
+
+/// Delta payload for a streaming chunk. Fields are `None` when not set.
+#[derive(Debug, Serialize)]
+struct ChatDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+}
+
+impl ChatStreamChunk {
+    /// First chunk — includes `role` field, empty content.
+    pub(super) fn role_chunk(request_id: &str, created: u64, model: &str) -> Self {
+        Self {
+            id: request_id.to_string(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.to_string(),
+            choices: vec![ChatStreamChoice {
+                index: 0,
+                delta: ChatDelta {
+                    role: Some("assistant"),
+                    content: None,
+                },
+                finish_reason: None,
+            }],
+        }
+    }
+
+    /// Content delta chunk.
+    pub(super) fn content_chunk(
+        request_id: &str,
+        created: u64,
+        model: &str,
+        delta: StreamDelta,
+    ) -> Self {
+        let finish_reason = delta
+            .finish_reason
+            .map(|r| r.as_openai_str().to_string());
+        Self {
+            id: request_id.to_string(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.to_string(),
+            choices: vec![ChatStreamChoice {
+                index: 0,
+                delta: ChatDelta {
+                    role: None,
+                    content: if delta.text_delta.is_empty() && finish_reason.is_some() {
+                        None
+                    } else {
+                        Some(delta.text_delta)
+                    },
+                },
+                finish_reason,
+            }],
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct ChatStreamUsageChunk {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    usage: Usage,
+}
+
+impl ChatStreamUsageChunk {
+    pub(super) fn from_usage(
+        request_id: &str,
+        created: u64,
+        model: &str,
+        usage: crate::server_engine::Usage,
+    ) -> Self {
+        Self {
+            id: request_id.to_string(),
+            object: "chat.completion.chunk",
             created,
             model: model.to_string(),
             usage: Usage {
