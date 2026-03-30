@@ -1,5 +1,6 @@
 //! Qwen3 model: full attention transformer.
 
+mod batch_decode;
 mod config;
 mod decode;
 mod decode_buffers;

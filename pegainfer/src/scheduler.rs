@@ -87,12 +87,6 @@ impl SchedulerHandle {
 // Internal types
 // ============================================================================
 
-struct Slot<S> {
-    state: S,
-    /// Prompt tokens from the last request processed in this slot (for prefix reuse).
-    cached_prompt: Vec<u32>,
-}
-
 enum Phase {
     /// Newly assigned, needs prefix cache check.
     New,
@@ -234,7 +228,11 @@ const STATS_LOG_INTERVAL: u64 = 10;
 pub struct Scheduler<M: ModelForward> {
     model: M,
     tokenizer: Tokenizer,
-    slots: Vec<Slot<M::State>>,
+    /// Per-slot states (KV caches, decode buffers). Stored separately from
+    /// slot metadata so we can pass `&mut [M::State]` to batched decode.
+    states: Vec<M::State>,
+    /// Per-slot cached prompts for prefix reuse.
+    cached_prompts: Vec<Vec<u32>>,
     request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
     waiting: VecDeque<IncomingRequest>,
     active: Vec<ActiveRequest>,
@@ -261,13 +259,11 @@ impl<M: ModelForward> Scheduler<M> {
     ) -> Result<(Self, SchedulerHandle)> {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let mut slots = Vec::with_capacity(num_slots);
+        let mut states = Vec::with_capacity(num_slots);
+        let mut cached_prompts = Vec::with_capacity(num_slots);
         for i in 0..num_slots {
-            let state = model.create_state()?;
-            slots.push(Slot {
-                state,
-                cached_prompt: Vec::new(),
-            });
+            states.push(model.create_state()?);
+            cached_prompts.push(Vec::new());
             info!("Initialized state slot {}/{}", i + 1, num_slots);
         }
 
@@ -279,7 +275,8 @@ impl<M: ModelForward> Scheduler<M> {
         let scheduler = Self {
             model,
             tokenizer,
-            slots,
+            states,
+            cached_prompts,
             request_rx: rx,
             waiting: VecDeque::new(),
             active: Vec::new(),
@@ -378,7 +375,7 @@ impl<M: ModelForward> Scheduler<M> {
 
     fn find_free_slot(&self) -> Option<usize> {
         let in_use: Vec<usize> = self.active.iter().map(|a| a.slot_idx).collect();
-        (0..self.slots.len()).find(|i| !in_use.contains(i))
+        (0..self.states.len()).find(|i| !in_use.contains(i))
     }
 
     fn step(&mut self) {
@@ -387,14 +384,13 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        // Priority 1: serve one decode request (round-robin)
-        for offset in 0..num {
-            let idx = (self.last_served.wrapping_add(1).wrapping_add(offset)) % num;
-            if matches!(self.active[idx].phase, Phase::Decoding) {
-                self.step_decode(idx);
-                self.last_served = idx;
-                return;
-            }
+        // Priority 1: batch ALL decode requests together (single GPU forward pass)
+        let decode_count = self.active.iter()
+            .filter(|r| matches!(r.phase, Phase::Decoding))
+            .count();
+        if decode_count > 0 {
+            self.step_decode_batch();
+            return;
         }
 
         // Priority 2: resume an ongoing chunked prefill
@@ -424,18 +420,18 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        let slot = &mut self.slots[req.slot_idx];
+        let si = req.slot_idx;
+        let cached = &mut self.cached_prompts[si];
+        let state = &mut self.states[si];
 
         // Prefix cache: find common prefix between cached and new prompt
-        let prefix_len = slot
-            .cached_prompt
+        let prefix_len = cached
             .iter()
             .zip(req.prompt_tokens.iter())
             .take_while(|(a, b)| a == b)
             .count();
 
-        let effective = if prefix_len > 0 && prefix_len == slot.cached_prompt.len() {
-            // Full prefix hit — reuse all cached KV
+        let effective = if prefix_len > 0 && prefix_len == cached.len() {
             info!(
                 "Request {}: prefix HIT {}/{} tokens",
                 req.id, prefix_len, req.prompt_tokens.len()
@@ -447,27 +443,25 @@ impl<M: ModelForward> Scheduler<M> {
                 suffix.to_vec()
             }
         } else if prefix_len > 0 {
-            // Partial prefix hit — truncate KV and reuse common part
             info!(
                 "Request {}: prefix PARTIAL {}/{} tokens",
                 req.id, prefix_len, req.prompt_tokens.len()
             );
-            if let Err(e) = slot.state.truncate_to(prefix_len) {
+            if let Err(e) = state.truncate_to(prefix_len) {
                 error!("Request {}: truncate failed: {}", req.id, e);
                 req.phase = Phase::Finished;
                 return;
             }
-            slot.cached_prompt.truncate(prefix_len);
+            cached.truncate(prefix_len);
             req.prompt_tokens[prefix_len..].to_vec()
         } else {
-            // No match — full reset
             info!("Request {}: prefix MISS", req.id);
-            if let Err(e) = slot.state.reset() {
+            if let Err(e) = state.reset() {
                 error!("Request {}: reset failed: {}", req.id, e);
                 req.phase = Phase::Finished;
                 return;
             }
-            slot.cached_prompt.clear();
+            cached.clear();
             req.prompt_tokens.clone()
         };
 
@@ -490,7 +484,7 @@ impl<M: ModelForward> Scheduler<M> {
         let Self {
             model,
             tokenizer,
-            slots,
+            states,
             active,
             rng,
             ..
@@ -517,10 +511,10 @@ impl<M: ModelForward> Scheduler<M> {
         let chunk_end = (*progress + PREFILL_CHUNK_SIZE).min(total);
         let chunk = &effective_tokens[*progress..chunk_end];
 
-        let slot = &mut slots[req.slot_idx];
+        let state = &mut states[req.slot_idx];
 
         // Run forward pass for this chunk
-        if let Err(e) = model.forward(chunk, &mut slot.state) {
+        if let Err(e) = model.forward(chunk, state) {
             error!("Request {}: prefill chunk failed: {}", req.id, e);
             req.phase = Phase::Finished;
             return;
@@ -541,7 +535,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         // All chunks done — sample first token
-        match model.select_token(&mut slot.state, &req.sampling, rng) {
+        match model.select_token(state, &req.sampling, rng) {
             Ok(token) => {
                 if !req.sampling.ignore_eos && model.is_stop_token(token) {
                     req.finish(FinishReason::Stop, tokenizer);
@@ -566,53 +560,87 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    fn step_decode(&mut self, idx: usize) {
+    /// Batch all decode requests into a single GPU forward pass.
+    ///
+    /// For batch_size=1, uses the regular single-token path (with CUDA Graph).
+    /// For batch_size>1, uses batched GEMM for projections + per-request attention.
+    fn step_decode_batch(&mut self) {
         let Self {
             model,
             tokenizer,
-            slots,
+            states,
             active,
             rng,
             ..
         } = self;
 
-        let req = &mut active[idx];
+        // Collect decode request indices and their tokens
+        let decode_indices: Vec<usize> = active.iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r.phase, Phase::Decoding) && !r.delta_tx.is_closed())
+            .map(|(i, _)| i)
+            .collect();
 
-        // Skip if client disconnected
-        if req.delta_tx.is_closed() {
-            req.phase = Phase::Finished;
-            return;
-        }
-
-        let slot = &mut slots[req.slot_idx];
-        let last_token = *req.generated_tokens.last().unwrap();
-
-        // One decode step
-        if let Err(e) = model.forward(&[last_token], &mut slot.state) {
-            error!("Request {}: decode failed: {}", req.id, e);
-            req.phase = Phase::Finished;
-            return;
-        }
-
-        match model.select_token(&mut slot.state, &req.sampling, rng) {
-            Ok(token) => {
-                if !req.sampling.ignore_eos && model.is_stop_token(token) {
-                    req.finish(FinishReason::Stop, tokenizer);
-                    return;
-                }
-                req.generated_tokens.push(token);
-                req.emit_delta(tokenizer);
-
-                if matches!(req.phase, Phase::Finished) {
-                    return; // Stop sequence hit
-                }
-                if req.generated_tokens.len() >= req.max_tokens {
-                    req.finish(FinishReason::Length, tokenizer);
-                }
+        // Mark disconnected decode requests as finished
+        for i in 0..active.len() {
+            if matches!(active[i].phase, Phase::Decoding) && active[i].delta_tx.is_closed() {
+                active[i].phase = Phase::Finished;
             }
-            Err(e) => {
-                error!("Request {}: select_token failed: {}", req.id, e);
-                req.phase = Phase::Finished;
+        }
+
+        if decode_indices.is_empty() {
+            return;
+        }
+
+        let token_ids: Vec<u32> = decode_indices.iter()
+            .map(|&i| *active[i].generated_tokens.last().unwrap())
+            .collect();
+        let slot_indices: Vec<usize> = decode_indices.iter()
+            .map(|&i| active[i].slot_idx)
+            .collect();
+
+        // Run forward pass
+        let forward_result = if decode_indices.len() == 1 {
+            // Single request: use regular path (benefits from CUDA Graph)
+            model.forward(&[token_ids[0]], &mut states[slot_indices[0]])
+        } else {
+            // Multiple requests: batched decode (GEMM for projections)
+            model.forward_decode_batch(&token_ids, states, &slot_indices)
+        };
+
+        if let Err(e) = forward_result {
+            error!("Batched decode failed: {}", e);
+            for &i in &decode_indices {
+                active[i].phase = Phase::Finished;
+            }
+            return;
+        }
+
+        // Sample and emit for each request
+        for &req_idx in &decode_indices {
+            let req = &mut active[req_idx];
+            let state = &mut states[req.slot_idx];
+
+            match model.select_token(state, &req.sampling, rng) {
+                Ok(token) => {
+                    if !req.sampling.ignore_eos && model.is_stop_token(token) {
+                        req.finish(FinishReason::Stop, tokenizer);
+                        continue;
+                    }
+                    req.generated_tokens.push(token);
+                    req.emit_delta(tokenizer);
+
+                    if matches!(req.phase, Phase::Finished) {
+                        continue;
+                    }
+                    if req.generated_tokens.len() >= req.max_tokens {
+                        req.finish(FinishReason::Length, tokenizer);
+                    }
+                }
+                Err(e) => {
+                    error!("Request {}: select_token failed: {}", req.id, e);
+                    req.phase = Phase::Finished;
+                }
             }
         }
     }
@@ -625,9 +653,9 @@ impl<M: ModelForward> Scheduler<M> {
                 let gen_tokens = req.generated_tokens.len() as u64;
 
                 // Update slot's cached prompt for future prefix reuse
-                self.slots[req.slot_idx].cached_prompt = req.prompt_tokens;
+                self.cached_prompts[req.slot_idx] = req.prompt_tokens;
                 // Offload excess KV to CPU if over GPU budget
-                let _ = self.slots[req.slot_idx].state.offload_kv_if_needed();
+                let _ = self.states[req.slot_idx].offload_kv_if_needed();
 
                 self.total_completed += 1;
                 self.total_generated_tokens += gen_tokens;
