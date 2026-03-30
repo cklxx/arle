@@ -1,6 +1,6 @@
-use std::process::Command;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::process::Command;
 
 // ============================================================================
 // Tool definition
@@ -63,10 +63,7 @@ pub fn execute_tool(name: &str, arguments: &serde_json::Value) -> String {
             execute_shell(command)
         }
         "python" => {
-            let code = arguments
-                .get("code")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let code = arguments.get("code").and_then(|v| v.as_str()).unwrap_or("");
             execute_python(code)
         }
         _ => format!("Error: unknown tool '{name}'"),
@@ -75,11 +72,7 @@ pub fn execute_tool(name: &str, arguments: &serde_json::Value) -> String {
 
 fn execute_shell(command: &str) -> String {
     log::info!("Executing shell: {}", command);
-    match Command::new("bash")
-        .arg("-c")
-        .arg(command)
-        .output()
-    {
+    match Command::new("bash").arg("-c").arg(command).output() {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -110,11 +103,7 @@ fn execute_shell(command: &str) -> String {
 
 fn execute_python(code: &str) -> String {
     log::info!("Executing python snippet ({} chars)", code.len());
-    match Command::new("python3")
-        .arg("-c")
-        .arg(code)
-        .output()
-    {
+    match Command::new("python3").arg("-c").arg(code).output() {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);

@@ -67,7 +67,11 @@ impl SpecConfig {
 
 impl Default for SpecConfig {
     fn default() -> Self {
-        Self { num_speculative_tokens: 5, vocab_size: 32000, min_acceptance_rate: 0.0 }
+        Self {
+            num_speculative_tokens: 5,
+            vocab_size: 32000,
+            min_acceptance_rate: 0.0,
+        }
     }
 }
 
@@ -106,18 +110,27 @@ impl TokenProposal {
     pub fn validate(&self) -> Result<()> {
         let k = self.tokens.len();
         if self.draft_probs.len() != k {
-            bail!("draft_probs length {} != tokens length {k}", self.draft_probs.len());
+            bail!(
+                "draft_probs length {} != tokens length {k}",
+                self.draft_probs.len()
+            );
         }
         if self.target_probs.len() != k {
-            bail!("target_probs length {} != tokens length {k}", self.target_probs.len());
+            bail!(
+                "target_probs length {} != tokens length {k}",
+                self.target_probs.len()
+            );
         }
-        for (i, (&p, &q)) in
-            self.target_probs.iter().zip(self.draft_probs.iter()).enumerate()
+        for (i, (&p, &q)) in self
+            .target_probs
+            .iter()
+            .zip(self.draft_probs.iter())
+            .enumerate()
         {
-            if p < 0.0 || p > 1.0 + 1e-5 {
+            if !(0.0..=1.0 + 1e-5).contains(&p) {
                 bail!("target_probs[{i}] = {p} out of [0, 1]");
             }
-            if q < 0.0 || q > 1.0 + 1e-5 {
+            if !(0.0..=1.0 + 1e-5).contains(&q) {
                 bail!("draft_probs[{i}] = {q} out of [0, 1]");
             }
         }
@@ -155,7 +168,11 @@ impl VerificationResult {
 
     /// Empirical acceptance rate = num_accepted / K.
     pub fn acceptance_rate(&self, k: usize) -> f32 {
-        if k == 0 { 1.0 } else { self.num_accepted as f32 / k as f32 }
+        if k == 0 {
+            1.0
+        } else {
+            self.num_accepted as f32 / k as f32
+        }
     }
 }
 
@@ -174,10 +191,7 @@ impl VerificationResult {
 ///
 /// `rng` must implement [`rand::Rng`] — pass `rand::thread_rng()` in
 /// production or a seeded RNG in tests.
-pub fn verify_tokens(
-    proposal: &TokenProposal,
-    rng: &mut impl rand::Rng,
-) -> VerificationResult {
+pub fn verify_tokens(proposal: &TokenProposal, rng: &mut impl rand::Rng) -> VerificationResult {
     let k = proposal.tokens.len();
     let mut accepted = Vec::with_capacity(k);
     let mut rejection_index = k; // default: all accepted
@@ -212,7 +226,12 @@ pub fn verify_tokens(
     };
 
     let num_accepted = accepted.len();
-    VerificationResult { accepted, bonus_token, num_accepted, rejection_index }
+    VerificationResult {
+        accepted,
+        bonus_token,
+        num_accepted,
+        rejection_index,
+    }
 }
 
 /// Sample a token index from a probability distribution (unnormalized is ok).
@@ -250,7 +269,10 @@ pub struct AcceptanceTracker {
 
 impl AcceptanceTracker {
     pub fn new(window_size: usize) -> Self {
-        Self { window_size: window_size.max(1), history: std::collections::VecDeque::new() }
+        Self {
+            window_size: window_size.max(1),
+            history: std::collections::VecDeque::new(),
+        }
     }
 
     /// Record the acceptance rate for one speculation step.
@@ -289,11 +311,7 @@ pub trait DraftModel: Send + Sync {
     /// Returns one [`TokenProposal`] per request.
     ///
     /// **GPU required** — panics if called in CPU builds.
-    fn draft_batch(
-        &self,
-        token_ids: &[u32],
-        num_draft_tokens: usize,
-    ) -> Result<TokenProposal>;
+    fn draft_batch(&self, token_ids: &[u32], num_draft_tokens: usize) -> Result<TokenProposal>;
 
     /// Model identifier (e.g. "Qwen3-0.5B").
     fn model_id(&self) -> &str;
@@ -312,7 +330,12 @@ pub struct MockDraftModel {
 
 impl MockDraftModel {
     pub fn new(token: u32, draft_prob: f32, target_prob: f32) -> Self {
-        Self { token, draft_prob, target_prob, id: "mock-draft".to_string() }
+        Self {
+            token,
+            draft_prob,
+            target_prob,
+            id: "mock-draft".to_string(),
+        }
     }
 }
 
@@ -486,13 +509,19 @@ mod tests {
 
     #[test]
     fn spec_config_zero_tokens_invalid() {
-        let cfg = SpecConfig { num_speculative_tokens: 0, ..SpecConfig::default() };
+        let cfg = SpecConfig {
+            num_speculative_tokens: 0,
+            ..SpecConfig::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn spec_config_invalid_threshold() {
-        let cfg = SpecConfig { min_acceptance_rate: 1.5, ..SpecConfig::default() };
+        let cfg = SpecConfig {
+            min_acceptance_rate: 1.5,
+            ..SpecConfig::default()
+        };
         assert!(cfg.validate().is_err());
     }
 

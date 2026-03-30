@@ -61,15 +61,12 @@ impl ModelArch {
     /// Attention variant used by this architecture.
     pub fn attention_variant(self) -> AttentionVariant {
         match self {
-            Self::Qwen3 => AttentionVariant::Gqa,
             Self::Qwen35 => AttentionVariant::HybridGqa,
-            Self::Llama => AttentionVariant::Gqa,
-            Self::Mistral => AttentionVariant::Gqa,
-            Self::Mixtral => AttentionVariant::Gqa,
-            Self::DeepSeekV2 => AttentionVariant::Mla,
-            Self::DeepSeekV3 => AttentionVariant::Mla,
+            Self::DeepSeekV2 | Self::DeepSeekV3 => AttentionVariant::Mla,
             Self::Gemma => AttentionVariant::Mha,
-            Self::Phi => AttentionVariant::Gqa,
+            Self::Qwen3 | Self::Llama | Self::Mistral | Self::Mixtral | Self::Phi => {
+                AttentionVariant::Gqa
+            }
         }
     }
 
@@ -154,8 +151,7 @@ pub fn detect_arch(model_path: &str) -> Result<ModelArch> {
 
 /// Detect architecture from a `config.json` string (testable without disk I/O).
 pub fn detect_arch_from_json(json_str: &str) -> Result<ModelArch> {
-    let v: serde_json::Value =
-        serde_json::from_str(json_str).context("parsing config.json")?;
+    let v: serde_json::Value = serde_json::from_str(json_str).context("parsing config.json")?;
 
     // Heuristic: Qwen3.5 embeds a `text_config` block at the top level.
     if v.get("text_config").is_some() {
@@ -173,10 +169,7 @@ pub fn detect_arch_from_json(json_str: &str) -> Result<ModelArch> {
             }
         }
         // Found architectures array but none matched.
-        let names: Vec<&str> = archs
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
+        let names: Vec<&str> = archs.iter().filter_map(|v| v.as_str()).collect();
         bail!("unknown architectures: {:?}", names);
     }
 
@@ -238,27 +231,42 @@ mod tests {
 
     #[test]
     fn detects_qwen3() {
-        assert_eq!(detect_arch_from_json(qwen3_config()).unwrap(), ModelArch::Qwen3);
+        assert_eq!(
+            detect_arch_from_json(qwen3_config()).unwrap(),
+            ModelArch::Qwen3
+        );
     }
 
     #[test]
     fn detects_qwen35_via_text_config() {
-        assert_eq!(detect_arch_from_json(qwen35_config()).unwrap(), ModelArch::Qwen35);
+        assert_eq!(
+            detect_arch_from_json(qwen35_config()).unwrap(),
+            ModelArch::Qwen35
+        );
     }
 
     #[test]
     fn detects_llama() {
-        assert_eq!(detect_arch_from_json(llama_config()).unwrap(), ModelArch::Llama);
+        assert_eq!(
+            detect_arch_from_json(llama_config()).unwrap(),
+            ModelArch::Llama
+        );
     }
 
     #[test]
     fn detects_deepseek_v3() {
-        assert_eq!(detect_arch_from_json(deepseek_v3_config()).unwrap(), ModelArch::DeepSeekV3);
+        assert_eq!(
+            detect_arch_from_json(deepseek_v3_config()).unwrap(),
+            ModelArch::DeepSeekV3
+        );
     }
 
     #[test]
     fn detects_gemma() {
-        assert_eq!(detect_arch_from_json(gemma_config()).unwrap(), ModelArch::Gemma);
+        assert_eq!(
+            detect_arch_from_json(gemma_config()).unwrap(),
+            ModelArch::Gemma
+        );
     }
 
     #[test]
@@ -290,8 +298,14 @@ mod tests {
 
     #[test]
     fn attention_variants_correct() {
-        assert_eq!(ModelArch::DeepSeekV2.attention_variant(), AttentionVariant::Mla);
-        assert_eq!(ModelArch::Qwen35.attention_variant(), AttentionVariant::HybridGqa);
+        assert_eq!(
+            ModelArch::DeepSeekV2.attention_variant(),
+            AttentionVariant::Mla
+        );
+        assert_eq!(
+            ModelArch::Qwen35.attention_variant(),
+            AttentionVariant::HybridGqa
+        );
         assert_eq!(ModelArch::Gemma.attention_variant(), AttentionVariant::Mha);
         assert_eq!(ModelArch::Llama.attention_variant(), AttentionVariant::Gqa);
     }

@@ -93,11 +93,11 @@ impl Reporter for FileReporter {
 
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis();
 
         for (trace_id, mut events) in traces {
-            events.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+            events.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(std::cmp::Ordering::Equal));
 
             let filename = format!("{}_{}.json", timestamp_ms, trace_id);
             let path = self.output_dir.join(&filename);

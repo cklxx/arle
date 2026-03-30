@@ -24,14 +24,16 @@ pub fn run_agent(
     max_tokens: usize,
     temperature: f32,
 ) -> Result<String> {
-    let mut messages = vec![
-        Message::system(SYSTEM_PROMPT),
-        Message::user(user_input),
-    ];
+    let mut messages = vec![Message::system(SYSTEM_PROMPT), Message::user(user_input)];
 
     for turn in 0..max_turns {
         let prompt = format_prompt(&messages, tools);
-        info!("Agent turn {}/{}: prompt length = {} chars", turn + 1, max_turns, prompt.len());
+        info!(
+            "Agent turn {}/{}: prompt length = {} chars",
+            turn + 1,
+            max_turns,
+            prompt.len()
+        );
 
         let output = engine.complete(CompleteRequest {
             prompt,
@@ -43,7 +45,11 @@ pub fn run_agent(
             stop: Some(vec!["<|im_end|>".to_string()]),
         })?;
 
-        info!("Generated {} chars, finish_reason={:?}", output.text.len(), output.finish_reason);
+        info!(
+            "Generated {} chars, finish_reason={:?}",
+            output.text.len(),
+            output.finish_reason
+        );
 
         let (content, tool_calls) = parse_tool_calls(&output.text);
 

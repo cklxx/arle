@@ -5,6 +5,7 @@ use tokenizers::tokenizer::{
     PostProcessorWrapper, PreTokenizerWrapper,
 };
 
+#[allow(dead_code)]
 type InnerDecodeStream<'a> = HfDecodeStream<
     'a,
     ModelWrapper,
@@ -18,6 +19,7 @@ pub struct Tokenizer {
     inner: HfTokenizer,
 }
 
+#[allow(dead_code)]
 pub(crate) struct IncrementalDecoder<'a> {
     tokenizer: &'a Tokenizer,
     inner: InnerDecodeStream<'a>,
@@ -47,6 +49,7 @@ impl Tokenizer {
             .map_err(|e| anyhow::anyhow!("Decode error: {}", e))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn incremental_decoder(&self) -> IncrementalDecoder<'_> {
         IncrementalDecoder {
             tokenizer: self,
@@ -61,6 +64,7 @@ impl Tokenizer {
     }
 }
 
+#[allow(dead_code)]
 impl IncrementalDecoder<'_> {
     pub(crate) fn step(&mut self, token_id: u32) -> Result<Option<String>> {
         self.token_ids.push(token_id);
@@ -105,12 +109,14 @@ mod tests {
     const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
     #[test]
+    #[ignore = "requires model weights at models/Qwen3-4B"]
     fn test_load_tokenizer() {
         let tokenizer = Tokenizer::from_file(MODEL_PATH).unwrap();
         assert!(tokenizer.vocab_size() > 0);
     }
 
     #[test]
+    #[ignore = "requires model weights at models/Qwen3-4B"]
     fn test_encode_decode() {
         let tokenizer = Tokenizer::from_file(MODEL_PATH).unwrap();
 
@@ -125,6 +131,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires model weights at models/Qwen3-4B"]
     fn test_chinese() {
         let tokenizer = Tokenizer::from_file(MODEL_PATH).unwrap();
 
@@ -137,6 +144,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires model weights at models/Qwen3-4B"]
     fn test_incremental_decode_matches_full_decode_for_chinese() {
         let tokenizer = Tokenizer::from_file(MODEL_PATH).unwrap();
         let text = "北京，简称“京”，是中国的首都。";

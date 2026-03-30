@@ -77,13 +77,10 @@ async fn main() {
     // The scheduler owns the model and state pool; the handle is Send+Clone.
     let handle = match model_type {
         ModelType::Qwen35 => {
-            let model = Qwen35Model::from_safetensors_with_options(
-                model_path,
-                options.enable_cuda_graph,
-            )
-            .expect("Failed to load Qwen3.5 model");
-            let tokenizer =
-                Tokenizer::from_file(model_path).expect("Failed to load tokenizer");
+            let model =
+                Qwen35Model::from_safetensors_with_options(model_path, options.enable_cuda_graph)
+                    .expect("Failed to load Qwen3.5 model");
+            let tokenizer = Tokenizer::from_file(model_path).expect("Failed to load tokenizer");
             let (scheduler, handle) =
                 Scheduler::new(model, tokenizer, &model_id, args.num_slots, 42)
                     .expect("Failed to create scheduler");
@@ -98,8 +95,7 @@ async fn main() {
                 },
             )
             .expect("Failed to load Qwen3 model");
-            let tokenizer =
-                Tokenizer::from_file(model_path).expect("Failed to load tokenizer");
+            let tokenizer = Tokenizer::from_file(model_path).expect("Failed to load tokenizer");
             let (scheduler, handle) =
                 Scheduler::new(model, tokenizer, &model_id, args.num_slots, 42)
                     .expect("Failed to create scheduler");
@@ -119,7 +115,9 @@ async fn main() {
     let addr = format!("0.0.0.0:{}", args.port);
     info!("Server listening on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to bind to {addr}: {e}"));
     axum::serve(
         axum::serve::ListenerExt::tap_io(listener, |tcp_stream| {
             let _ = tcp_stream.set_nodelay(true);
@@ -128,7 +126,7 @@ async fn main() {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await
-    .unwrap();
+    .expect("Server error");
 
     if args.trace_output_path.is_some() {
         info!("Flushing pending traces...");

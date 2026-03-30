@@ -30,7 +30,7 @@ use anyhow::{Result, bail};
 // ============================================================================
 
 /// Tensor parallel configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TpConfig {
     /// Total number of TP ranks (GPUs in the tensor-parallel group).
     pub world_size: usize,
@@ -41,7 +41,10 @@ pub struct TpConfig {
 impl TpConfig {
     /// Single-GPU configuration (no parallelism).
     pub fn single() -> Self {
-        Self { world_size: 1, rank: 0 }
+        Self {
+            world_size: 1,
+            rank: 0,
+        }
     }
 
     /// Multi-GPU configuration.
@@ -133,8 +136,16 @@ pub fn column_shard(total: usize, tp: &TpConfig) -> ShardingSpec {
     let remainder = total % tp.world_size;
     // Distribute remainder to the last rank.
     let offset = tp.rank * base;
-    let size = if tp.rank == tp.world_size - 1 { base + remainder } else { base };
-    ShardingSpec { offset, size, total }
+    let size = if tp.rank == tp.world_size - 1 {
+        base + remainder
+    } else {
+        base
+    };
+    ShardingSpec {
+        offset,
+        size,
+        total,
+    }
 }
 
 /// Compute the shard for a **row-parallel** dimension (input features split
@@ -157,13 +168,13 @@ pub fn head_shard(
     num_kv_heads: usize,
     tp: &TpConfig,
 ) -> Result<(usize, usize)> {
-    if num_q_heads % tp.world_size != 0 {
+    if !num_q_heads.is_multiple_of(tp.world_size) {
         bail!(
             "num_q_heads ({num_q_heads}) not divisible by world_size ({})",
             tp.world_size
         );
     }
-    if num_kv_heads % tp.world_size != 0 {
+    if !num_kv_heads.is_multiple_of(tp.world_size) {
         bail!(
             "num_kv_heads ({num_kv_heads}) not divisible by world_size ({})",
             tp.world_size
@@ -402,7 +413,11 @@ mod tests {
 
     #[test]
     fn sharding_spec_range() {
-        let s = ShardingSpec { offset: 8, size: 4, total: 16 };
+        let s = ShardingSpec {
+            offset: 8,
+            size: 4,
+            total: 16,
+        };
         assert_eq!(s.end(), 12);
         assert_eq!(s.range(), 8..12);
         assert!(!s.is_full());
@@ -410,7 +425,11 @@ mod tests {
 
     #[test]
     fn sharding_spec_full() {
-        let s = ShardingSpec { offset: 0, size: 1024, total: 1024 };
+        let s = ShardingSpec {
+            offset: 0,
+            size: 1024,
+            total: 1024,
+        };
         assert!(s.is_full());
     }
 }

@@ -6,9 +6,9 @@ Target: **production-grade LLM inference engine** on par with sglang (excluding 
 
 ## Current State (2026-03-31)
 
-Working: Qwen3/Qwen3.5 inference, FlashAttention-2 (Triton), KV cache + CPU offload, continuous batching with chunked prefill, top-k/p/temp sampling, OpenAI `/v1/completions` + SSE, CUDA graph decode, Rust agent binary, Python async agent, Dynamo integration.
+Working: Qwen3/Qwen3.5 inference, FlashAttention-2 (Triton), KV cache + CPU offload, continuous batching with chunked prefill, top-k/p/temp/min-p/penalty sampling, OpenAI `/v1/completions` + `/v1/chat/completions` + SSE, CUDA graph decode, Rust agent binary, Python async agent, Dynamo integration, Prometheus `/metrics` + `/v1/stats` endpoints, model architecture registry, radix-tree prefix cache (data structure), paged KV block manager (accounting), speculative decoding framework (CPU stubs), tensor parallel config/sharding math (CPU stubs), CUDA graph batch pool (CPU tracking), quantization format detection (GPTQ/AWQ/FP8/INT8/GGUF parser).
 
-Missing: multi-architecture support, PagedAttention, radix-tree prefix cache, MLA/GQA generalization, chat completions API, quantization, tensor parallel, speculative decoding, comprehensive benchmarks.
+Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi), PagedAttention CUDA kernel, MLA attention, quantization GPU kernels, tensor parallel communication (NCCL), speculative decoding GPU integration, comprehensive benchmark suite.
 
 ---
 

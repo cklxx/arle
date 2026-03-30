@@ -73,11 +73,13 @@ impl Default for SamplingParams {
 impl SamplingParams {
     /// Returns `true` when deterministic greedy decoding should be used.
     /// Greedy when temperature ≤ 0 (or top_k == 1) AND no stochastic filters.
+    #[allow(dead_code)]
     pub(crate) fn is_greedy(&self) -> bool {
         (self.temperature <= 0.0 || self.top_k == 1) && self.top_p >= 1.0 && self.min_p <= 0.0
     }
 
     /// Returns `true` when any penalty modifies the logits before sampling.
+    #[allow(clippy::float_cmp)]
     pub fn has_penalties(&self) -> bool {
         self.repetition_penalty != 1.0
             || self.frequency_penalty != 0.0
@@ -90,6 +92,7 @@ impl SamplingParams {
     ///
     /// This pure-Rust implementation is used for correctness tests. The
     /// production path calls the CUDA kernel in `ops/sampling.rs`.
+    #[allow(clippy::float_cmp)]
     pub fn apply_penalties(&self, logits: &mut [f32], token_counts: &[u32]) {
         if !self.has_penalties() {
             return;
@@ -111,20 +114,17 @@ impl SamplingParams {
 
             // Repetition penalty: divide by penalty if logit > 0, multiply if < 0.
             // This matches Transformers / SGLang semantics.
-            let penalized = if rep != 1.0 {
-                if logit >= 0.0 {
-                    logit / rep
-                } else {
-                    logit * rep
-                }
-            } else {
+            let penalized = if rep == 1.0 {
                 logit
+            } else if logit >= 0.0 {
+                logit / rep
+            } else {
+                logit * rep
             };
 
             // Frequency + presence penalties (additive, like OpenAI).
-            let penalized = penalized
-                - freq * (*count as f32)
-                - if *count > 0 { pres } else { 0.0 };
+            let penalized =
+                penalized - freq * (*count as f32) - if *count > 0 { pres } else { 0.0 };
 
             logits[token_id] = penalized;
         }

@@ -81,7 +81,9 @@ fn format_tool_definitions(tools: &[Tool]) -> String {
         return String::new();
     }
 
-    let mut out = String::from("\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>");
+    let mut out = String::from(
+        "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>",
+    );
 
     for tool in tools {
         let schema = serde_json::json!({
@@ -93,7 +95,7 @@ fn format_tool_definitions(tools: &[Tool]) -> String {
             }
         });
         out.push('\n');
-        out.push_str(&serde_json::to_string(&schema).unwrap());
+        out.push_str(&serde_json::to_string(&schema).expect("tool schema serialization"));
     }
 
     out.push_str("\n</tools>\n\nFor each function call, return a JSON object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>");
@@ -129,7 +131,9 @@ pub fn format_prompt(messages: &[Message], tools: &[Tool]) -> String {
                         "name": tc.name,
                         "arguments": tc.arguments,
                     });
-                    prompt.push_str(&serde_json::to_string(&call_json).unwrap());
+                    prompt.push_str(
+                        &serde_json::to_string(&call_json).expect("tool call serialization"),
+                    );
                     prompt.push_str("\n</tool_call>");
                 }
                 prompt.push_str("<|im_end|>\n");

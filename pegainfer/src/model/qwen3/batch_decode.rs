@@ -214,8 +214,7 @@ impl Qwen3Model {
                 .map_err(|e| anyhow::anyhow!("H2D decode_meta failed: {e}"))?;
 
             // Run fused decode attention (QK-norm + RoPE + KV write + attention)
-            let (k_cache, v_cache) =
-                state.kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
+            let (k_cache, v_cache) = state.kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
             ops::fused_attention_decode_into(
                 &self.ctx,
                 &state.decode_bufs.q,
@@ -237,7 +236,12 @@ impl Qwen3Model {
             )?;
 
             // Copy attention output back to batch row
-            copy_vec_to_row(&self.ctx, &state.decode_bufs.attn_out, &mut bufs.attn_output, b)?;
+            copy_vec_to_row(
+                &self.ctx,
+                &state.decode_bufs.attn_out,
+                &mut bufs.attn_output,
+                b,
+            )?;
         }
 
         // 4. Batched O projection → bufs.o_buf [B, hidden_dim]

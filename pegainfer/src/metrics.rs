@@ -20,6 +20,7 @@
 //! | `pegainfer_kv_gpu_blocks_free` | gauge | Free GPU KV blocks |
 //! | `pegainfer_kv_gpu_blocks_total` | gauge | Total GPU KV blocks |
 
+use std::fmt::Write as FmtWrite;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -41,11 +42,12 @@ pub struct Histogram {
 
 /// Default latency buckets in seconds, covering 1ms … 60s.
 pub const LATENCY_BUCKETS: &[f64] = &[
-    0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.500, 1.0, 2.0, 5.0, 10.0, 30.0,
-    60.0,
+    0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.500, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0,
 ];
 
 impl Histogram {
+    /// Create a new histogram with the given bucket boundaries (in seconds).
+    /// Buckets are sorted ascending. Duplicate boundaries are de-duplicated by sort.
     pub fn new(buckets: &[f64]) -> Self {
         let mut sorted = buckets.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -75,13 +77,15 @@ impl Histogram {
         let mut cumulative = 0u64;
         for (i, &bound) in self.buckets.iter().enumerate() {
             cumulative += self.counts[i];
-            out.push_str(&format!(
-                "{name}_bucket{{{labels}le=\"{bound:.3}\"}} {cumulative}\n"
-            ));
+            writeln!(
+                out,
+                "{name}_bucket{{{labels}le=\"{bound:.3}\"}} {cumulative}"
+            )
+            .unwrap();
         }
-        out.push_str(&format!("{name}_bucket{{{labels}le=\"+Inf\"}} {}\n", self.count));
-        out.push_str(&format!("{name}_sum{{{labels}}} {:.6}\n", self.sum));
-        out.push_str(&format!("{name}_count{{{labels}}} {}\n", self.count));
+        writeln!(out, "{name}_bucket{{{labels}le=\"+Inf\"}} {}", self.count).unwrap();
+        writeln!(out, "{name}_sum{{{labels}}} {:.6}", self.sum).unwrap();
+        writeln!(out, "{name}_count{{{labels}}} {}", self.count).unwrap();
         out
     }
 
@@ -123,6 +127,7 @@ pub struct HistogramSet {
 }
 
 impl HistogramSet {
+    /// Create a new set of TTFT, TPOT, and E2E histograms using the default latency buckets.
     pub fn new() -> Self {
         Self {
             ttft: Histogram::new(LATENCY_BUCKETS),
@@ -190,6 +195,7 @@ impl ServerMetrics {
     // Update helpers (called by scheduler)
     // -----------------------------------------------------------------------
 
+    /// Record a completed request: update counters and observe latency histograms.
     pub fn record_request_completed(
         &self,
         prompt_tokens: u64,
@@ -199,7 +205,9 @@ impl ServerMetrics {
         e2e_s: f64,
     ) {
         self.inner.requests_total.fetch_add(1, Ordering::Relaxed);
-        self.inner.tokens_prompt_total.fetch_add(prompt_tokens, Ordering::Relaxed);
+        self.inner
+            .tokens_prompt_total
+            .fetch_add(prompt_tokens, Ordering::Relaxed);
         self.inner
             .tokens_generated_total
             .fetch_add(generated_tokens, Ordering::Relaxed);
@@ -213,21 +221,29 @@ impl ServerMetrics {
         }
     }
 
+    /// Increment the failed-request counter.
     pub fn record_request_failed(&self) {
-        self.inner.requests_failed_total.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .requests_failed_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Set the number of currently-active requests.
     pub fn set_active(&self, n: u64) {
         self.inner.requests_active.store(n, Ordering::Relaxed);
     }
 
+    /// Set the number of requests currently waiting in the queue.
     pub fn set_waiting(&self, n: u64) {
         self.inner.requests_waiting.store(n, Ordering::Relaxed);
     }
 
+    /// Update the GPU KV block gauges.
     pub fn set_kv_gpu_blocks(&self, free: u64, total: u64) {
         self.inner.kv_gpu_blocks_free.store(free, Ordering::Relaxed);
-        self.inner.kv_gpu_blocks_total.store(total, Ordering::Relaxed);
+        self.inner
+            .kv_gpu_blocks_total
+            .store(total, Ordering::Relaxed);
     }
 
     // -----------------------------------------------------------------------
@@ -281,39 +297,49 @@ impl ServerMetrics {
         // Counters
         out.push_str("# HELP pegainfer_requests_total Total completed inference requests.\n");
         out.push_str("# TYPE pegainfer_requests_total counter\n");
-        out.push_str(&format!(
-            "pegainfer_requests_total{{{labels}}} {}\n",
+        writeln!(
+            out,
+            "pegainfer_requests_total{{{labels}}} {}",
             self.inner.requests_total.load(Ordering::Relaxed)
-        ));
+        )
+        .unwrap();
 
         out.push_str("# HELP pegainfer_tokens_generated_total Total output tokens generated.\n");
         out.push_str("# TYPE pegainfer_tokens_generated_total counter\n");
-        out.push_str(&format!(
-            "pegainfer_tokens_generated_total{{{labels}}} {}\n",
+        writeln!(
+            out,
+            "pegainfer_tokens_generated_total{{{labels}}} {}",
             self.inner.tokens_generated_total.load(Ordering::Relaxed)
-        ));
+        )
+        .unwrap();
 
         out.push_str("# HELP pegainfer_tokens_prompt_total Total prompt tokens processed.\n");
         out.push_str("# TYPE pegainfer_tokens_prompt_total counter\n");
-        out.push_str(&format!(
-            "pegainfer_tokens_prompt_total{{{labels}}} {}\n",
+        writeln!(
+            out,
+            "pegainfer_tokens_prompt_total{{{labels}}} {}",
             self.inner.tokens_prompt_total.load(Ordering::Relaxed)
-        ));
+        )
+        .unwrap();
 
         // Gauges
         out.push_str("# HELP pegainfer_requests_active Currently running requests.\n");
         out.push_str("# TYPE pegainfer_requests_active gauge\n");
-        out.push_str(&format!(
-            "pegainfer_requests_active{{{labels}}} {}\n",
+        writeln!(
+            out,
+            "pegainfer_requests_active{{{labels}}} {}",
             self.inner.requests_active.load(Ordering::Relaxed)
-        ));
+        )
+        .unwrap();
 
         out.push_str("# HELP pegainfer_requests_waiting Requests waiting in queue.\n");
         out.push_str("# TYPE pegainfer_requests_waiting gauge\n");
-        out.push_str(&format!(
-            "pegainfer_requests_waiting{{{labels}}} {}\n",
+        writeln!(
+            out,
+            "pegainfer_requests_waiting{{{labels}}} {}",
             self.inner.requests_waiting.load(Ordering::Relaxed)
-        ));
+        )
+        .unwrap();
 
         let total = self.inner.kv_gpu_blocks_total.load(Ordering::Relaxed);
         let free = self.inner.kv_gpu_blocks_free.load(Ordering::Relaxed);
@@ -325,15 +351,19 @@ impl ServerMetrics {
 
         out.push_str("# HELP pegainfer_kv_gpu_utilization GPU KV cache utilization [0,1].\n");
         out.push_str("# TYPE pegainfer_kv_gpu_utilization gauge\n");
-        out.push_str(&format!("pegainfer_kv_gpu_utilization{{{labels}}} {utilization:.4}\n"));
+        writeln!(
+            out,
+            "pegainfer_kv_gpu_utilization{{{labels}}} {utilization:.4}"
+        )
+        .unwrap();
 
         out.push_str("# HELP pegainfer_kv_gpu_blocks_free Free GPU KV cache blocks.\n");
         out.push_str("# TYPE pegainfer_kv_gpu_blocks_free gauge\n");
-        out.push_str(&format!("pegainfer_kv_gpu_blocks_free{{{labels}}} {free}\n"));
+        writeln!(out, "pegainfer_kv_gpu_blocks_free{{{labels}}} {free}").unwrap();
 
         out.push_str("# HELP pegainfer_kv_gpu_blocks_total Total GPU KV cache blocks.\n");
         out.push_str("# TYPE pegainfer_kv_gpu_blocks_total gauge\n");
-        out.push_str(&format!("pegainfer_kv_gpu_blocks_total{{{labels}}} {total}\n"));
+        writeln!(out, "pegainfer_kv_gpu_blocks_total{{{labels}}} {total}").unwrap();
 
         // Histograms
         if let Ok(h) = self.inner.histograms.lock() {
@@ -359,18 +389,15 @@ impl ServerMetrics {
         let ttft_p50 = histograms
             .as_ref()
             .and_then(|h| h.ttft.percentile(0.50))
-            .map(|v| format!("{v:.1}ms"))
-            .unwrap_or_else(|| "—".to_string());
+            .map_or_else(|| "—".to_string(), |v| format!("{v:.1}ms"));
         let ttft_p99 = histograms
             .as_ref()
             .and_then(|h| h.ttft.percentile(0.99))
-            .map(|v| format!("{v:.1}ms"))
-            .unwrap_or_else(|| "—".to_string());
+            .map_or_else(|| "—".to_string(), |v| format!("{v:.1}ms"));
         let tpot_p50 = histograms
             .as_ref()
             .and_then(|h| h.tpot.percentile(0.50))
-            .map(|v| format!("{:.1}ms", v * 1000.0))
-            .unwrap_or_else(|| "—".to_string());
+            .map_or_else(|| "—".to_string(), |v| format!("{:.1}ms", v * 1000.0));
 
         format!(
             "requests={} active={} waiting={} tokens_out={} kv_util={:.1}% ttft_p50={} ttft_p99={} tpot_p50={}",

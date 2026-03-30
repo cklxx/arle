@@ -101,7 +101,10 @@ impl GraphPool {
             .iter()
             .map(|&bs| (bs, GraphCaptureState::Uncaptured))
             .collect();
-        Self { states, replay_counts: HashMap::new() }
+        Self {
+            states,
+            replay_counts: HashMap::new(),
+        }
     }
 
     /// Returns the capture state for the given batch size.
@@ -113,7 +116,10 @@ impl GraphPool {
 
     /// Returns `true` if the graph for this batch size is ready for replay.
     pub fn is_ready(&self, batch_size: usize) -> bool {
-        self.states.get(&batch_size).copied().map_or(false, |s| s.is_ready())
+        self.states
+            .get(&batch_size)
+            .copied()
+            .is_some_and(GraphCaptureState::is_ready)
     }
 
     /// Mark a graph as currently being captured.
@@ -190,7 +196,11 @@ impl GraphPool {
             Some(padded) => {
                 if self.is_ready(padded) {
                     self.record_replay(padded);
-                    DispatchDecision::Graph { padded, actual: n, padding: padded - n }
+                    DispatchDecision::Graph {
+                        padded,
+                        actual: n,
+                        padding: padded - n,
+                    }
                 } else {
                     DispatchDecision::Eager { actual: n }
                 }
@@ -225,8 +235,7 @@ impl DispatchDecision {
 
     pub fn actual_size(&self) -> usize {
         match self {
-            Self::Graph { actual, .. } => *actual,
-            Self::Eager { actual } => *actual,
+            Self::Graph { actual, .. } | Self::Eager { actual } => *actual,
         }
     }
 }
@@ -376,7 +385,11 @@ mod tests {
         assert!(d.is_graph());
         assert_eq!(d.actual_size(), 6);
         match d {
-            DispatchDecision::Graph { padded, actual, padding } => {
+            DispatchDecision::Graph {
+                padded,
+                actual,
+                padding,
+            } => {
                 assert_eq!(padded, 8);
                 assert_eq!(actual, 6);
                 assert_eq!(padding, 2);

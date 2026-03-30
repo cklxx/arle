@@ -15,20 +15,29 @@
 //! 3. Round-robin among active decode requests
 //! 4. Starting new prefills only when no decode work is pending
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
-use log::{error, info};
-use rand::SeedableRng;
-use rand::rngs::StdRng;
 use tokio::sync::mpsc;
+
+#[cfg(feature = "cuda")]
+use log::{error, info};
+
+#[cfg(feature = "cuda")]
+use rand::SeedableRng;
+#[cfg(feature = "cuda")]
+use rand::rngs::StdRng;
+
+#[cfg(feature = "cuda")]
+use std::collections::VecDeque;
 
 #[cfg(feature = "cuda")]
 use crate::model::{GenerationState, ModelForward};
 use crate::sampler::SamplingParams;
-use crate::server_engine::{FinishReason, StreamDelta, Usage};
+use crate::server_engine::StreamDelta;
+#[cfg(feature = "cuda")]
+use crate::server_engine::{FinishReason, Usage};
 #[cfg(feature = "cuda")]
 use crate::tokenizer::Tokenizer;
 
@@ -125,14 +134,6 @@ pub struct IncomingRequest {
     pub delta_tx: mpsc::UnboundedSender<StreamDelta>,
 }
 
-/// Stats snapshot from the scheduler.
-pub struct SchedulerStats {
-    pub active_requests: usize,
-    pub waiting_requests: usize,
-    pub total_completed: u64,
-    pub total_generated_tokens: u64,
-}
-
 /// Error returned when the scheduler's waiting queue is full.
 #[derive(Debug)]
 pub struct SchedulerFull;
@@ -211,6 +212,7 @@ impl SchedulerHandle {
         self.waiting_count.load(Ordering::Relaxed)
     }
 
+    /// Returns the model identifier string for this scheduler.
     pub fn model_id(&self) -> &str {
         &self.model_id
     }
@@ -434,6 +436,8 @@ impl<M: ModelForward> Scheduler<M> {
         let handle = SchedulerHandle {
             tx,
             model_id: Arc::from(model_id),
+            waiting_count: Arc::new(AtomicUsize::new(0)),
+            max_waiting: 0, // unlimited
         };
 
         Ok((scheduler, handle))
@@ -477,7 +481,7 @@ impl<M: ModelForward> Scheduler<M> {
                 None => break,
             };
 
-            let incoming = self.waiting.pop_front().unwrap();
+            let incoming = self.waiting.pop_front().expect("checked non-empty above");
             let prompt_tokens = match self.tokenizer.encode(&incoming.prompt) {
                 Ok(tokens) if !tokens.is_empty() => tokens,
                 Ok(_) => {
@@ -536,7 +540,10 @@ impl<M: ModelForward> Scheduler<M> {
         // decode-priority would completely starve prefills, making requests
         // process sequentially instead of concurrently.
 
-        let has_decode = self.active.iter().any(|r| matches!(r.phase, Phase::Decoding));
+        let has_decode = self
+            .active
+            .iter()
+            .any(|r| matches!(r.phase, Phase::Decoding));
         if has_decode {
             self.step_decode_batch();
         }
@@ -580,7 +587,9 @@ impl<M: ModelForward> Scheduler<M> {
         let effective = if prefix_len > 0 && prefix_len == cached.len() {
             info!(
                 "Request {}: prefix HIT {}/{} tokens",
-                req.id, prefix_len, req.prompt_tokens.len()
+                req.id,
+                prefix_len,
+                req.prompt_tokens.len()
             );
             let suffix = &req.prompt_tokens[prefix_len..];
             if suffix.is_empty() {
@@ -591,7 +600,9 @@ impl<M: ModelForward> Scheduler<M> {
         } else if prefix_len > 0 {
             info!(
                 "Request {}: prefix PARTIAL {}/{} tokens",
-                req.id, prefix_len, req.prompt_tokens.len()
+                req.id,
+                prefix_len,
+                req.prompt_tokens.len()
             );
             if let Err(e) = state.truncate_to(prefix_len) {
                 error!("Request {}: truncate failed: {}", req.id, e);
@@ -721,7 +732,8 @@ impl<M: ModelForward> Scheduler<M> {
         } = self;
 
         // Collect decode request indices and their tokens
-        let decode_indices: Vec<usize> = active.iter()
+        let decode_indices: Vec<usize> = active
+            .iter()
             .enumerate()
             .filter(|(_, r)| matches!(r.phase, Phase::Decoding) && !r.delta_tx.is_closed())
             .map(|(i, _)| i)
@@ -738,12 +750,11 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        let token_ids: Vec<u32> = decode_indices.iter()
+        let token_ids: Vec<u32> = decode_indices
+            .iter()
             .map(|&i| *active[i].generated_tokens.last().unwrap())
             .collect();
-        let slot_indices: Vec<usize> = decode_indices.iter()
-            .map(|&i| active[i].slot_idx)
-            .collect();
+        let slot_indices: Vec<usize> = decode_indices.iter().map(|&i| active[i].slot_idx).collect();
 
         // Run forward pass
         let forward_result = if decode_indices.len() == 1 {
@@ -867,13 +878,19 @@ mod tests {
 
     #[test]
     fn scheduler_config_zero_slots_invalid() {
-        let cfg = SchedulerConfig { max_slots: 0, ..Default::default() };
+        let cfg = SchedulerConfig {
+            max_slots: 0,
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn scheduler_config_zero_chunk_invalid() {
-        let cfg = SchedulerConfig { prefill_chunk_size: 0, ..Default::default() };
+        let cfg = SchedulerConfig {
+            prefill_chunk_size: 0,
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
