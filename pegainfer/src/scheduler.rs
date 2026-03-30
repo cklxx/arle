@@ -384,24 +384,26 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        // Priority 1: batch ALL decode requests together (single GPU forward pass)
-        let decode_count = self.active.iter()
-            .filter(|r| matches!(r.phase, Phase::Decoding))
-            .count();
-        if decode_count > 0 {
+        // Each step does TWO things:
+        // 1. Batch decode ALL active decode requests (1 token each)
+        // 2. Run ONE prefill chunk (so new requests don't starve)
+        //
+        // This interleaves decode and prefill properly. Without step 2,
+        // decode-priority would completely starve prefills, making requests
+        // process sequentially instead of concurrently.
+
+        let has_decode = self.active.iter().any(|r| matches!(r.phase, Phase::Decoding));
+        if has_decode {
             self.step_decode_batch();
-            return;
         }
 
-        // Priority 2: resume an ongoing chunked prefill
+        // Run one prefill operation (ongoing chunk or new request setup)
         for idx in 0..num {
             if matches!(self.active[idx].phase, Phase::Prefilling { .. }) {
                 self.step_prefill_chunk(idx);
                 return;
             }
         }
-
-        // Priority 3: start a new request (prefix cache check + first chunk)
         for idx in 0..num {
             if matches!(self.active[idx].phase, Phase::New) {
                 self.step_new(idx);
