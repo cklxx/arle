@@ -1,89 +1,119 @@
 # agent-infer
 
-Agent system with multi-turn conversation and tool calling, built on [Dynamo](https://github.com/cklxx/dynamo) (inference orchestration) + [Pegainfer](https://github.com/cklxx/pegainfer) (Rust+CUDA inference engine).
+Pure Rust agent system with multi-turn tool calling, built on [Pegainfer](https://github.com/cklxx/pegainfer) (Rust+CUDA inference) + [Dynamo](https://github.com/cklxx/dynamo) (inference orchestration).
+
+**No Python glue** — direct `ModelForward::forward()` calls from Rust.
 
 ## Architecture
 
 ```
-User Request
+User Input
      ↓
-Agent Loop (agent_infer/)
-  ├─ Chat formatter (Qwen3 ChatML)
-  ├─ Tool call parser
-  └─ Tool executor (python, shell, file)
+Rust Agent Binary (src/)
+  ├─ ChatML formatter (src/chat.rs)
+  ├─ <tool_call> parser (src/chat.rs)
+  ├─ Tool executor: shell, python (src/tools.rs)
+  └─ Agent loop (src/agent.rs)
      ↓
-LLM Client
-  ├─ Direct: pegainfer /v1/completions
-  └─ Orchestrated: Dynamo frontend /v1/chat/completions
-     ↓
-Pegainfer (Rust+CUDA inference)
-  └─ Qwen3-4B / Qwen3-8B / Qwen3.5-4B
+Pegainfer (Rust library, linked directly)
+  ├─ ModelForward::forward()    ← GPU inference
+  ├─ KV prefix cache            ← cross-request reuse
+  ├─ KV offload (GPU → CPU)     ← long context support
+  └─ CUDA Graph                 ← decode acceleration
 ```
 
 ## Quick Start
 
-### 1. Start Pegainfer
-
 ```bash
-./scripts/start_pegainfer.sh pegainfer/models/Qwen3-4B
+# Build
+cargo build --release
+
+# Run (interactive REPL)
+./target/release/agent-infer --model-path pegainfer/models/Qwen3-8B
+
+# With options
+./target/release/agent-infer \
+  --model-path pegainfer/models/Qwen3-8B \
+  --max-tokens 4096 \
+  --max-turns 10 \
+  --temperature 0.0
 ```
 
-### 2. Run Agent (Direct Mode)
+## Features
 
+### KV Prefix Cache
+Reuses KV cache across multi-turn requests. When a new prompt shares a prefix with the previous one, only the new suffix is computed.
+
+### KV Offload (GPU → CPU)
+When GPU memory is full, older KV blocks are offloaded to CPU RAM. Before attention, they're automatically prefetched back. Enables contexts beyond GPU VRAM.
+
+### Partial Prefix Reuse
+When conversations diverge, `truncate_to()` keeps the common prefix instead of resetting entirely.
+
+### Dynamo Integration (optional)
 ```bash
-pip install -e .
-python -m agent_infer --url http://localhost:8000
+cargo build --release --features dynamo
+./target/release/agent-infer --model-path ... --dynamo
 ```
-
-### 3. Run Agent (via Dynamo)
-
-```bash
-# Terminal 1: Start Dynamo + pegainfer backend
-./scripts/start_dynamo.sh
-
-# Terminal 2: Start agent
-./scripts/start_agent.sh dynamo
-```
-
-## Usage
-
-### Interactive REPL
-
-```bash
-python -m agent_infer
-```
-
-### Single Query
-
-```bash
-python -m agent_infer query "What is 2^100?"
-```
-
-### HTTP Server
-
-```bash
-python -m agent_infer serve --port 9000
-```
+Registers with Dynamo's distributed runtime for service discovery and KV-aware routing.
 
 ## Built-in Tools
 
 | Tool | Description |
 |------|-------------|
-| `python` | Execute Python code |
-| `shell` | Execute shell commands |
-| `file` | Read, write, list files |
+| `python` | Execute Python code via `python3 -c` |
+| `shell` | Execute shell commands via `bash -c` |
+
+## Benchmark
+
+```bash
+python3 scripts/bench_agent.py pegainfer/models/Qwen3-8B
+```
+
+### Test Environment
+
+| Spec | Value |
+|------|-------|
+| GPU | NVIDIA A100-SXM4-40GB |
+| CPU | Intel Xeon @ 2.20GHz, 12 cores |
+| RAM | 83GB |
+| CUDA | 13.0 (Driver 580.82) |
+| OS | Linux 6.6.113+ |
+
+### Results
+
+| Model | Prompts | Turns | Tool Calls | KV Hit Rate | Avg Time |
+|-------|---------|-------|-----------|-------------|----------|
+| Qwen3-4B | 5 | 10 | 8 | 100% | 31.9s |
+| Qwen3-8B | 5 | 10 | 11 | 100% | 88.5s |
+
+KV prefix cache saves 12-38% of prefill computation on multi-turn agent conversations.
+
+### Verify KV Cache Correctness
+
+```bash
+# Starts pegainfer HTTP server, compares cold vs warm outputs (greedy decoding)
+python3 scripts/verify_kv_cache.py http://localhost:8000
+```
 
 ## Project Structure
 
 ```
 agent-infer/
-├── agent_infer/              # Agent framework (Python)
-│   ├── agent.py              # Agent loop: generate → parse → execute → repeat
-│   ├── chat.py               # Message types, ChatML formatter, tool call parser
-│   ├── client.py             # Async LLM client (pegainfer / OpenAI-compatible)
-│   └── tools/                # Tool registry and built-in tools
-├── dynamo/                   # Dynamo source (inference orchestration)
-│   └── components/src/dynamo/pegainfer/  # Pegainfer backend for Dynamo
-├── pegainfer/                # Pegainfer source (Rust+CUDA inference engine)
-└── scripts/                  # Startup scripts
+├── src/                         # Rust agent binary
+│   ├── main.rs                  # CLI + REPL, model loading
+│   ├── agent.rs                 # Agent loop: generate → parse → execute → repeat
+│   ├── chat.rs                  # ChatML formatter + <tool_call> parser
+│   ├── tools.rs                 # Built-in shell/python tools
+│   └── dynamo_integration.rs    # Optional Dynamo runtime integration
+├── pegainfer/                   # Inference engine (submodule)
+│   └── src/model/kv_cache.rs    # KV cache with CPU offload
+├── dynamo/                      # Inference orchestration (submodule)
+│   └── components/src/dynamo/pegainfer/  # Dynamo backend module
+├── scripts/
+│   ├── bench_agent.py           # Agent prompt benchmark
+│   ├── verify_kv_cache.py       # KV cache correctness test
+│   ├── start_pegainfer.sh       # Start inference server
+│   └── start_dynamo.sh          # Start Dynamo stack
+└── Cargo.toml
 ```
