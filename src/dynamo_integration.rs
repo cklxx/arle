@@ -25,22 +25,24 @@ use dynamo_runtime::{
     protocols::annotated::Annotated,
     stream,
 };
+use tokio::sync::mpsc;
+
+use pegainfer::sampler::SamplingParams;
+use pegainfer::scheduler::{IncomingRequest, SchedulerHandle};
 
 const NAMESPACE: &str = "dynamo";
 const COMPONENT: &str = "agent-infer";
 const ENDPOINT: &str = "generate";
 
 /// Request handler that wraps agent-infer's generate capability and exposes
-/// it as a Dynamo endpoint.
-///
-/// For now this is a simple echo/passthrough handler that proves registration
-/// works. The full integration would forward requests to the local
-/// `ServerEngine` instance and stream back token-by-token responses.
-struct AgentEndpoint;
+/// it as a Dynamo endpoint. Forwards requests to the pegainfer scheduler.
+struct AgentEndpoint {
+    handle: SchedulerHandle,
+}
 
 impl AgentEndpoint {
-    fn new() -> Arc<Self> {
-        Arc::new(Self)
+    fn new(handle: SchedulerHandle) -> Arc<Self> {
+        Arc::new(Self { handle })
     }
 }
 
@@ -50,27 +52,50 @@ impl AsyncEngine<SingleIn<String>, ManyOut<Annotated<String>>, Error> for AgentE
         &self,
         input: SingleIn<String>,
     ) -> anyhow::Result<ManyOut<Annotated<String>>> {
-        let (data, ctx) = input.into_parts();
+        let (prompt, ctx) = input.into_parts();
 
-        // Placeholder: echo the request back as a single-token stream.
-        // A full integration would run the agent loop here and stream tokens.
-        let response = vec![Annotated::from_data(format!(
-            "[agent-infer] received: {}",
-            data
-        ))];
+        // Create a channel to receive streaming deltas from the scheduler.
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
 
-        let stream = stream::iter(response);
-        Ok(ResponseStream::new(Box::pin(stream), ctx.context()))
+        let req = IncomingRequest {
+            prompt,
+            max_tokens: 256,
+            sampling: SamplingParams {
+                temperature: 0.0,
+                ..SamplingParams::default()
+            },
+            stop: None,
+            delta_tx,
+        };
+
+        if !self.handle.submit(req) {
+            anyhow::bail!("Scheduler is shut down");
+        }
+
+        // Collect all deltas into a Vec of Annotated<String>.
+        let mut results = Vec::new();
+        while let Some(delta) = delta_rx.recv().await {
+            if !delta.text_delta.is_empty() {
+                results.push(Annotated::from_data(delta.text_delta));
+            }
+            // Stop collecting once we get a finish signal.
+            if delta.finish_reason.is_some() {
+                break;
+            }
+        }
+
+        let response_stream = stream::iter(results);
+        Ok(ResponseStream::new(Box::pin(response_stream), ctx.context()))
     }
 }
 
 /// Register the agent-infer endpoint with the Dynamo distributed runtime.
 ///
 /// This function blocks until the runtime shuts down (e.g. via signal).
-async fn register(runtime: Runtime) -> anyhow::Result<()> {
+async fn register(runtime: Runtime, handle: SchedulerHandle) -> anyhow::Result<()> {
     let distributed = DistributedRuntime::from_settings(runtime.clone()).await?;
 
-    let ingress = Ingress::for_engine(AgentEndpoint::new())?;
+    let ingress = Ingress::for_engine(AgentEndpoint::new(handle))?;
 
     let component = distributed.namespace(NAMESPACE)?.component(COMPONENT)?;
     component
@@ -85,9 +110,9 @@ async fn register(runtime: Runtime) -> anyhow::Result<()> {
 ///
 /// Creates a `Worker`, initialises the Dynamo runtime, registers the agent
 /// as a discoverable endpoint, and blocks until shutdown.
-pub fn run_dynamo_worker() -> anyhow::Result<()> {
+pub fn run_dynamo_worker(handle: SchedulerHandle) -> anyhow::Result<()> {
     dynamo_runtime::logging::init();
 
     let worker = Worker::from_settings()?;
-    worker.execute(register)
+    worker.execute(move |runtime| register(runtime, handle))
 }

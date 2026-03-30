@@ -35,31 +35,48 @@ E2E tests compare against JSON baselines in `test_data/`. Regenerate baselines a
 
 ## Architecture
 
+### HTTP Server Path (multi-request)
+
 ```
-HTTP Request → GenericServerEngine<M> → tokenizer.encode() → generate(model, state, ...) → tokenizer.decode() → SSE/JSON Response
-                                                                        │
-                                                  ┌─────────────────────┤
-                                                  │                     │
-                                            Qwen3Model            Qwen35Model
-                                           (full attention)  (24 linear + 8 full attn)
-                                                  │                     │
-                                                  └─────────────────────┘
-                                                            │
+HTTP Request → SchedulerHandle.submit() → channel → Scheduler.run() (dedicated thread)
+                                                        │
+                                              ┌─── State Pool (N slots, each with KV cache) ───┐
+                                              │         │                                       │
+                                              │   Decode priority round-robin                   │
+                                              │   Chunked prefill (512 tok/chunk)               │
+                                              │         │                                       │
+                                              └─── model.forward(tokens, &mut slot.state) ──────┘
+                                                        │
+                                              StreamDelta → HTTP SSE/JSON Response
+```
+
+### Model Layer
+
+```
                                             M.forward(tokens, state)  ← ModelForward trait
-                                                            │
-                                            Prefill (batch GEMM) / Decode (GEMV, CUDA Graph)
-                                                            │
-                                                      ops.rs → ffi.rs → CUDA/Triton kernels
+                                                        │
+                                  ┌─────────────────────┤
+                                  │                     │
+                            Qwen3Model            Qwen35Model
+                           (full attention)  (24 linear + 8 full attn)
+                                  │                     │
+                                  └─────────────────────┘
+                                              │
+                              Prefill (batch GEMM) / Decode (GEMV, CUDA Graph)
+                                              │
+                                        ops.rs → ffi.rs → CUDA/Triton kernels
 ```
 
 **Key abstractions:**
 
-- **`ModelForward` trait** (`model.rs`) — single `forward(&self, tokens, state)` method; `tokens.len() > 1` → prefill, `== 1` → decode. Weights are `&self` (immutable, shareable), per-request mutable state lives in the associated `State` type. Shared `generate()` / `generate_streaming()` in `server_engine.rs` replace per-model generation loops. `GenericServerEngine<M: ModelForward>` provides request handling (stop sequences, streaming, sampling).
+- **`Scheduler`** (`scheduler.rs`) — multi-request scheduler with state pooling. Accepts requests via channel, interleaves them on a single GPU. Decode steps always run before new prefills. Long prefills are chunked (512 tokens) to allow decode interleaving. Each slot has its own KV cache for prefix reuse. `--num-slots N` controls concurrency (default 4).
+- **`ModelForward` trait** (`model.rs`) — single `forward(&self, tokens, state)` method; `tokens.len() > 1` → prefill, `== 1` → decode. Weights are `&self` (immutable, shareable across slots), per-request mutable state lives in the associated `State` type.
+- **`GenericServerEngine`** (`server_engine.rs`) — legacy single-request engine, still used by the REPL/agent CLI. HTTP server uses Scheduler instead.
 - **Model submodules** — each model lives under `src/model/{qwen3,qwen35}/` with `weights.rs`, `forward.rs`, `prefill.rs`, `decode.rs`, `config.rs`, `decode_buffers.rs`. Shared code: `model/cuda_graph.rs` (CUDA Graph capture/replay), `model/kv_cache.rs`.
 - **`ops.rs`** — high-level GPU operators (gemv, rms_norm, rope, fused_mlp, fused_attention, sampling). Calls unsafe C FFI in `ffi.rs`.
 - **Tensor types** (`tensor.rs`) — `DeviceVec` (1D bf16), `DeviceMatrix` (2D bf16), `HiddenStates` (batched hidden states). All GPU-resident, accessed via cudarc.
-- **CUDA Graph** (`model/cuda_graph.rs`) — decode path captured on first token, replayed on subsequent tokens. `embedding_decode_cuda()` reads token_id from GPU memory (not CPU) so the graph is stable. Pre-allocated `DecodeBuffers` ensure pointer stability.
-- **KVCache** (`model/kv_cache.rs`) — per-layer contiguous K/V buffers, seq_len tracking, reset between requests (keeps allocations).
+- **CUDA Graph** (`model/cuda_graph.rs`) — decode path captured per state slot on first token, replayed on subsequent tokens. Each slot has independent graph state.
+- **KVCache** (`model/kv_cache.rs`) — per-layer contiguous K/V buffers with CPU offload. Multiple instances coexist (one per scheduler slot).
 - **RecurrentState** (`model/qwen35/recurrent_state.rs`) — Qwen3.5 linear attention state, persists across decode steps within a generation.
 
 **Build system** (`build.rs`) does two things:
