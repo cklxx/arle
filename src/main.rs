@@ -46,6 +46,11 @@ struct Args {
     /// and KV-aware routing. Requires the `dynamo` feature.
     #[arg(long, default_value_t = false)]
     dynamo: bool,
+
+    /// Max KV cache tokens on GPU. Excess offloads to CPU.
+    /// Use a small value (e.g. 512) to test KV offload behavior.
+    #[arg(long)]
+    max_gpu_kv: Option<usize>,
 }
 
 fn run_repl(
@@ -143,12 +148,20 @@ fn main() -> Result<()> {
         ModelType::Qwen3 => {
             let mut engine =
                 RealServerEngine::load_with_options(&args.model_path, 42, options)?;
+            if let Some(max_kv) = args.max_gpu_kv {
+                info!("Setting max GPU KV to {} tokens (offload test mode)", max_kv);
+                engine.set_max_gpu_kv(max_kv);
+            }
             info!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
             run_repl(&mut engine, args.max_turns, args.max_tokens, args.temperature)?;
         }
         ModelType::Qwen35 => {
             let mut engine =
                 Qwen35ServerEngine::load_with_options(&args.model_path, 42, options)?;
+            if let Some(max_kv) = args.max_gpu_kv {
+                info!("Setting max GPU KV to {} tokens (offload test mode)", max_kv);
+                engine.set_max_gpu_kv(max_kv);
+            }
             info!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
             run_repl(&mut engine, args.max_turns, args.max_tokens, args.temperature)?;
         }
