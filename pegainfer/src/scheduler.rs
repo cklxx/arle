@@ -24,15 +24,18 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
+#[cfg(feature = "cuda")]
 use crate::model::{GenerationState, ModelForward};
 use crate::sampler::SamplingParams;
 use crate::server_engine::{FinishReason, StreamDelta, Usage};
+#[cfg(feature = "cuda")]
 use crate::tokenizer::Tokenizer;
 
 // ============================================================================
-// Constants
+// Constants (CUDA-only — used by Scheduler internals)
 // ============================================================================
 
+#[cfg(feature = "cuda")]
 const PREFILL_CHUNK_SIZE: usize = 512;
 
 // ============================================================================
@@ -84,9 +87,10 @@ impl SchedulerHandle {
 }
 
 // ============================================================================
-// Internal types
+// Internal types (CUDA-only — used by Scheduler)
 // ============================================================================
 
+#[cfg(feature = "cuda")]
 enum Phase {
     /// Newly assigned, needs prefix cache check.
     New,
@@ -101,6 +105,7 @@ enum Phase {
     Finished,
 }
 
+#[cfg(feature = "cuda")]
 struct ActiveRequest {
     id: u64,
     slot_idx: usize,
@@ -117,6 +122,7 @@ struct ActiveRequest {
     phase: Phase,
 }
 
+#[cfg(feature = "cuda")]
 impl ActiveRequest {
     /// Decode newly generated tokens and emit text deltas to the client.
     fn emit_delta(&mut self, tokenizer: &Tokenizer) {
@@ -223,8 +229,10 @@ impl ActiveRequest {
 // ============================================================================
 
 /// Interval (in completed requests) at which stats are logged.
+#[cfg(feature = "cuda")]
 const STATS_LOG_INTERVAL: u64 = 10;
 
+#[cfg(feature = "cuda")]
 pub struct Scheduler<M: ModelForward> {
     model: M,
     tokenizer: Tokenizer,
@@ -245,6 +253,7 @@ pub struct Scheduler<M: ModelForward> {
     total_generated_tokens: u64,
 }
 
+#[cfg(feature = "cuda")]
 impl<M: ModelForward> Scheduler<M> {
     /// Create a new scheduler and its handle.
     ///
