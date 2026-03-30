@@ -1,0 +1,48 @@
+//! Model implementations: Qwen3 and Qwen3.5.
+
+use anyhow::Result;
+use rand::rngs::StdRng;
+
+use crate::sampler::SamplingParams;
+use crate::tensor::DeviceVec;
+
+pub(crate) mod cuda_graph;
+mod kv_cache;
+
+pub mod qwen3;
+pub mod qwen35;
+
+pub use qwen3::{ModelRuntimeConfig, Qwen3Model, Qwen3State};
+pub use qwen35::{Qwen35Model, Qwen35State};
+
+// ============================================================================
+// ModelForward trait — shared by Qwen3 and Qwen3.5
+// ============================================================================
+
+/// Per-request mutable state. Separate from model weights for bs > 1 future.
+pub trait GenerationState {
+    fn logits(&self) -> &DeviceVec;
+    fn reset(&mut self) -> Result<()>;
+    /// Truncate KV cache to `len` tokens, keeping the first `len` tokens.
+    fn truncate_to(&mut self, len: usize) -> Result<()>;
+    /// Set max KV tokens on GPU. Excess offloads to CPU.
+    fn set_max_gpu_kv(&mut self, max_tokens: usize);
+    /// Offload excess KV to CPU if over GPU budget. Called between requests.
+    fn offload_kv_if_needed(&mut self) -> Result<()>;
+}
+
+/// Deep module interface: one `forward` method hides prefill/decode strategy,
+/// layer types, CUDA Graph, buffer management, KV cache, and recurrent state.
+pub trait ModelForward: Send {
+    type State: GenerationState + Send;
+
+    fn create_state(&self) -> Result<Self::State>;
+    fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()>;
+    fn select_token(
+        &self,
+        state: &mut Self::State,
+        params: &SamplingParams,
+        rng: &mut StdRng,
+    ) -> Result<u32>;
+    fn is_stop_token(&self, token_id: u32) -> bool;
+}
