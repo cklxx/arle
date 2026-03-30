@@ -1,6 +1,3 @@
 [submodule "dynamo"]
 	path = dynamo
 	url = git@github.com:cklxx/dynamo.git
-[submodule "pegainfer"]
-	path = pegainfer
-	url = git@github.com:cklxx/pegainfer.git
