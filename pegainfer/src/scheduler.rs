@@ -11,8 +11,9 @@
 //!
 //! The scheduler interleaves multiple requests on a single GPU by:
 //! 1. Prioritizing decode steps (1 token each) over prefill
-//! 2. Round-robin among active decode requests
-//! 3. Starting new prefills only when no decode work is pending
+//! 2. Chunking long prefills (512 tokens) so decode can interleave
+//! 3. Round-robin among active decode requests
+//! 4. Starting new prefills only when no decode work is pending
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -29,6 +30,12 @@ use crate::server_engine::{FinishReason, StreamDelta, Usage};
 use crate::tokenizer::Tokenizer;
 
 // ============================================================================
+// Constants
+// ============================================================================
+
+const PREFILL_CHUNK_SIZE: usize = 512;
+
+// ============================================================================
 // Public types
 // ============================================================================
 
@@ -40,6 +47,14 @@ pub struct IncomingRequest {
     pub stop: Option<Vec<String>>,
     /// Channel to send streaming deltas back to the HTTP handler.
     pub delta_tx: mpsc::UnboundedSender<StreamDelta>,
+}
+
+/// Stats snapshot from the scheduler.
+pub struct SchedulerStats {
+    pub active_requests: usize,
+    pub waiting_requests: usize,
+    pub total_completed: u64,
+    pub total_generated_tokens: u64,
 }
 
 /// Handle for submitting requests to the scheduler. Cloneable and Send.
@@ -78,10 +93,17 @@ struct Slot<S> {
     cached_prompt: Vec<u32>,
 }
 
-#[derive(PartialEq)]
 enum Phase {
-    NeedsPrefill,
+    /// Newly assigned, needs prefix cache check.
+    New,
+    /// Prefilling in chunks. Decode takes priority between chunks.
+    Prefilling {
+        effective_tokens: Vec<u32>,
+        progress: usize,
+    },
+    /// Generating tokens.
     Decoding,
+    /// Completed.
     Finished,
 }
 
@@ -159,7 +181,7 @@ impl ActiveRequest {
 
     /// Flush remaining buffered text and send the final finish delta.
     fn finish(&mut self, reason: FinishReason, tokenizer: &Tokenizer) {
-        if self.phase == Phase::Finished {
+        if matches!(self.phase, Phase::Finished) {
             return;
         }
         self.phase = Phase::Finished;
@@ -206,6 +228,9 @@ impl ActiveRequest {
 // Scheduler
 // ============================================================================
 
+/// Interval (in completed requests) at which stats are logged.
+const STATS_LOG_INTERVAL: u64 = 10;
+
 pub struct Scheduler<M: ModelForward> {
     model: M,
     tokenizer: Tokenizer,
@@ -217,6 +242,9 @@ pub struct Scheduler<M: ModelForward> {
     rng: StdRng,
     /// Round-robin index for fair decode scheduling.
     last_served: usize,
+    /// Lifetime stats.
+    total_completed: u64,
+    total_generated_tokens: u64,
 }
 
 impl<M: ModelForward> Scheduler<M> {
@@ -258,6 +286,8 @@ impl<M: ModelForward> Scheduler<M> {
             next_id: 0,
             rng: StdRng::seed_from_u64(seed),
             last_served: 0,
+            total_completed: 0,
+            total_generated_tokens: 0,
         };
 
         let handle = SchedulerHandle {
@@ -341,7 +371,7 @@ impl<M: ModelForward> Scheduler<M> {
                 delta_tx: incoming.delta_tx,
                 decoded_text: String::new(),
                 sent_len: 0,
-                phase: Phase::NeedsPrefill,
+                phase: Phase::New,
             });
         }
     }
@@ -360,42 +390,41 @@ impl<M: ModelForward> Scheduler<M> {
         // Priority 1: serve one decode request (round-robin)
         for offset in 0..num {
             let idx = (self.last_served.wrapping_add(1).wrapping_add(offset)) % num;
-            if self.active[idx].phase == Phase::Decoding {
+            if matches!(self.active[idx].phase, Phase::Decoding) {
                 self.step_decode(idx);
                 self.last_served = idx;
                 return;
             }
         }
 
-        // Priority 2: run one prefill
+        // Priority 2: resume an ongoing chunked prefill
         for idx in 0..num {
-            if self.active[idx].phase == Phase::NeedsPrefill {
-                self.step_prefill(idx);
+            if matches!(self.active[idx].phase, Phase::Prefilling { .. }) {
+                self.step_prefill_chunk(idx);
+                return;
+            }
+        }
+
+        // Priority 3: start a new request (prefix cache check + first chunk)
+        for idx in 0..num {
+            if matches!(self.active[idx].phase, Phase::New) {
+                self.step_new(idx);
                 return;
             }
         }
     }
 
-    fn step_prefill(&mut self, idx: usize) {
-        // Destructure to satisfy borrow checker (separate field borrows).
-        let Self {
-            model,
-            tokenizer,
-            slots,
-            active,
-            rng,
-            ..
-        } = self;
+    /// Compute prefix cache for a new request and begin chunked prefill.
+    fn step_new(&mut self, idx: usize) {
+        let req = &mut self.active[idx];
 
-        let req = &mut active[idx];
-
-        // Skip if client disconnected
+        // Check client disconnect
         if req.delta_tx.is_closed() {
             req.phase = Phase::Finished;
             return;
         }
 
-        let slot = &mut slots[req.slot_idx];
+        let slot = &mut self.slots[req.slot_idx];
 
         // Prefix cache: find common prefix between cached and new prompt
         let prefix_len = slot
@@ -442,14 +471,76 @@ impl<M: ModelForward> Scheduler<M> {
             req.prompt_tokens.clone()
         };
 
-        // Run prefill forward pass
-        if let Err(e) = model.forward(&effective, &mut slot.state) {
-            error!("Request {}: prefill failed: {}", req.id, e);
+        info!(
+            "Request {}: chunked prefill starting ({} effective tokens, chunk_size={})",
+            req.id,
+            effective.len(),
+            PREFILL_CHUNK_SIZE
+        );
+
+        req.phase = Phase::Prefilling {
+            effective_tokens: effective,
+            progress: 0,
+        };
+    }
+
+    /// Process one chunk of a prefill. When all chunks are done, sample the
+    /// first token and transition to Decoding.
+    fn step_prefill_chunk(&mut self, idx: usize) {
+        let Self {
+            model,
+            tokenizer,
+            slots,
+            active,
+            rng,
+            ..
+        } = self;
+
+        let req = &mut active[idx];
+
+        // Check client disconnect
+        if req.delta_tx.is_closed() {
             req.phase = Phase::Finished;
             return;
         }
 
-        // Sample first token
+        // Extract prefill state; if not Prefilling, bail out.
+        let (effective_tokens, progress) = match &mut req.phase {
+            Phase::Prefilling {
+                effective_tokens,
+                progress,
+            } => (effective_tokens as &Vec<u32>, progress as &mut usize),
+            _ => return,
+        };
+
+        let total = effective_tokens.len();
+        let chunk_end = (*progress + PREFILL_CHUNK_SIZE).min(total);
+        let chunk = &effective_tokens[*progress..chunk_end];
+
+        let slot = &mut slots[req.slot_idx];
+
+        // Run forward pass for this chunk
+        if let Err(e) = model.forward(chunk, &mut slot.state) {
+            error!("Request {}: prefill chunk failed: {}", req.id, e);
+            req.phase = Phase::Finished;
+            return;
+        }
+
+        let new_progress = chunk_end;
+
+        if new_progress < total {
+            // More chunks remaining
+            // We need to update progress. Since we borrowed through the enum,
+            // update via the mutable reference.
+            *progress = new_progress;
+            info!(
+                "Request {}: prefill chunk {}/{} tokens",
+                req.id, new_progress, total
+            );
+            return;
+        }
+
+        // All chunks done — sample first token
         match model.select_token(&mut slot.state, &req.sampling, rng) {
             Ok(token) => {
                 if !req.sampling.ignore_eos && model.is_stop_token(token) {
@@ -459,7 +550,7 @@ impl<M: ModelForward> Scheduler<M> {
                 req.generated_tokens.push(token);
                 req.emit_delta(tokenizer);
 
-                if req.phase == Phase::Finished {
+                if matches!(req.phase, Phase::Finished) {
                     return; // Stop sequence hit during emit
                 }
                 if req.generated_tokens.len() >= req.max_tokens {
@@ -512,7 +603,7 @@ impl<M: ModelForward> Scheduler<M> {
                 req.generated_tokens.push(token);
                 req.emit_delta(tokenizer);
 
-                if req.phase == Phase::Finished {
+                if matches!(req.phase, Phase::Finished) {
                     return; // Stop sequence hit
                 }
                 if req.generated_tokens.len() >= req.max_tokens {
@@ -529,19 +620,37 @@ impl<M: ModelForward> Scheduler<M> {
     fn cleanup(&mut self) {
         let mut i = 0;
         while i < self.active.len() {
-            if self.active[i].phase == Phase::Finished {
+            if matches!(self.active[i].phase, Phase::Finished) {
                 let req = self.active.remove(i);
+                let gen_tokens = req.generated_tokens.len() as u64;
+
                 // Update slot's cached prompt for future prefix reuse
                 self.slots[req.slot_idx].cached_prompt = req.prompt_tokens;
                 // Offload excess KV to CPU if over GPU budget
                 let _ = self.slots[req.slot_idx].state.offload_kv_if_needed();
+
+                self.total_completed += 1;
+                self.total_generated_tokens += gen_tokens;
+
                 info!(
                     "Request {} done: {} tokens (active={}, waiting={})",
                     req.id,
-                    req.generated_tokens.len(),
+                    gen_tokens,
                     self.active.len(),
                     self.waiting.len()
                 );
+
+                // Log stats periodically
+                if self.total_completed % STATS_LOG_INTERVAL == 0 {
+                    info!(
+                        "Scheduler stats: completed={}, generated_tokens={}, active={}, waiting={}",
+                        self.total_completed,
+                        self.total_generated_tokens,
+                        self.active.len(),
+                        self.waiting.len()
+                    );
+                }
+
                 // Fix round-robin index
                 if self.last_served >= self.active.len() && !self.active.is_empty() {
                     self.last_served = 0;

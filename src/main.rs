@@ -117,12 +117,57 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // If --dynamo is passed, register with Dynamo runtime and block.
+    // If --dynamo is passed, load the model, create a scheduler, and register
+    // with the Dynamo distributed runtime.
     if args.dynamo {
         #[cfg(feature = "dynamo")]
         {
+            use pegainfer::model::{ModelRuntimeConfig, Qwen3Model, Qwen35Model};
+            use pegainfer::scheduler::Scheduler;
+            use pegainfer::server_engine::{model_id_from_path, detect_model_type as detect};
+            use pegainfer::tokenizer::Tokenizer;
+
             info!("Starting Dynamo distributed runtime registration...");
-            return dynamo_integration::run_dynamo_worker();
+
+            let options = EngineOptions {
+                enable_cuda_graph: !args.no_cuda_graph,
+            };
+            let model_type = detect(&args.model_path)?;
+            let model_id = model_id_from_path(&args.model_path);
+            info!("Detected model type: {}", model_type);
+            info!("Loading model from: {}", args.model_path);
+
+            let load_start = Instant::now();
+
+            let handle = match model_type {
+                pegainfer::server_engine::ModelType::Qwen3 => {
+                    let model = Qwen3Model::from_safetensors_with_runtime(
+                        &args.model_path,
+                        ModelRuntimeConfig {
+                            enable_cuda_graph: options.enable_cuda_graph,
+                        },
+                    )?;
+                    let tokenizer = Tokenizer::from_file(&args.model_path)?;
+                    let (scheduler, handle) =
+                        Scheduler::new(model, tokenizer, &model_id, 4, 42)?;
+                    std::thread::spawn(move || scheduler.run());
+                    handle
+                }
+                pegainfer::server_engine::ModelType::Qwen35 => {
+                    let model = Qwen35Model::from_safetensors_with_options(
+                        &args.model_path,
+                        options.enable_cuda_graph,
+                    )?;
+                    let tokenizer = Tokenizer::from_file(&args.model_path)?;
+                    let (scheduler, handle) =
+                        Scheduler::new(model, tokenizer, &model_id, 4, 42)?;
+                    std::thread::spawn(move || scheduler.run());
+                    handle
+                }
+            };
+
+            info!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
+            return dynamo_integration::run_dynamo_worker(handle);
         }
 
         #[cfg(not(feature = "dynamo"))]
