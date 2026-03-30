@@ -2,6 +2,9 @@ mod agent;
 mod chat;
 mod tools;
 
+#[cfg(feature = "dynamo")]
+mod dynamo_integration;
+
 use std::io::{self, BufRead, Write};
 use std::time::Instant;
 
@@ -38,6 +41,11 @@ struct Args {
     /// Disable CUDA graph (useful for debugging)
     #[arg(long, default_value_t = false)]
     no_cuda_graph: bool,
+
+    /// Register with Dynamo distributed runtime for service discovery
+    /// and KV-aware routing. Requires the `dynamo` feature.
+    #[arg(long, default_value_t = false)]
+    dynamo: bool,
 }
 
 fn run_repl(
@@ -103,6 +111,23 @@ fn main() -> Result<()> {
     pegainfer::logging::init_default();
 
     let args = Args::parse();
+
+    // If --dynamo is passed, register with Dynamo runtime and block.
+    if args.dynamo {
+        #[cfg(feature = "dynamo")]
+        {
+            info!("Starting Dynamo distributed runtime registration...");
+            return dynamo_integration::run_dynamo_worker();
+        }
+
+        #[cfg(not(feature = "dynamo"))]
+        {
+            anyhow::bail!(
+                "--dynamo flag requires the `dynamo` feature. \
+                 Rebuild with: cargo build --features dynamo"
+            );
+        }
+    }
 
     let options = EngineOptions {
         enable_cuda_graph: !args.no_cuda_graph,

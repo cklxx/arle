@@ -3,7 +3,13 @@ name = "agent-infer"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+dynamo = ["dep:dynamo-runtime", "dep:tokio"]
+
 [dependencies]
+dynamo-runtime = { path = "dynamo/lib/runtime", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
 pegainfer = { path = "pegainfer" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
