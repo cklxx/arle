@@ -1088,7 +1088,19 @@ impl<M: ModelForward> Scheduler<M> {
             .map(|&i| &active[i].sampling)
             .collect();
 
-        match model.select_tokens_batch(states, &slot_indices, &sampling_params, rng) {
+        let all_greedy = sampling_params
+            .iter()
+            .all(|p| p.is_greedy() && !p.has_penalties());
+        let sampled_result = if all_greedy {
+            match model.sample_batch_greedy(&slot_indices, decode_bufs) {
+                Ok(Some(tokens)) => Ok(tokens),
+                Ok(None) => model.select_tokens_batch(states, &slot_indices, &sampling_params, rng),
+                Err(e) => Err(e),
+            }
+        } else {
+            model.select_tokens_batch(states, &slot_indices, &sampling_params, rng)
+        };
+        match sampled_result {
             Ok(sampled_tokens) => {
                 for (j, &req_idx) in decode_indices.iter().enumerate() {
                     let token = sampled_tokens[j];

@@ -114,6 +114,16 @@ pub trait ModelForward: Send {
         self.forward(tokens, state)
     }
 
+    /// Fast-path batched greedy sampling on internal contiguous logits.
+    /// Returns None if fast path unavailable (non-greedy, or model doesn't support it).
+    fn sample_batch_greedy(
+        &self,
+        _slot_indices: &[usize],
+        _decode_bufs_cache: &mut Option<Box<dyn std::any::Any + Send>>,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
     /// Batched decode: process B tokens from B requests in one forward pass.
     ///
     /// `tokens[b]` is decoded using `states[slot_indices[b]]`. Uses GEMM for
