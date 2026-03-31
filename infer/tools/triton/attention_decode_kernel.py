@@ -20,6 +20,7 @@ def fused_attention_decode_kernel(
     num_qheads,
     num_kvheads,
     gqa_ratio,
+    max_seq_len,
     NUM_KV_SPLITS: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -52,7 +53,7 @@ def fused_attention_decode_kernel(
     offs_d = tl.arange(0, HALF)
     q_base = q_head_idx * HEAD_DIM
     kv_base = kv_head_idx * HEAD_DIM
-    cache_base = kv_head_idx * 4096 * HEAD_DIM
+    cache_base = kv_head_idx * max_seq_len * HEAD_DIM
 
     # ---- Load Q, apply RMSNorm + RoPE (every split) ----
     q_lo = tl.load(q_full_ptr + q_base + offs_d).to(tl.float32)

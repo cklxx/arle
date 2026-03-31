@@ -13,6 +13,7 @@ def flash_attention_prefill_kernel(
     gqa_ratio,
     seq_len,            # number of query tokens in this prefill
     start_pos,          # starting position (for multi-turn)
+    max_seq_len,        # max tokens in KV cache (stride per head)
     q_dim,              # num_q_heads * HEAD_DIM (stride between tokens in Q/Output)
     BLOCK_M: tl.constexpr,   # 128 — query tile size
     BLOCK_N: tl.constexpr,   # 64  — KV tile size
@@ -39,7 +40,6 @@ def flash_attention_prefill_kernel(
     At gqa_ratio=4 with BLOCK_M=128, this exceeds register budget causing L1 spilling —
     net effect is slower. True GQA-aware FA would need explicit SMEM (CUDA, not Triton).
     """
-    MAX_SEQ: tl.constexpr = 4096
     HALF_HD: tl.constexpr = HEAD_DIM // 2
     scale = 1.44269504 / tl.sqrt(float(HEAD_DIM))  # log2(e) / sqrt(HEAD_DIM)
 
@@ -69,7 +69,7 @@ def flash_attention_prefill_kernel(
     q_hi = tl.load(q_ptrs_hi, mask=q_mask, other=0.0).to(tl.float32)  # [BLOCK_M, HALF_HD]
 
     # KV cache base for this KV head
-    kv_cache_base = kv_head * MAX_SEQ * HEAD_DIM
+    kv_cache_base = kv_head * max_seq_len * HEAD_DIM
 
     # Online softmax state: per query row
     m_i = tl.full([BLOCK_M], -1e38, dtype=tl.float32)  # max scores

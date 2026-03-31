@@ -37,6 +37,11 @@ pub fn prefill_attention_batch(
     assert!(num_kv_heads > 0, "num_kv_heads must be > 0");
     let gqa_ratio = num_q_heads / num_kv_heads;
 
+    // Derive max_seq_len from KV cache buffer size.
+    // Buffer layout: [num_kv_heads * max_seq_len * head_dim] u16 elements.
+    let kv_elements = k_cache.len;
+    let max_seq_len = kv_elements / (num_kv_heads * head_dim);
+
     {
         let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
         let (k_ptr, _gk) = k_batch.data.device_ptr_mut(&ctx.stream);
@@ -66,6 +71,7 @@ pub fn prefill_attention_batch(
                 head_dim as i32,
                 seq_len as i32,
                 start_pos as i32,
+                max_seq_len as i32,
                 rms_eps,
                 ctx.stream.cu_stream(),
             );
@@ -81,6 +87,7 @@ pub fn prefill_attention_batch(
                 gqa_ratio as i32,
                 seq_len as i32,
                 start_pos as i32,
+                max_seq_len as i32,
                 q_dim as i32,
                 ctx.stream.cu_stream(),
             );
@@ -112,6 +119,9 @@ pub(crate) fn flash_attention_prefill_hd256_into(
     assert!(num_kv_heads > 0, "num_kv_heads must be > 0");
     let gqa_ratio = num_q_heads / num_kv_heads;
 
+    // Derive max_seq_len from KV cache buffer size.
+    let max_seq_len = k_cache.len / (num_kv_heads * head_dim);
+
     let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
     let (kc_ptr, _gkc) = k_cache.data.device_ptr(&ctx.stream);
     let (vc_ptr, _gvc) = v_cache.data.device_ptr(&ctx.stream);
@@ -129,6 +139,7 @@ pub(crate) fn flash_attention_prefill_hd256_into(
             gqa_ratio as i32,
             seq_len as i32,
             sp_ptr as *const i32,
+            max_seq_len as i32,
             q_dim as i32,
             ctx.stream.cu_stream(),
         )
@@ -407,6 +418,10 @@ pub fn fused_attention_decode_into(
     num_qheads: usize,
     num_kvheads: usize,
 ) -> Result<()> {
+    // Derive max_seq_len from KV cache buffer size before borrowing.
+    let actual_head_dim = q_full.len / num_qheads;
+    let max_seq_len = k_cache.len / (num_kvheads * actual_head_dim);
+
     let (q_ptr, _gq) = q_full.data.device_ptr(&ctx.stream);
     let (k_ptr, _gk) = k_full.data.device_ptr(&ctx.stream);
     let (v_ptr, _gv) = v_full.data.device_ptr(&ctx.stream);
@@ -441,6 +456,7 @@ pub fn fused_attention_decode_into(
             num_qheads as i32,
             num_kvheads as i32,
             (num_qheads / num_kvheads) as i32,
+            max_seq_len as i32,
             ctx.stream.cu_stream(),
         )
     };

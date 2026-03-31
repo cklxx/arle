@@ -150,6 +150,7 @@ unsafe extern "C" {
         head_dim: i32,
         seq_len: i32,
         start_pos: i32,
+        max_seq_len: i32,
         rms_eps: f32,
         stream: CUstream,
     );
@@ -166,6 +167,7 @@ unsafe extern "C" {
         gqa_ratio: i32,
         seq_len: i32,
         start_pos: i32,
+        max_seq_len: i32,
         q_dim: i32,
         stream: CUstream,
     ) -> CUresult;
@@ -182,6 +184,7 @@ unsafe extern "C" {
         gqa_ratio: i32,
         seq_len: i32,
         start_pos_ptr: *const i32,
+        max_seq_len: i32,
         q_dim: i32,
         stream: CUstream,
     ) -> CUresult;
@@ -277,6 +280,7 @@ unsafe extern "C" {
         num_qheads: i32,
         num_kvheads: i32,
         gqa_ratio: i32,
+        max_seq_len: i32,
         stream: CUstream,
     ) -> CUresult;
 

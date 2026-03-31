@@ -216,7 +216,7 @@ impl Qwen3Model {
             &mut bufs.v_batch,
         );
 
-        // 2b. Scatter-write K/V to token pool (NEW — dual-write path).
+        // 2b. Scatter-write K/V to token pool (dual-write path).
         // The Triton attention kernel below will also write to contiguous cache.
         if !pool.k_buffers.is_empty() {
             ops::scatter_write_kv(

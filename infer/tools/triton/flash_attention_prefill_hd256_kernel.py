@@ -13,6 +13,7 @@ def flash_attention_prefill_hd256_kernel(
     gqa_ratio,
     seq_len,
     start_pos_ptr,      # *i32 pointer — GPU-resident for CUDA Graph safety
+    max_seq_len,        # max tokens in KV cache (stride per head)
     q_dim,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -28,7 +29,6 @@ def flash_attention_prefill_hd256_kernel(
     """
     start_pos = tl.load(start_pos_ptr).to(tl.int32)
 
-    MAX_SEQ: tl.constexpr = 4096
     QTR_HD: tl.constexpr = HEAD_DIM // 4
     scale = 1.44269504 / tl.sqrt(float(HEAD_DIM))  # log2(e) / sqrt(HEAD_DIM)
 
@@ -53,7 +53,7 @@ def flash_attention_prefill_hd256_kernel(
         q_base + 3 * QTR_HD + offs_d[None, :], mask=q_mask, other=0.0
     ).to(tl.float32)
 
-    kv_cache_base = kv_head * MAX_SEQ * HEAD_DIM
+    kv_cache_base = kv_head * max_seq_len * HEAD_DIM
 
     m_i = tl.full([BLOCK_M], -1e38, dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
