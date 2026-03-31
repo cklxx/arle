@@ -288,7 +288,8 @@ impl ModelForward for Qwen3Model {
 
                 // Lazy-init or reuse pre-allocated buffers
                 let bufs = match decode_bufs_cache {
-                    Some(cache) => cache.downcast_mut::<BatchDecodeBuffers>()
+                    Some(cache) => cache
+                        .downcast_mut::<BatchDecodeBuffers>()
                         .expect("decode_bufs_cache type mismatch"),
                     None => {
                         let num_heads = self.config.num_attention_heads;
@@ -300,21 +301,22 @@ impl ModelForward for Qwen3Model {
                         let max_bs = states.len(); // max possible batch size = num_slots
                         // max_total_pages: worst case = max_bs * max_seq_len
                         let max_pages = pool.max_total_tokens;
-                        let b: Box<dyn std::any::Any + Send> = Box::new(
-                            BatchDecodeBuffers::new(
-                                &self.ctx,
-                                self.config.hidden_size,
-                                q_dim,
-                                kv_dim,
-                                inter_dim,
-                                max_bs,
-                                num_heads,
-                                max_pages,
-                            )?
-                        );
+                        let b: Box<dyn std::any::Any + Send> = Box::new(BatchDecodeBuffers::new(
+                            &self.ctx,
+                            self.config.hidden_size,
+                            q_dim,
+                            kv_dim,
+                            inter_dim,
+                            max_bs,
+                            num_heads,
+                            max_pages,
+                        )?);
                         *decode_bufs_cache = Some(b);
-                        decode_bufs_cache.as_mut().unwrap()
-                            .downcast_mut::<BatchDecodeBuffers>().unwrap()
+                        decode_bufs_cache
+                            .as_mut()
+                            .unwrap()
+                            .downcast_mut::<BatchDecodeBuffers>()
+                            .unwrap()
                     }
                 };
                 self.decode_batch(tokens, states, slot_indices, pool, bufs)

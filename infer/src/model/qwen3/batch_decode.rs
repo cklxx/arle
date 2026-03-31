@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::safe::CudaGraph;
-use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 use log::info;
 
 use super::forward::Qwen3State;
@@ -183,32 +183,57 @@ impl Qwen3Model {
             .map(|&si| (paged_kv_pool.seq_len(si) - 1) as i32)
             .collect();
 
-        self.ctx.stream.memcpy_htod(&positions_h, &mut bufs.positions)
+        self.ctx
+            .stream
+            .memcpy_htod(&positions_h, &mut bufs.positions)
             .map_err(|e| anyhow::anyhow!("H2D positions: {e}"))?;
-        self.ctx.stream.memcpy_htod(&indptr_h, &mut bufs.kv_indptr_gpu)
+        self.ctx
+            .stream
+            .memcpy_htod(&indptr_h, &mut bufs.kv_indptr_gpu)
             .map_err(|e| anyhow::anyhow!("H2D indptr: {e}"))?;
         if indices_h.len() > bufs.max_total_pages {
-            bufs.kv_indices_gpu = self.ctx.stream.alloc_zeros(indices_h.len())
+            bufs.kv_indices_gpu = self
+                .ctx
+                .stream
+                .alloc_zeros(indices_h.len())
                 .map_err(|e| anyhow::anyhow!("Realloc kv_indices: {e}"))?;
             bufs.max_total_pages = indices_h.len();
             bufs.graph_cache.remove(&batch_size);
         }
-        self.ctx.stream.memcpy_htod(&indices_h, &mut bufs.kv_indices_gpu)
+        self.ctx
+            .stream
+            .memcpy_htod(&indices_h, &mut bufs.kv_indices_gpu)
             .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
-        self.ctx.stream.memcpy_htod(&last_page_lens_h, &mut bufs.kv_last_page_len_gpu)
+        self.ctx
+            .stream
+            .memcpy_htod(&last_page_lens_h, &mut bufs.kv_last_page_len_gpu)
             .map_err(|e| anyhow::anyhow!("H2D last_page_len: {e}"))?;
 
         ops::flashinfer_plan(
-            &self.ctx, &indptr_h, &mut bufs.flashinfer_ws,
-            batch_size, num_heads, num_kv_heads, page_size, head_dim,
+            &self.ctx,
+            &indptr_h,
+            &mut bufs.flashinfer_ws,
+            batch_size,
+            num_heads,
+            num_kv_heads,
+            page_size,
+            head_dim,
         )?;
 
         // Embedding (has H2D copy — must be outside graph)
         bufs.embedding_out.seq_len = batch_size;
         let token_ids_i32: Vec<i32> = tokens.iter().map(|&x| x as i32).collect();
-        let token_ids_gpu = self.ctx.stream.clone_htod(&token_ids_i32)
+        let token_ids_gpu = self
+            .ctx
+            .stream
+            .clone_htod(&token_ids_i32)
             .map_err(|e| anyhow::anyhow!("H2D token_ids: {e}"))?;
-        ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut bufs.embedding_out)?;
+        ops::embedding_batch(
+            &self.ctx,
+            &self.embed_tokens,
+            &token_ids_gpu,
+            &mut bufs.embedding_out,
+        )?;
 
         // ── Graph body: layers + final norm + logits GEMM ──
         // All use pre-allocated buffers with stable pointers.
@@ -216,7 +241,11 @@ impl Qwen3Model {
         // Lazy-init logits buffer (allocation — must be before any graph capture)
         if bufs.logits_batch.is_none() {
             let vocab_size = self.output_projection().rows;
-            bufs.logits_batch = Some(HiddenStates::zeros(&self.ctx, vocab_size, bufs.max_batch_size)?);
+            bufs.logits_batch = Some(HiddenStates::zeros(
+                &self.ctx,
+                vocab_size,
+                bufs.max_batch_size,
+            )?);
         }
 
         // ── CUDA Graph: capture on first call per batch_size, replay on subsequent ──
@@ -224,21 +253,30 @@ impl Qwen3Model {
         // kernel launches — no allocs, no H2D, no CPU memcpy (except FlashInfer's
         // plan_info read which sets kernel params, baked on capture, stable per bs).
         if let Some(graph) = bufs.graph_cache.get(&batch_size) {
-            graph.launch()
+            graph
+                .launch()
                 .map_err(|e| anyhow::anyhow!("CUDA Graph replay (B={}): {e}", batch_size))?;
         } else {
-            info!("Capturing CUDA Graph for batched decode B={}...", batch_size);
-            self.ctx.stream.begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            info!(
+                "Capturing CUDA Graph for batched decode B={}...",
+                batch_size
+            );
+            self.ctx
+                .stream
+                .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
                 .map_err(|e| anyhow::anyhow!("begin_capture: {e}"))?;
 
             self.decode_batch_graph_body(bufs, paged_kv_pool, batch_size)?;
 
-            let graph_opt = self.ctx.stream
+            let graph_opt = self
+                .ctx
+                .stream
                 .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
                 .map_err(|e| anyhow::anyhow!("end_capture: {e}"))?;
 
             if let Some(graph) = graph_opt {
-                graph.launch()
+                graph
+                    .launch()
                     .map_err(|e| anyhow::anyhow!("Graph first launch (B={}): {e}", batch_size))?;
                 info!("CUDA Graph captured for batched decode B={}", batch_size);
                 bufs.graph_cache.insert(batch_size, graph);
@@ -287,7 +325,12 @@ impl Qwen3Model {
         ops::rms_norm_batch_into(&self.ctx, hidden, &self.norm, eps, &mut bufs.normed);
         let logits_buf = bufs.logits_batch.as_mut().unwrap();
         logits_buf.seq_len = batch_size;
-        ops::gemm_into(&self.ctx, self.output_projection(), &bufs.normed, logits_buf);
+        ops::gemm_into(
+            &self.ctx,
+            self.output_projection(),
+            &bufs.normed,
+            logits_buf,
+        );
 
         Ok(())
     }

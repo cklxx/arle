@@ -26,7 +26,6 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use anyhow::{Context, Result};
 
@@ -206,14 +205,8 @@ impl InferenceBackend for MetalBackend {
             let max_new_tokens = 512usize;
             let t0 = Instant::now();
 
-            let generated = metal_generate(
-                &input_ids,
-                weights,
-                config,
-                params,
-                max_new_tokens,
-                t0,
-            )?;
+            let generated =
+                metal_generate(&input_ids, weights, config, params, max_new_tokens, t0)?;
 
             let elapsed = t0.elapsed().as_secs_f64();
             let gen_tps = generated.len() as f64 / elapsed.max(1e-9);
@@ -272,8 +265,8 @@ fn metal_generate(
     use mlx_rs::{
         fast,
         nn::silu,
-        ops::{self, concatenate_axis, reshape, transpose_axes},
         ops::indexing::{argmax, take_axis},
+        ops::{self, concatenate_axis, reshape, transpose_axes},
         transforms::eval,
     };
 
@@ -304,15 +297,13 @@ fn metal_generate(
         let idx_i32: Vec<i32> = current_ids.iter().map(|&t| t as i32).collect();
         let idx_arr = Array::from_slice(&idx_i32, &[seq]);
         // embed: [seq, hidden]
-        let mut x = take_axis(&weights.embed_tokens, &idx_arr, 0)
-            .context("embedding take_axis")?;
+        let mut x = take_axis(&weights.embed_tokens, &idx_arr, 0).context("embedding take_axis")?;
 
         // ── Transformer layers ────────────────────────────────────────────────
         for (li, layer) in weights.layers.iter().enumerate() {
             // 1. Input norm + residual
             let residual = x.clone();
-            x = fast::rms_norm(&x, &layer.input_layernorm, eps)
-                .context("input_layernorm")?;
+            x = fast::rms_norm(&x, &layer.input_layernorm, eps).context("input_layernorm")?;
 
             // 2. QKV projections  [seq, n_heads*head_dim], [seq, n_kv_heads*head_dim]
             let q_raw = linear(&x, &layer.q_proj)?;
@@ -324,12 +315,9 @@ fn metal_generate(
             let k_raw = apply_head_norm(&k_raw, seq, n_kv_heads, head_dim, &layer.k_norm, eps)?;
 
             // 4. Reshape to [1, seq, n_heads, head_dim] for RoPE
-            let q = reshape(&q_raw, &[1, seq, n_heads, head_dim])
-                .context("reshape q")?;
-            let k = reshape(&k_raw, &[1, seq, n_kv_heads, head_dim])
-                .context("reshape k")?;
-            let v = reshape(&v_raw, &[1, seq, n_kv_heads, head_dim])
-                .context("reshape v")?;
+            let q = reshape(&q_raw, &[1, seq, n_heads, head_dim]).context("reshape q")?;
+            let k = reshape(&k_raw, &[1, seq, n_kv_heads, head_dim]).context("reshape k")?;
+            let v = reshape(&v_raw, &[1, seq, n_kv_heads, head_dim]).context("reshape v")?;
 
             // 5. RoPE (input: [1, seq, n_heads, head_dim], traditional=false)
             let q = fast::rope(&q, head_dim, false, rope_base, 1.0f32, cache_len, None)
@@ -346,10 +334,8 @@ fn metal_generate(
             let (k_full, v_full) = match kv_cache[li].take() {
                 None => (k, v),
                 Some((k_prev, v_prev)) => {
-                    let kk = concatenate_axis(&[&k_prev, &k], 2)
-                        .context("concat k_cache")?;
-                    let vv = concatenate_axis(&[&v_prev, &v], 2)
-                        .context("concat v_cache")?;
+                    let kk = concatenate_axis(&[&k_prev, &k], 2).context("concat k_cache")?;
+                    let vv = concatenate_axis(&[&v_prev, &v], 2).context("concat v_cache")?;
                     (kk, vv)
                 }
             };
@@ -371,10 +357,10 @@ fn metal_generate(
             kv_cache[li] = Some((k_full, v_full));
 
             // 9. Reshape back to [seq, hidden] and project
-            let attn_out = transpose_axes(&attn_out, &[0, 2, 1, 3])
-                .context("transpose attn_out")?;
-            let attn_out = reshape(&attn_out, &[seq, n_heads * head_dim])
-                .context("reshape attn_out")?;
+            let attn_out =
+                transpose_axes(&attn_out, &[0, 2, 1, 3]).context("transpose attn_out")?;
+            let attn_out =
+                reshape(&attn_out, &[seq, n_heads * head_dim]).context("reshape attn_out")?;
             let attn_out = linear(&attn_out, &layer.o_proj)?;
             x = ops::add(&residual, &attn_out).context("residual + attn")?;
 
@@ -384,8 +370,11 @@ fn metal_generate(
                 .context("post_attn_layernorm")?;
 
             let gate = silu(&linear(&xn, &layer.gate_proj)?).context("silu gate")?;
-            let up   = linear(&xn, &layer.up_proj)?;
-            let mlp  = linear(&ops::multiply(&gate, &up).context("gate*up")?, &layer.down_proj)?;
+            let up = linear(&xn, &layer.up_proj)?;
+            let mlp = linear(
+                &ops::multiply(&gate, &up).context("gate*up")?,
+                &layer.down_proj,
+            )?;
             x = ops::add(&residual2, &mlp).context("residual + mlp")?;
         }
 
@@ -404,7 +393,10 @@ fn metal_generate(
 
         if !first_token_logged {
             let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            log::info!("  TTFT: {ttft_ms:.1}ms (including prefill of {} tokens)", input_ids.len());
+            log::info!(
+                "  TTFT: {ttft_ms:.1}ms (including prefill of {} tokens)",
+                input_ids.len()
+            );
             first_token_logged = true;
         }
 
@@ -455,7 +447,11 @@ fn apply_head_norm(
 /// Sample the next token from `logits` with shape [1, vocab].
 #[cfg(feature = "metal")]
 fn sample_token(logits: &Array, params: &SamplingParams) -> Result<u32> {
-    use mlx_rs::{ops::{multiply, softmax_axis}, ops::indexing::argmax, transforms::eval};
+    use mlx_rs::{
+        ops::indexing::argmax,
+        ops::{multiply, softmax_axis},
+        transforms::eval,
+    };
 
     let temp = params.temperature;
 
@@ -555,22 +551,22 @@ fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
             e.as_u64().map(|n| n as u32).or_else(|| {
                 e.as_array()
                     .and_then(|a| a.first())
-                    .and_then(|x| x.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .map(|n| n as u32)
             })
         })
-        .unwrap_or(151645); // Qwen2.5 <|im_end|>
+        .unwrap_or(151_645); // Qwen2.5 <|im_end|>
 
     Ok(MetalModelConfig {
-        hidden_size:              get_usize("hidden_size",              2048),
-        num_attention_heads:      get_usize("num_attention_heads",      16),
-        num_key_value_heads:      get_usize("num_key_value_heads",      8),
-        num_hidden_layers:        get_usize("num_hidden_layers",        24),
-        intermediate_size:        get_usize("intermediate_size",        11_008),
-        vocab_size:               get_usize("vocab_size",               151_936),
-        max_position_embeddings:  get_usize("max_position_embeddings",  32_768),
-        rms_norm_eps:             get_f64("rms_norm_eps",               1e-6),
-        rope_theta:               get_f64("rope_theta",                 1_000_000.0),
+        hidden_size: get_usize("hidden_size", 2048),
+        num_attention_heads: get_usize("num_attention_heads", 16),
+        num_key_value_heads: get_usize("num_key_value_heads", 8),
+        num_hidden_layers: get_usize("num_hidden_layers", 24),
+        intermediate_size: get_usize("intermediate_size", 11_008),
+        vocab_size: get_usize("vocab_size", 151_936),
+        max_position_embeddings: get_usize("max_position_embeddings", 32_768),
+        rms_norm_eps: get_f64("rms_norm_eps", 1e-6),
+        rope_theta: get_f64("rope_theta", 1_000_000.0),
         eos_token_id,
     })
 }
@@ -581,8 +577,8 @@ fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
 // GPU required: Array is backed by Metal buffers.
 #[cfg(feature = "metal")]
 fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<MetalWeights> {
-    use std::collections::HashMap;
     use mlx_rs::Dtype;
+    use std::collections::HashMap;
 
     let shards = collect_safetensors_shards(model_dir)?;
     if shards.is_empty() {
@@ -601,16 +597,14 @@ fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<Met
         for (name, view) in st.tensors() {
             let shape: Vec<i32> = view.shape().iter().map(|&d| d as i32).collect();
             let dtype = match view.dtype() {
-                safetensors::Dtype::F32  => Dtype::Float32,
-                safetensors::Dtype::F16  => Dtype::Float16,
+                safetensors::Dtype::F32 => Dtype::Float32,
+                safetensors::Dtype::F16 => Dtype::Float16,
                 safetensors::Dtype::BF16 => Dtype::Bfloat16,
-                safetensors::Dtype::I32  => Dtype::Int32,
+                safetensors::Dtype::I32 => Dtype::Int32,
                 other => anyhow::bail!("unsupported dtype {:?} for '{}'", other, name),
             };
             // SAFETY: `bytes` is alive for this scope; from_raw_data copies into Metal memory.
-            let arr = unsafe {
-                Array::from_raw_data(view.data().as_ptr().cast(), &shape, dtype)
-            };
+            let arr = unsafe { Array::from_raw_data(view.data().as_ptr().cast(), &shape, dtype) };
             tensors.insert(name.to_string(), arr);
         }
     }
@@ -637,21 +631,26 @@ fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<Met
     for i in 0..n {
         let p = |s: &str| format!("model.layers.{i}.{s}");
         layers.push(MetalLayerWeights {
-            q_proj:                   get(&p("self_attn.q_proj.weight"))?,
-            k_proj:                   get(&p("self_attn.k_proj.weight"))?,
-            v_proj:                   get(&p("self_attn.v_proj.weight"))?,
-            o_proj:                   get(&p("self_attn.o_proj.weight"))?,
-            q_norm:                   get(&p("self_attn.q_norm.weight"))?,
-            k_norm:                   get(&p("self_attn.k_norm.weight"))?,
-            gate_proj:                get(&p("mlp.gate_proj.weight"))?,
-            up_proj:                  get(&p("mlp.up_proj.weight"))?,
-            down_proj:                get(&p("mlp.down_proj.weight"))?,
-            input_layernorm:          get(&p("input_layernorm.weight"))?,
+            q_proj: get(&p("self_attn.q_proj.weight"))?,
+            k_proj: get(&p("self_attn.k_proj.weight"))?,
+            v_proj: get(&p("self_attn.v_proj.weight"))?,
+            o_proj: get(&p("self_attn.o_proj.weight"))?,
+            q_norm: get(&p("self_attn.q_norm.weight"))?,
+            k_norm: get(&p("self_attn.k_norm.weight"))?,
+            gate_proj: get(&p("mlp.gate_proj.weight"))?,
+            up_proj: get(&p("mlp.up_proj.weight"))?,
+            down_proj: get(&p("mlp.down_proj.weight"))?,
+            input_layernorm: get(&p("input_layernorm.weight"))?,
             post_attention_layernorm: get(&p("post_attention_layernorm.weight"))?,
         });
     }
 
-    Ok(MetalWeights { embed_tokens, layers, norm, lm_head })
+    Ok(MetalWeights {
+        embed_tokens,
+        layers,
+        norm,
+        lm_head,
+    })
 }
 
 /// Sorted list of `.safetensors` shards in `model_dir`.

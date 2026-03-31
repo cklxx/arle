@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use log::info;
 use infer::http_server::build_app;
 use infer::logging;
 use infer::model::{ModelRuntimeConfig, Qwen3Model, Qwen35Model};
@@ -10,6 +9,7 @@ use infer::scheduler::Scheduler;
 use infer::server_engine::{EngineOptions, ModelType, detect_model_type, model_id_from_path};
 use infer::tokenizer::Tokenizer;
 use infer::trace_reporter::FileReporter;
+use log::info;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 

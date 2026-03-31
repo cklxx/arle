@@ -174,10 +174,7 @@ pub fn gpu_sample_launch(
 }
 
 /// Read back the sampling result after a prior `gpu_sample_launch` + `ctx.sync()`.
-pub fn gpu_sample_readback(
-    ctx: &DeviceContext,
-    out: &CudaSlice<i32>,
-) -> Result<u32> {
+pub fn gpu_sample_readback(ctx: &DeviceContext, out: &CudaSlice<i32>) -> Result<u32> {
     let result = ctx
         .stream
         .clone_dtoh(out)

@@ -14,22 +14,23 @@ mod tests;
 
 // pub re-exports
 pub use attention::{
-    FlashInferWorkspace, decode_prep_paged, flashinfer_batch_decode,
-    flashinfer_plan, flashinfer_run_layer,
-    fused_attention_decode_batched_into, fused_attention_decode_into,
+    FlashInferWorkspace, decode_prep_paged, flashinfer_batch_decode, flashinfer_plan,
+    flashinfer_run_layer, fused_attention_decode_batched_into, fused_attention_decode_into,
     prefill_attention_batch, prefill_attention_hd256_batch,
     prefill_attention_hd256_batch_with_scratch,
 };
-pub use kv_ops::scatter_write_kv;
 pub use elementwise::{add_batch, silu_mul_batch};
 pub use embedding::{embedding_batch, embedding_decode_into};
+pub use kv_ops::scatter_write_kv;
 pub use linear::{fused_mlp_into, gemm, gemv};
 pub use norm::{
     fused_add_rms_norm_into, fused_add_rms_norm_offset_into, rms_norm_batch_offset_into,
     rms_norm_gated_into, rms_norm_into, rms_norm_offset_into,
 };
 pub use recurrent::gated_delta_rule_prefill_chunkwise_into;
-pub use sampling::{argmax, argmax_batch, gpu_sample, gpu_sample_into, gpu_sample_launch, gpu_sample_readback};
+pub use sampling::{
+    argmax, argmax_batch, gpu_sample, gpu_sample_into, gpu_sample_launch, gpu_sample_readback,
+};
 
 // pub(crate) re-exports
 #[cfg(test)]

@@ -19,14 +19,12 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED};
 use comfy_table::{Cell, CellAlignment, Table};
-use log::{debug, info};
 use infer::logging;
-use infer::model::{
-    GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model,
-};
+use infer::model::{GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model};
 use infer::sampler::SamplingParams;
 use infer::server_engine::{ModelType, detect_model_type};
 use infer::tokenizer::Tokenizer;
+use log::{debug, info};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde::Serialize;

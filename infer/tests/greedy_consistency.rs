@@ -41,7 +41,10 @@ fn collect_output(rx: &mut mpsc::UnboundedReceiver<StreamDelta>) -> String {
     text
 }
 
-fn make_request(prompt: &str, max_tokens: usize) -> (IncomingRequest, mpsc::UnboundedReceiver<StreamDelta>) {
+fn make_request(
+    prompt: &str,
+    max_tokens: usize,
+) -> (IncomingRequest, mpsc::UnboundedReceiver<StreamDelta>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let req = IncomingRequest {
         prompt: prompt.to_string(),
@@ -55,11 +58,7 @@ fn make_request(prompt: &str, max_tokens: usize) -> (IncomingRequest, mpsc::Unbo
 }
 
 /// Run a single request through the scheduler (solo = batch_size=1 during decode).
-fn run_solo(
-    prompt: &str,
-    max_tokens: usize,
-    model_path: &str,
-) -> String {
+fn run_solo(prompt: &str, max_tokens: usize, model_path: &str) -> String {
     let model = Qwen3Model::from_safetensors_with_runtime(
         model_path,
         ModelRuntimeConfig {
