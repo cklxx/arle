@@ -5,8 +5,6 @@
 //! paged KV cache: QK-norm + RoPE + paged KV write are done in a prep kernel,
 //! then FlashInfer's batch decode handles attention in a single launch.
 
-use std::collections::HashMap;
-
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::safe::CudaGraph;
@@ -72,8 +70,8 @@ pub(crate) struct BatchDecodeBuffers {
     /// Scratch buffer for incremental index H2D (avoids alloc).
     new_indices_scratch: Vec<i32>,
 
-    /// CUDA Graph cache: one graph per batch_size.
-    graph_cache: HashMap<usize, CudaGraph>,
+    /// CUDA Graph cache: index = batch_size - 1. Vec avoids HashMap overhead.
+    graph_cache: Vec<Option<CudaGraph>>,
 }
 
 // SAFETY: BatchDecodeBuffers contains CudaGraph (CUgraphExec) which is !Send.
@@ -146,7 +144,7 @@ impl BatchDecodeBuffers {
             prev_total_tokens: 0,
             prev_slot_indices: Vec::new(),
             new_indices_scratch: Vec::with_capacity(max_batch_size),
-            graph_cache: HashMap::new(),
+            graph_cache: (0..max_batch_size).map(|_| None).collect(),
         })
     }
 
@@ -275,7 +273,7 @@ impl Qwen3Model {
                     .alloc_zeros(indices_h.len())
                     .map_err(|e| anyhow::anyhow!("Realloc kv_indices: {e}"))?;
                 bufs.max_total_pages = indices_h.len();
-                bufs.graph_cache.remove(&batch_size);
+                bufs.graph_cache[batch_size - 1] = None;
             }
             self.ctx
                 .stream
@@ -317,7 +315,7 @@ impl Qwen3Model {
         // plan() was called above (updates int_workspace). graph_body only does
         // kernel launches — no allocs, no H2D, no CPU memcpy (except FlashInfer's
         // plan_info read which sets kernel params, baked on capture, stable per bs).
-        if let Some(graph) = bufs.graph_cache.get(&batch_size) {
+        if let Some(ref graph) = bufs.graph_cache[batch_size - 1] {
             graph
                 .launch()
                 .map_err(|e| anyhow::anyhow!("CUDA Graph replay (B={}): {e}", batch_size))?;
@@ -344,7 +342,7 @@ impl Qwen3Model {
                     .launch()
                     .map_err(|e| anyhow::anyhow!("Graph first launch (B={}): {e}", batch_size))?;
                 info!("CUDA Graph captured for batched decode B={}", batch_size);
-                bufs.graph_cache.insert(batch_size, graph);
+                bufs.graph_cache[batch_size - 1] = Some(graph);
             } else {
                 // Fallback: capture returned None (shouldn't happen)
                 self.decode_batch_graph_body(bufs, paged_kv_pool, batch_size)?;

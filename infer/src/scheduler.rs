@@ -258,10 +258,10 @@ struct ActiveRequest {
     sampling: SamplingParams,
     stop: Option<Vec<String>>,
     delta_tx: mpsc::UnboundedSender<StreamDelta>,
-    /// Cached decoded text of stable prefix (not re-decoded each step).
-    decoded_text: String,
-    /// Number of tokens in the cached decoded_text prefix.
-    decoded_prefix_tokens: usize,
+    /// Full decoded text, maintained incrementally.
+    full_decoded: String,
+    /// Number of tokens already decoded into full_decoded.
+    decoded_token_count: usize,
     /// Number of characters already sent to the client.
     sent_len: usize,
     phase: Phase,
@@ -270,48 +270,51 @@ struct ActiveRequest {
 #[cfg(feature = "cuda")]
 impl ActiveRequest {
     /// Decode newly generated tokens and emit text deltas to the client.
+    ///
+    /// Uses incremental decode: only re-decodes a small suffix (4 tokens)
+    /// to handle multi-byte character boundaries, instead of all tokens.
+    /// Cost per call: O(1) instead of O(N) where N = generated token count.
     fn emit_delta(&mut self, tokenizer: &Tokenizer) {
-        if self.generated_tokens.is_empty() {
+        let n = self.generated_tokens.len();
+        if n == 0 {
             return;
         }
 
-        // Incremental decode: only re-decode a small suffix of tokens
-        // (for multi-byte boundary safety) instead of all generated tokens.
-        // At 128 tokens this reduces decode from ~100us to ~10us per call.
-        let n = self.generated_tokens.len();
-        let overlap = 16.min(n); // enough for any multi-byte boundary
-        let stable_count = n - overlap;
+        // Incremental decode: re-decode tokens[safe_point..] where safe_point
+        // is 4 tokens before the last decoded position (multi-byte boundary).
+        let overlap = 4;
+        let safe_point = self.decoded_token_count.saturating_sub(overlap);
 
-        // Build/update cached prefix from tokens we don't need to re-decode.
-        if stable_count > self.decoded_prefix_tokens {
-            // Decode the new stable prefix
-            self.decoded_text = tokenizer
-                .decode(&self.generated_tokens[..stable_count])
-                .unwrap_or_default();
-            self.decoded_prefix_tokens = stable_count;
-        }
-
-        // Decode the overlap suffix and append
-        let suffix = tokenizer
-            .decode(&self.generated_tokens[stable_count..])
-            .unwrap_or_default();
-        let full_text = if stable_count > 0 {
-            format!("{}{}", self.decoded_text, suffix)
-        } else {
-            suffix
+        // Decode from safe_point to end
+        let new_text = match tokenizer.decode(&self.generated_tokens[safe_point..]) {
+            Ok(t) => t,
+            Err(_) => return,
         };
 
-        // Check stop sequences in full text
+        // Stitch: truncate full_decoded to safe_point's decoded length, append new
+        if safe_point > 0 {
+            // Decode just the safe_point prefix to find the cut position
+            let prefix_text = tokenizer
+                .decode(&self.generated_tokens[..safe_point])
+                .unwrap_or_default();
+            self.full_decoded.truncate(prefix_text.len());
+            self.full_decoded.push_str(&new_text);
+        } else {
+            self.full_decoded = new_text;
+        }
+        self.decoded_token_count = n;
+
+        // Emit delta
         if let Some(ref stops) = self.stop {
+            // Check stop sequences
             for stop in stops {
                 if stop.is_empty() {
                     continue;
                 }
-                if let Some(pos) = full_text.find(stop.as_str()) {
-                    // Stop found — emit text up to stop, then finish
+                if let Some(pos) = self.full_decoded.find(stop.as_str()) {
                     if pos > self.sent_len {
                         let _ = self.delta_tx.send(StreamDelta {
-                            text_delta: full_text[self.sent_len..pos].to_string(),
+                            text_delta: self.full_decoded[self.sent_len..pos].to_string(),
                             finish_reason: None,
                             usage: None,
                         });
@@ -323,24 +326,24 @@ impl ActiveRequest {
                 }
             }
 
-            // Hold back max_stop_len characters to avoid sending partial stop matches
+            // Hold back max_stop_len characters
             let max_stop_len = stops.iter().map(|s| s.len()).max().unwrap_or(0);
-            let safe_len = full_text.len().saturating_sub(max_stop_len);
+            let safe_len = self.full_decoded.len().saturating_sub(max_stop_len);
             if safe_len > self.sent_len {
                 let _ = self.delta_tx.send(StreamDelta {
-                    text_delta: full_text[self.sent_len..safe_len].to_string(),
+                    text_delta: self.full_decoded[self.sent_len..safe_len].to_string(),
                     finish_reason: None,
                     usage: None,
                 });
                 self.sent_len = safe_len;
             }
-        } else if full_text.len() > self.sent_len {
+        } else if self.full_decoded.len() > self.sent_len {
             let _ = self.delta_tx.send(StreamDelta {
-                text_delta: full_text[self.sent_len..].to_string(),
+                text_delta: self.full_decoded[self.sent_len..].to_string(),
                 finish_reason: None,
                 usage: None,
             });
-            self.sent_len = full_text.len();
+            self.sent_len = self.full_decoded.len();
         }
     }
 
@@ -744,8 +747,8 @@ impl<M: ModelForward> Scheduler<M> {
                 sampling: incoming.sampling,
                 stop: incoming.stop,
                 delta_tx: incoming.delta_tx,
-                decoded_text: String::new(),
-                decoded_prefix_tokens: 0,
+                full_decoded: String::new(),
+                decoded_token_count: 0,
                 sent_len: 0,
                 phase: Phase::New,
             });
