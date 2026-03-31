@@ -1,13 +1,13 @@
 #!/bin/bash
-# Start Dynamo frontend + pegainfer backend worker
+# Start Dynamo frontend + infer backend worker
 #
 # Prerequisites:
-#   - pegainfer server running (./scripts/start_pegainfer.sh)
+#   - infer server running (./scripts/start_infer.sh)
 #   - etcd running (or use --discovery-backend file)
 #   - dynamo Python package installed
 #
 # Usage:
-#   ./scripts/start_dynamo.sh [pegainfer_url] [model_name] [model_path]
+#   ./scripts/start_dynamo.sh [infer_url] [model_name] [model_path]
 #
 # Examples:
 #   ./scripts/start_dynamo.sh
@@ -26,10 +26,10 @@ echo "  Model:         ${MODEL_NAME}"
 echo "  Frontend Port: ${FRONTEND_PORT}"
 echo ""
 
-# Start pegainfer backend worker
-echo "[1/2] Starting pegainfer backend worker..."
-python -m dynamo.pegainfer \
-    --pegainfer-url "${PEGAINFER_URL}" \
+# Start infer backend worker
+echo "[1/2] Starting infer backend worker..."
+python -m dynamo.infer \
+    --infer-url "${PEGAINFER_URL}" \
     --model-name "${MODEL_NAME}" \
     --model-path "${MODEL_PATH}" \
     --namespace dynamo \

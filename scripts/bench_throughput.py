@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pegainfer throughput & latency benchmark.
+infer throughput & latency benchmark.
 
 Measures:
   - TTFT  (time-to-first-token)
@@ -451,7 +451,7 @@ def print_report(results: list[RequestResult], wall_time_s: float):
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="pegainfer throughput & latency benchmark")
+    p = argparse.ArgumentParser(description="infer throughput & latency benchmark")
     p.add_argument("--url", default="http://localhost:8000",
                    help="Server base URL (default: http://localhost:8000)")
     p.add_argument("--model", default="",

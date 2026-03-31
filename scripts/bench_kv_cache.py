@@ -90,7 +90,7 @@ class BenchmarkResult:
 
         lines = []
         lines.append("=" * 70)
-        lines.append("KV Cache Benchmark Results (Dynamo + Pegainfer)")
+        lines.append("KV Cache Benchmark Results (Dynamo + Infer)")
         lines.append("=" * 70)
 
         # Per-conversation stats
@@ -148,7 +148,7 @@ class BenchmarkResult:
             else:
                 lines.append(
                     "  -> KV cache not reusing prefix "
-                    "(expected: pegainfer resets KV between requests)"
+                    "(expected: infer resets KV between requests)"
                 )
 
         lines.append("=" * 70)
@@ -256,7 +256,7 @@ async def main():
     result = BenchmarkResult()
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-        # Run conversations sequentially (pegainfer is single-request)
+        # Run conversations sequentially (infer is single-request)
         for i, conv in enumerate(CONVERSATIONS[:max_convs]):
             print(f"Conversation {i + 1}/{max_convs}:")
             await run_conversation(client, base_url, i, conv, result)

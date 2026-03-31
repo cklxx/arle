@@ -2,7 +2,7 @@
 Sampling parameter tests — no GPU required.
 
 Tests the sampling math and parameter validation logic that mirrors
-pegainfer/src/sampler.rs. All tests are pure Python.
+infer/src/sampler.rs. All tests are pure Python.
 
 Run:
     pytest tests/test_sampling.py -v
@@ -17,7 +17,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 class SamplingParams:
-    """CPU-side mirror of pegainfer::sampler::SamplingParams."""
+    """CPU-side mirror of infer::sampler::SamplingParams."""
 
     def __init__(
         self,

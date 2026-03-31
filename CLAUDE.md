@@ -32,7 +32,7 @@ Non-trivial tasks follow phases. **Each phase has a clear exit condition.**
 
 **Posture**: Contractor. Build to spec. Spec wrong → fix spec first.
 
-- Before writing code → check prior art in `pegainfer/src/` and `docs/` first
+- Before writing code → check prior art in `infer/src/` and `docs/` first
 - Want to change something outside the plan → stop. Update plan or note it for later
 - Completed a logical unit → `cargo check` immediately
 - Writing new code → match adjacent code style (error handling, logging, naming)
@@ -127,7 +127,7 @@ cargo build --release --features dynamo
 cargo test --workspace
 
 # Single test
-cargo test -p pegainfer -- <test_name>
+cargo test -p infer -- <test_name>
 
 # Lint
 cargo clippy --workspace -- -D warnings
@@ -140,10 +140,10 @@ cargo fmt --all -- --check
 # Run agent REPL (requires model)
 ./target/release/agent-infer --model-path /path/to/model
 
-# Run pegainfer HTTP server
-./target/release/pegainfer --model-path /path/to/model --port 8000
+# Run infer HTTP server
+./target/release/infer --model-path /path/to/model --port 8000
 
-# Python agent (HTTP mode, points at running pegainfer)
+# Python agent (HTTP mode, points at running infer)
 python -m agent_infer --url http://localhost:8000
 
 # Benchmark
@@ -170,7 +170,7 @@ Primary language: **Rust** (inference engine + agent runtime). Secondary: **Pyth
 agent-infer/          ← top-level Cargo workspace
 ├── src/              ← Rust agent binary (ChatML, tool calling, REPL)
 ├── agent_infer/      ← Python agent package (async HTTP client mode)
-├── pegainfer/        ← Inference engine (Rust library + CUDA kernels)
+├── infer/        ← Inference engine (Rust library + CUDA kernels)
 │   ├── src/
 │   │   ├── model/       ← Model implementations (Qwen3, Qwen35, ...)
 │   │   ├── ops/         ← CUDA-backed tensor ops (attention, linear, norm...)
@@ -186,16 +186,16 @@ agent-infer/          ← top-level Cargo workspace
 
 ### Key abstractions
 
-- **`ModelForward` trait** (`pegainfer/src/model.rs`) — single `forward()` entry point per model. Implement for each new architecture.
+- **`ModelForward` trait** (`infer/src/model.rs`) — single `forward()` entry point per model. Implement for each new architecture.
 - **`GenerationState` trait** — per-request mutable state (KV cache, recurrent state). Separate from weights.
 - **`ServerEngine` trait** — single-request synchronous inference (used by agent binary + tests).
-- **`Scheduler`** (`pegainfer/src/scheduler.rs`) — multi-request continuous batching over any `ModelForward`.
-- **`SamplingParams`** (`pegainfer/src/sampler.rs`) — sampling config (temperature, top-k, top-p, ...).
+- **`Scheduler`** (`infer/src/scheduler.rs`) — multi-request continuous batching over any `ModelForward`.
+- **`SamplingParams`** (`infer/src/sampler.rs`) — sampling config (temperature, top-k, top-p, ...).
 - **`SchedulerHandle`** — `Clone + Send` handle for submitting requests from HTTP handlers.
 
 ### Model implementation pattern
 
-Every model lives in `pegainfer/src/model/<name>/`:
+Every model lives in `infer/src/model/<name>/`:
 ```
 config.rs       ← JSON config parsing
 weights.rs      ← safetensors loading
@@ -206,15 +206,15 @@ forward.rs      ← ModelForward + GenerationState impl
 
 ### CUDA kernel integration
 
-Kernels live in `pegainfer/csrc/` (CUDA C) and `pegainfer/tools/triton/` (Triton).
-FFI bindings are declared in `pegainfer/src/ffi.rs`.
+Kernels live in `infer/csrc/` (CUDA C) and `infer/tools/triton/` (Triton).
+FFI bindings are declared in `infer/src/ffi.rs`.
 `build.rs` compiles CUDA C and links against pre-compiled Triton binaries.
 
 ---
 
 ## Key References
 
-[ModelForward trait](pegainfer/src/model.rs) · [Scheduler](pegainfer/src/scheduler.rs) · [KV cache](pegainfer/src/model/kv_cache.rs) · [Attention ops](pegainfer/src/ops/attention.rs) · [HTTP server](pegainfer/src/http_server.rs) · [Roadmap](ROADMAP.md)
+[ModelForward trait](infer/src/model.rs) · [Scheduler](infer/src/scheduler.rs) · [KV cache](infer/src/model/kv_cache.rs) · [Attention ops](infer/src/ops/attention.rs) · [HTTP server](infer/src/http_server.rs) · [Roadmap](ROADMAP.md)
 
 ---
 

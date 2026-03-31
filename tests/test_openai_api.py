@@ -3,7 +3,7 @@ OpenAI API compatibility tests — no GPU required for mock-server tests.
 
 Tests the OpenAI-compatible /v1/completions and /v1/chat/completions
 API shapes using a mock HTTP server. Integration tests against a real
-running pegainfer server are skipped when no server is available.
+running infer server are skipped when no server is available.
 
 Run:
     pytest tests/test_openai_api.py -v                   # mock only
@@ -498,7 +498,7 @@ class TestErrorCases:
 
 
 # ---------------------------------------------------------------------------
-# Integration tests (requires running pegainfer server)
+# Integration tests (requires running infer server)
 # ---------------------------------------------------------------------------
 
 @skip_without_server

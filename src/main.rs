@@ -12,7 +12,7 @@ use anyhow::Result;
 use clap::Parser;
 use log::info;
 
-use pegainfer::server_engine::{
+use infer::server_engine::{
     EngineOptions, ModelType, Qwen35ServerEngine, RealServerEngine, ServerEngine, detect_model_type,
 };
 
@@ -122,7 +122,7 @@ fn run_repl(
 
 fn main() -> Result<()> {
     // Initialize logging
-    pegainfer::logging::init_default();
+    infer::logging::init_default();
 
     let args = Args::parse();
 
@@ -131,10 +131,10 @@ fn main() -> Result<()> {
     if args.dynamo {
         #[cfg(feature = "dynamo")]
         {
-            use pegainfer::model::{ModelRuntimeConfig, Qwen3Model, Qwen35Model};
-            use pegainfer::scheduler::Scheduler;
-            use pegainfer::server_engine::{detect_model_type as detect, model_id_from_path};
-            use pegainfer::tokenizer::Tokenizer;
+            use infer::model::{ModelRuntimeConfig, Qwen3Model, Qwen35Model};
+            use infer::scheduler::Scheduler;
+            use infer::server_engine::{detect_model_type as detect, model_id_from_path};
+            use infer::tokenizer::Tokenizer;
 
             info!("Starting Dynamo distributed runtime registration...");
 
@@ -149,7 +149,7 @@ fn main() -> Result<()> {
             let load_start = Instant::now();
 
             let handle = match model_type {
-                pegainfer::server_engine::ModelType::Qwen3 => {
+                infer::server_engine::ModelType::Qwen3 => {
                     let model = Qwen3Model::from_safetensors_with_runtime(
                         &args.model_path,
                         ModelRuntimeConfig {
@@ -161,7 +161,7 @@ fn main() -> Result<()> {
                     std::thread::spawn(move || scheduler.run());
                     handle
                 }
-                pegainfer::server_engine::ModelType::Qwen35 => {
+                infer::server_engine::ModelType::Qwen35 => {
                     let model = Qwen35Model::from_safetensors_with_options(
                         &args.model_path,
                         options.enable_cuda_graph,

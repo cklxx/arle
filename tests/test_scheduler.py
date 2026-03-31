@@ -3,7 +3,7 @@ Scheduler tests — no GPU required.
 
 Tests SchedulerConfig validation, SchedulerHandle backpressure,
 RequestPriority ordering, and the Phase state machine described in
-pegainfer/src/scheduler.rs — all using pure Python mirrors.
+infer/src/scheduler.rs — all using pure Python mirrors.
 
 Run:
     pytest tests/test_scheduler.py -v
@@ -60,7 +60,7 @@ class SchedulerFull(Exception):
 
 
 class SchedulerHandle:
-    """Python mirror of pegainfer::scheduler::SchedulerHandle."""
+    """Python mirror of infer::scheduler::SchedulerHandle."""
 
     def __init__(self, model_id: str, max_waiting: int = 0):
         self.model_id = model_id

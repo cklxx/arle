@@ -25,7 +25,7 @@ Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi), Pa
 These tasks can be built and tested entirely on CPU.
 
 ### 0.1 Chat Completions API
-**Files**: `pegainfer/src/http_server/openai_v1.rs`
+**Files**: `infer/src/http_server/openai_v1.rs`
 **Goal**: Add `/v1/chat/completions` endpoint with message → ChatML conversion, streaming SSE, and `finish_reason` handling. Essential for LLM clients (OpenAI SDK, litellm, etc.).
 
 ```
@@ -39,7 +39,7 @@ Tool call delta streaming (OpenAI format)
 ---
 
 ### 0.2 Sampler Expansion
-**Files**: `pegainfer/src/sampler.rs`, `pegainfer/src/ops/sampling.rs`
+**Files**: `infer/src/sampler.rs`, `infer/src/ops/sampling.rs`
 **Goal**: Add missing sampling strategies so the engine is compatible with all common LLM configs.
 
 ```
@@ -56,7 +56,7 @@ stop_token_ids: Vec<u32>       ← additional stop tokens beyond model EOS
 ---
 
 ### 0.3 Radix Tree Prefix Cache
-**Files**: `pegainfer/src/model/prefix_cache.rs` (new)
+**Files**: `infer/src/model/prefix_cache.rs` (new)
 **Goal**: Content-addressable KV cache reuse across requests. Requests sharing a common prefix (system prompt, few-shot examples) skip prefill for the shared portion.
 
 ```
@@ -73,7 +73,7 @@ RadixTree<BlockId>
 ---
 
 ### 0.4 Paged KV Cache Block Manager
-**Files**: `pegainfer/src/model/block_manager.rs` (new), extend `kv_cache.rs`
+**Files**: `infer/src/model/block_manager.rs` (new), extend `kv_cache.rs`
 **Goal**: Fixed-size block allocator for KV cache. Required for PagedAttention and for radix cache to work across requests without copying.
 
 ```
@@ -95,7 +95,7 @@ BlockManager {
 ---
 
 ### 0.5 Scheduler Improvements
-**Files**: `pegainfer/src/scheduler.rs`
+**Files**: `infer/src/scheduler.rs`
 **Goal**: Upgrade scheduler for PagedAttention-era requirements.
 
 - **Preemption with swap**: when GPU OOM, preempt lowest-priority request, swap its KV blocks to CPU, resume later
@@ -109,7 +109,7 @@ BlockManager {
 ---
 
 ### 0.6 Model Architecture Registry
-**Files**: `pegainfer/src/model/registry.rs` (new), `pegainfer/src/server_engine.rs`
+**Files**: `infer/src/model/registry.rs` (new), `infer/src/server_engine.rs`
 **Goal**: Replace hard-coded `ModelType` enum with a dynamic registry. Enables adding new architectures without changing the dispatch code.
 
 ```rust
@@ -133,7 +133,7 @@ Register `Qwen3`, `Qwen35`, and stubs for `Llama`, `DeepSeek`, `Mistral`, `Gemma
 ---
 
 ### 0.7 Benchmark Suite
-**Files**: `scripts/bench_throughput.py`, `scripts/bench_latency.py`, `pegainfer/src/bin/bench_serving.rs`
+**Files**: `scripts/bench_throughput.py`, `scripts/bench_latency.py`, `infer/src/bin/bench_serving.rs`
 **Goal**: Comprehensive benchmark framework measuring all production metrics.
 
 ```
@@ -158,7 +158,7 @@ ShareGPT dataset loader for realistic prompt distributions.
 ## Phase 1 — Core GPU Features (GPU required)
 
 ### 1.1 PagedAttention Kernel
-**Files**: `pegainfer/csrc/paged_attention.cu`, `pegainfer/src/ops/attention.rs`
+**Files**: `infer/csrc/paged_attention.cu`, `infer/src/ops/attention.rs`
 **Goal**: Replace contiguous KV cache with paged blocks. Eliminates memory fragmentation, enables sharing blocks across requests (prefix cache), enables swap.
 
 ```c
@@ -180,7 +180,7 @@ Placeholder stub in `ops/attention.rs` with `todo!("GPU required: paged attentio
 ---
 
 ### 1.2 FlashAttention-3 (prefill)
-**Files**: `pegainfer/tools/triton/flash_attention_v3_kernel.py`, `pegainfer/src/ops/attention.rs`
+**Files**: `infer/tools/triton/flash_attention_v3_kernel.py`, `infer/src/ops/attention.rs`
 **Goal**: Upgrade prefill kernel from FA2 → FA3 for better A100/H100 utilization. FA3 uses warp specialization + async pipeline.
 
 Key improvements over FA2:
@@ -193,7 +193,7 @@ Keep FA2 as fallback for older GPUs (< SM90).
 ---
 
 ### 1.3 Multi-Head Latent Attention (MLA) — DeepSeek
-**Files**: `pegainfer/src/ops/attention.rs`, `pegainfer/src/model/deepseek/`
+**Files**: `infer/src/ops/attention.rs`, `infer/src/model/deepseek/`
 **Goal**: Implement MLA as used in DeepSeek-V2/V3/R1. MLA compresses KV cache to a latent vector (rank << d_model), drastically reducing KV memory.
 
 ```
@@ -210,7 +210,7 @@ Cache only `C_KV` (compressed), not `K, V` — huge memory saving.
 ---
 
 ### 1.4 Llama 3/4 Model
-**Files**: `pegainfer/src/model/llama/`
+**Files**: `infer/src/model/llama/`
 **Goal**: Support Meta's Llama 3 (8B, 70B, 405B) and Llama 4 Scout/Maverick.
 
 Llama 3 differences from Qwen3:
@@ -228,7 +228,7 @@ Llama 4 additions:
 ---
 
 ### 1.5 DeepSeek-V3 / R1 Model
-**Files**: `pegainfer/src/model/deepseek/`
+**Files**: `infer/src/model/deepseek/`
 **Goal**: Support DeepSeek-V3 (671B MoE) and R1 (671B MoE + chain-of-thought).
 
 Key components:
@@ -240,7 +240,7 @@ Key components:
 ---
 
 ### 1.6 Mistral / Mixtral Model
-**Files**: `pegainfer/src/model/mistral/`
+**Files**: `infer/src/model/mistral/`
 **Goal**: Support Mistral 7B v0.3, Mixtral 8x7B, Mixtral 8x22B, Mistral Large 2.
 
 - Sliding window attention (Mistral 7B)
@@ -250,7 +250,7 @@ Key components:
 ---
 
 ### 1.7 Gemma 2 / 3 Model
-**Files**: `pegainfer/src/model/gemma/`
+**Files**: `infer/src/model/gemma/`
 **Goal**: Support Google Gemma 2 (2B, 9B, 27B) and Gemma 3.
 
 Gemma 2 differences:
@@ -266,7 +266,7 @@ Gemma 3 additions:
 ---
 
 ### 1.8 Phi-4 Model
-**Files**: `pegainfer/src/model/phi/`
+**Files**: `infer/src/model/phi/`
 **Goal**: Support Microsoft Phi-4 (14B).
 
 - Dense transformer, standard GQA
@@ -278,7 +278,7 @@ Gemma 3 additions:
 ## Phase 2 — Quantization (GPU required for kernels, CPU for config)
 
 ### 2.1 Weight Loader Abstraction
-**Files**: `pegainfer/src/weight_loader.rs`
+**Files**: `infer/src/weight_loader.rs`
 **Goal**: Extend weight loader to detect and dispatch quantized formats.
 
 ```rust
@@ -295,7 +295,7 @@ impl WeightLoader {
 ---
 
 ### 2.2 GPTQ / AWQ INT4 Kernels
-**Files**: `pegainfer/csrc/gemm_int4.cu`
+**Files**: `infer/csrc/gemm_int4.cu`
 **Goal**: Fused dequantize-GEMM kernels for INT4 weights. Required for serving quantized open-source models (most popular community models are GPTQ/AWQ quantized).
 
 Implement W4A16 (INT4 weights, FP16 activations) via:
@@ -305,7 +305,7 @@ Implement W4A16 (INT4 weights, FP16 activations) via:
 ---
 
 ### 2.3 FP8 (E4M3) Kernels
-**Files**: `pegainfer/csrc/gemm_fp8.cu`
+**Files**: `infer/csrc/gemm_fp8.cu`
 **Goal**: FP8 GEMM for H100 (SM90). Required for DeepSeek-V3 native precision.
 
 - `__nv_fp8_e4m3` weight storage, BF16 accumulation
@@ -315,7 +315,7 @@ Implement W4A16 (INT4 weights, FP16 activations) via:
 ---
 
 ### 2.4 INT8 / SmoothQuant
-**Files**: `pegainfer/csrc/gemm_int8.cu`
+**Files**: `infer/csrc/gemm_int8.cu`
 **Goal**: INT8 W8A8 GEMM using cuBLAS `cublasLtMatmul` with INT8 I/O.
 
 SmoothQuant migration: apply channel-wise scale to activations before quantizing.
@@ -323,7 +323,7 @@ SmoothQuant migration: apply channel-wise scale to activations before quantizing
 ---
 
 ### 2.5 GGUF Loading
-**Files**: `pegainfer/src/weight_loader.rs`, add gguf reader
+**Files**: `infer/src/weight_loader.rs`, add gguf reader
 **Goal**: Load GGUF format files (llama.cpp ecosystem). Read GGUF header, tensor layout, Q4_K_M / Q8_0 block formats. Dequantize on load to BF16.
 
 ---
@@ -331,7 +331,7 @@ SmoothQuant migration: apply channel-wise scale to activations before quantizing
 ## Phase 3 — Tensor Parallelism (GPU required, multi-GPU)
 
 ### 3.1 TP Communication Primitives
-**Files**: `pegainfer/src/ops/comm.rs` (new)
+**Files**: `infer/src/ops/comm.rs` (new)
 **Goal**: All-reduce and all-gather over NCCL for tensor parallel.
 
 ```rust
@@ -345,7 +345,7 @@ impl NcclComm {
 ---
 
 ### 3.2 Column / Row Parallel Linear
-**Files**: `pegainfer/src/ops/linear.rs`
+**Files**: `infer/src/ops/linear.rs`
 **Goal**: Sharded linear layers for tensor parallel.
 
 ```
@@ -356,19 +356,19 @@ RowParallelLinear:     Y = X_i · W_i^T             (scatter input, gather outpu
 ---
 
 ### 3.3 TP-aware Model Wrappers
-**Files**: `pegainfer/src/model/<name>/tp.rs` per model
+**Files**: `infer/src/model/<name>/tp.rs` per model
 **Goal**: Wrap each model's attention (split Q/K/V heads) and MLP (split intermediate dim) across TP ranks.
 
 ---
 
 ### 3.4 Pipeline Parallel (PP)
-**Files**: `pegainfer/src/model/pp.rs` (new)
+**Files**: `infer/src/model/pp.rs` (new)
 **Goal**: Partition layers across devices. Send hidden states between stages via P2P (cuMemcpyPeer / NCCL send/recv).
 
 ---
 
 ### 3.5 Expert Parallel (EP) for MoE
-**Files**: `pegainfer/src/ops/moe.rs` (new)
+**Files**: `infer/src/ops/moe.rs` (new)
 **Goal**: Distribute MoE experts across EP ranks. All-to-all routing for expert dispatch/combine.
 
 ---
@@ -376,13 +376,13 @@ RowParallelLinear:     Y = X_i · W_i^T             (scatter input, gather outpu
 ## Phase 4 — Advanced Decoding
 
 ### 4.1 Beam Search
-**Files**: `pegainfer/src/sampler.rs`
+**Files**: `infer/src/sampler.rs`
 **Goal**: Beam search with configurable beam width. Uses block manager to share KV prefixes across beams.
 
 ---
 
 ### 4.2 Speculative Decoding
-**Files**: `pegainfer/src/speculative.rs` (new)
+**Files**: `infer/src/speculative.rs` (new)
 **Goal**: Draft-verify loop: small draft model generates K candidate tokens, large target model verifies in one forward pass.
 
 ```
@@ -396,7 +396,7 @@ For DeepSeek-V3: use MTP heads (built into model) as draft — zero additional m
 ---
 
 ### 4.3 Structured Output (JSON schema / regex)
-**Files**: `pegainfer/src/structured_output.rs` (new)
+**Files**: `infer/src/structured_output.rs` (new)
 **Goal**: Constrained decoding via logit masking. At each step, mask invalid token IDs per grammar state.
 
 - JSON schema → LALR(1) grammar → token mask table
@@ -408,13 +408,13 @@ For DeepSeek-V3: use MTP heads (built into model) as draft — zero additional m
 ## Phase 5 — Performance Optimization
 
 ### 5.1 CUDA Graph for Multi-Request Decode
-**Files**: `pegainfer/src/model/cuda_graph.rs`
+**Files**: `infer/src/model/cuda_graph.rs`
 **Goal**: Extend existing single-request CUDA graph to capture multi-request batched decode. Requires fixed batch size → maintain a pool of graphs (batch sizes 1, 2, 4, 8, 16, 32).
 
 ---
 
 ### 5.2 Overlap Compute and Communication (TP)
-**Files**: `pegainfer/src/ops/comm.rs`
+**Files**: `infer/src/ops/comm.rs`
 **Goal**: Async NCCL all-reduce overlapped with next layer's compute using two CUDA streams.
 
 ---

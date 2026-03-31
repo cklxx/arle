@@ -11,7 +11,7 @@ dependencies = [
  "dynamo-runtime",
  "log",
  "logforth",
- "pegainfer",
+ "infer",
  "rand 0.10.0",
  "regex",
  "serde",
@@ -2998,7 +2998,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pegainfer"
+name = "infer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
