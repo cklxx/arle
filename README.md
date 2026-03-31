@@ -6,6 +6,21 @@ Pure Rust LLM inference engine with multi-turn agent tool-calling. Built on **In
 
 ---
 
+## Performance (Qwen3-4B, A100-40GB)
+
+| Metric | agent-infer | SGLang | Ratio |
+|--------|-------------|--------|-------|
+| TTFT | 8.6ms | 39.3ms | **4.6x faster** |
+| Single-request tok/s | 112 | 122 | 0.92x |
+| 4-concurrent tok/s | 205 | 482 | 0.43x |
+| 8-concurrent tok/s | 152 | 860 | 0.18x |
+
+**TTFT lead**: Rust runtime eliminates Python dispatch overhead; CUDA Graph decode removes per-step CPU→GPU launches, cutting first-token latency to 8.6ms.
+
+**Concurrency gap**: Batch decode attention is currently being migrated from a per-request loop to FlashInfer's batched kernel — once complete, multi-request throughput is expected to close significantly toward SGLang levels. (In progress.)
+
+---
+
 ## Quick Start
 
 ```bash
@@ -43,7 +58,7 @@ User
                            │  (linked library)
                            ▼
 ┌─────────────────────────────────────────────────────────┐
-│  infer  (infer/src/)                            │
+│  infer  (infer/src/)                                    │
 │                                                         │
 │  HTTP layer          Scheduler          Sampler         │
 │  /v1/completions  ──▶ continuous  ──▶  top-k/p/temp    │
@@ -210,6 +225,9 @@ Scheduler interleaves multiple requests on a single GPU. Long prefills are chunk
 ### CUDA Graph Decode
 First decode token captures a CUDA graph; subsequent tokens replay it, eliminating CPU→GPU dispatch overhead per step.
 
+### FlashInfer Batched Decode (In Progress)
+Batch decode attention is being migrated to FlashInfer's batched kernel, replacing the current per-request loop. This is the primary work item for closing the concurrency throughput gap vs SGLang.
+
 ### Dynamo Integration
 ```bash
 cargo build --release --features dynamo
@@ -257,7 +275,7 @@ agent-infer/
 │   ├── chat.rs                  # ChatML formatter + <tool_call> parser
 │   ├── tools.rs                 # shell / python tool execution
 │   └── dynamo_integration.rs    # Dynamo runtime bridge
-├── infer/                   # Inference engine (Rust library)
+├── infer/                       # Inference engine (Rust library)
 │   ├── src/
 │   │   ├── model/               # Qwen3, Qwen3.5 implementations
 │   │   ├── ops/                 # GPU ops: attention, linear, norm, sampling
