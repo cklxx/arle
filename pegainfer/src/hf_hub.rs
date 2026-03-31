@@ -97,13 +97,15 @@ pub fn download_from_hub(model_id: &str) -> Result<PathBuf> {
     let weight_files: Vec<&str> = filenames
         .iter()
         .filter(|f| {
-            (f.ends_with(".safetensors") || f.ends_with(".bin"))
+            let p = std::path::Path::new(f.as_str());
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            (ext == "safetensors" || ext == "bin")
                 // Skip adapter / lora weight files
                 && !f.contains("adapter")
                 // Prefer safetensors; skip .bin when a .safetensors twin exists
-                && !(f.ends_with(".bin") && has_safetensors_twin(&filenames, f))
+                && !(ext == "bin" && has_safetensors_twin(&filenames, f))
         })
-        .map(|f| f.as_str())
+        .map(String::as_str)
         .collect();
 
     if weight_files.is_empty() {
@@ -130,8 +132,7 @@ pub fn download_from_hub(model_id: &str) -> Result<PathBuf> {
 
     let cache_dir = file_path
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| file_path.clone());
+        .map_or_else(|| file_path.clone(), Path::to_path_buf);
 
     log::info!(
         "Model '{}' ready at: {}",
