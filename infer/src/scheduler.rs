@@ -49,6 +49,10 @@ use crate::tokenizer::Tokenizer;
 
 #[cfg(feature = "cuda")]
 const PREFILL_CHUNK_SIZE: usize = 512;
+/// Smaller chunk when decode is active, to avoid blocking decode latency.
+/// SGLang uses dynamic sizing; we use a fixed small chunk for simplicity.
+#[cfg(feature = "cuda")]
+const PREFILL_CHUNK_SIZE_WITH_DECODE: usize = 64;
 
 // ============================================================================
 // SchedulerConfig — always available
@@ -751,10 +755,11 @@ impl<M: ModelForward> Scheduler<M> {
             self.step_decode_batch();
         }
 
-        // Run one prefill operation (ongoing chunk or new request setup)
+        // Run one prefill operation with decode-aware chunk sizing.
+        // When decode is active, use a smaller chunk to minimize decode latency impact.
         for idx in 0..num {
             if matches!(self.active[idx].phase, Phase::Prefilling { .. }) {
-                self.step_prefill_chunk(idx);
+                self.step_prefill_chunk(idx, has_decode);
                 return;
             }
         }
@@ -862,7 +867,7 @@ impl<M: ModelForward> Scheduler<M> {
 
     /// Process one chunk of a prefill. When all chunks are done, sample the
     /// first token and transition to Decoding.
-    fn step_prefill_chunk(&mut self, idx: usize) {
+    fn step_prefill_chunk(&mut self, idx: usize, decode_active: bool) {
         let Self {
             model,
             tokenizer,
@@ -891,7 +896,12 @@ impl<M: ModelForward> Scheduler<M> {
         };
 
         let total = effective_tokens.len();
-        let chunk_end = (*progress + PREFILL_CHUNK_SIZE).min(total);
+        let chunk_size = if decode_active {
+            PREFILL_CHUNK_SIZE_WITH_DECODE
+        } else {
+            PREFILL_CHUNK_SIZE
+        };
+        let chunk_end = (*progress + chunk_size).min(total);
         let chunk = &effective_tokens[*progress..chunk_end];
 
         let slot_idx = req.slot_idx;
@@ -1031,14 +1041,16 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
 
-        // Run forward pass
-        let forward_result = if decode_indices.len() == 1 {
-            // Single request: use regular path (benefits from CUDA Graph)
-            model.forward(&[token_ids[0]], &mut states[slot_indices[0]])
-        } else {
-            // Multiple requests: batched decode (GEMM for projections)
-            model.forward_decode_batch(&token_ids, states, &slot_indices, Some(paged_kv_pool), decode_bufs)
-        };
+        // Run forward pass — always use the batched FlashInfer path when the paged
+        // KV pool is active. Routing batch_size=1 through the contiguous/Triton
+        // decode path causes output divergence: K/V is written only to the
+        // contiguous cache (not the pool), so when the request later joins a
+        // larger batch, FlashInfer reads stale pool data. Additionally, the
+        // Triton and FlashInfer attention kernels produce numerically different
+        // results, so greedy (temperature=0) output depends on which path ran.
+        let forward_result = model.forward_decode_batch(
+            &token_ids, states, &slot_indices, Some(paged_kv_pool), decode_bufs,
+        );
 
         if let Err(e) = forward_result {
             error!("Batched decode failed: {}", e);
