@@ -158,6 +158,21 @@ impl KVCache {
         self.seq_len += 1;
     }
 
+    /// Access contiguous K caches for migration to paged pool.
+    pub(crate) fn k_caches(&self) -> &[DeviceVec] {
+        &self.k_cache
+    }
+
+    /// Access contiguous V caches for migration to paged pool.
+    pub(crate) fn v_caches(&self) -> &[DeviceVec] {
+        &self.v_cache
+    }
+
+    /// Maximum sequence length (for contiguous offset calculation).
+    pub(crate) fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
     pub(crate) fn advance_seq_len(&mut self, count: usize) {
         self.seq_len += count;
     }

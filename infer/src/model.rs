@@ -33,6 +33,15 @@ pub trait GenerationState {
     fn set_max_seq_len(&mut self, max_seq: usize);
     /// Offload excess KV to CPU if over GPU budget. Called between requests.
     fn offload_kv_if_needed(&mut self) -> Result<()>;
+
+    /// Migrate KV data from contiguous cache to paged pool.
+    /// Called after prefill completes, before first decode step.
+    fn migrate_kv_to_paged(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &crate::paged_kv::PagedKVPool,
+        slot: usize,
+    ) -> Result<()>;
 }
 
 /// Deep module interface: one `forward` method hides prefill/decode strategy,

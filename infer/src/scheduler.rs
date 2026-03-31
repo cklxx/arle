@@ -451,9 +451,8 @@ impl<M: ModelForward> Scheduler<M> {
             use crate::paged_kv::DEFAULT_PAGE_SIZE;
             use crate::tensor::DeviceContext;
 
-            // Paged pool stub: 0 budget means minimal allocation (num_slots pages only).
-            // Real budget will be assigned when FlashInfer decode path is fully wired
-            // (requires prefill to also write to paged cache — TODO).
+            // Paged pool stub: 0 budget. FlashInfer decode path needs debugging
+            // before enabling (KV migration produces incorrect attention output).
             let budget_bytes: usize = 0;
 
             let ctx = model.device_context();
@@ -520,9 +519,7 @@ impl<M: ModelForward> Scheduler<M> {
         use crate::tensor::DeviceContext;
 
         const DEFAULT_MAX_SEQ: usize = 32768;
-        // Reserve 512 MB for activations, scratch buffers, CUDA overhead, etc.
         const RESERVED_BYTES: usize = 512 * 1024 * 1024;
-        // Minimum useful sequence length (don't go below 256 tokens).
         const MIN_SEQ_LEN: usize = 256;
 
         if let Some(val) = override_val {
@@ -790,6 +787,7 @@ impl<M: ModelForward> Scheduler<M> {
             states,
             active,
             rng,
+            paged_kv_pool,
             ..
         } = self;
 

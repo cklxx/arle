@@ -72,6 +72,21 @@ impl GenerationState for Qwen35State {
     fn offload_kv_if_needed(&mut self) -> Result<()> {
         self.kv_cache.offload_if_needed(&self.ctx)
     }
+
+    fn migrate_kv_to_paged(
+        &mut self,
+        ctx: &crate::tensor::DeviceContext,
+        pool: &crate::paged_kv::PagedKVPool,
+        slot: usize,
+    ) -> Result<()> {
+        pool.migrate_from_contiguous(
+            ctx,
+            slot,
+            &self.kv_cache.k_caches(),
+            &self.kv_cache.v_caches(),
+            self.kv_cache.max_seq_len(),
+        )
+    }
 }
 
 impl ModelForward for Qwen35Model {

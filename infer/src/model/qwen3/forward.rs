@@ -67,6 +67,21 @@ impl GenerationState for Qwen3State {
     fn offload_kv_if_needed(&mut self) -> Result<()> {
         self.kv_cache.offload_if_needed(&self.ctx)
     }
+
+    fn migrate_kv_to_paged(
+        &mut self,
+        ctx: &crate::tensor::DeviceContext,
+        pool: &crate::paged_kv::PagedKVPool,
+        slot: usize,
+    ) -> Result<()> {
+        pool.migrate_from_contiguous(
+            ctx,
+            slot,
+            &self.kv_cache.k_caches(),
+            &self.kv_cache.v_caches(),
+            self.kv_cache.max_seq_len(),
+        )
+    }
 }
 
 impl ModelForward for Qwen3Model {
@@ -213,7 +228,7 @@ impl ModelForward for Qwen3Model {
         tokens: &[u32],
         states: &mut [Self::State],
         slot_indices: &[usize],
-        _paged_kv_pool: Option<&mut crate::paged_kv::PagedKVPool>,
+        paged_kv_pool: Option<&mut crate::paged_kv::PagedKVPool>,
     ) -> Result<()> {
         if tokens.len() <= 1 {
             if tokens.len() == 1 {
@@ -221,8 +236,15 @@ impl ModelForward for Qwen3Model {
             }
             return Ok(());
         }
-        // Use old batched decode path with contiguous KV cache.
-        // FlashInfer paged path requires prefill to also write to paged cache (TODO).
+        // TODO: Enable FlashInfer paged path once KV migration is debugged.
+        // For now, use sequential decode with contiguous KV cache (correct).
+        // match paged_kv_pool {
+        //     Some(pool) if !pool.k_pools.is_empty() => {
+        //         self.decode_batch(tokens, states, slot_indices, pool)
+        //     }
+        //     _ => self.decode_batch_contiguous(tokens, states, slot_indices),
+        // }
+        let _ = paged_kv_pool; // suppress warning
         self.decode_batch_contiguous(tokens, states, slot_indices)
     }
 }
