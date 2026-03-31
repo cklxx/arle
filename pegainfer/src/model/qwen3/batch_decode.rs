@@ -139,12 +139,11 @@ impl Qwen3Model {
             states[si].kv_cache.increment_seq_len();
         }
 
-        // 4. Compute logits for each request
+        // 4. Compute logits for all requests in one batched norm + one GEMM
+        ops::rms_norm_batch_into(&self.ctx, &hidden, &self.norm, eps, &mut bufs.normed);
+        let logits_batch = ops::gemm(&self.ctx, self.output_projection(), &bufs.normed)?;
         for (b, &si) in slot_indices.iter().enumerate() {
-            let row_vec = ops::extract_vec(&self.ctx, &hidden, b)?;
-            let normed = ops::rms_norm(&self.ctx, &row_vec, &self.norm, eps)?;
-            let logits = ops::linear(&self.ctx, &normed, self.output_projection())?;
-            // Store logits in the state's prefill_logits field (select_token reads from here)
+            let logits = ops::extract_vec(&self.ctx, &logits_batch, b)?;
             states[si].prefill_logits = Some(logits);
         }
 

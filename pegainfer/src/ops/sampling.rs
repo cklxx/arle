@@ -38,6 +38,49 @@ pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
     Ok(result[0] as u32)
 }
 
+/// Batched argmax — returns the index of the maximum element for each of B rows.
+///
+/// Input: `logits` is a contiguous [B, vocab_size] bf16 tensor.
+/// Output: `out` is a pre-allocated [B] i32 buffer on device.
+/// Launches B blocks of 1024 threads in a single kernel.
+pub fn argmax_batch(
+    ctx: &DeviceContext,
+    logits: &DeviceVec,
+    out: &mut CudaSlice<i32>,
+    batch_size: usize,
+    vocab_size: usize,
+) -> Result<Vec<u32>> {
+    assert_eq!(
+        logits.len,
+        batch_size * vocab_size,
+        "logits length must equal batch_size * vocab_size"
+    );
+
+    {
+        let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+        let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+
+        unsafe {
+            ffi::argmax_batch_cuda(
+                l_ptr as *const ffi::Half,
+                o_ptr as *mut i32,
+                batch_size as i32,
+                vocab_size as i32,
+                ctx.stream.cu_stream(),
+            );
+        }
+    }
+
+    ctx.sync()?;
+
+    let result = ctx
+        .stream
+        .clone_dtoh(out)
+        .map_err(|e| anyhow!("D2H batch argmax read failed: {}", e))?;
+
+    Ok(result.iter().map(|&x| x as u32).collect())
+}
+
 /// GPU sampling: temperature → softmax → top-k → top-p → multinomial.
 /// Allocates a temporary output buffer — use `gpu_sample_into` for the decode loop.
 pub fn gpu_sample(
@@ -77,8 +120,28 @@ fn gpu_sample_core(
     params: &crate::sampler::SamplingParams,
     random_val: f32,
 ) -> Result<u32> {
+    gpu_sample_launch(ctx, logits, probs_scratch, out, params, random_val)?;
+
+    ctx.sync()?;
+
+    let result = ctx
+        .stream
+        .clone_dtoh(out)
+        .map_err(|e| anyhow!("D2H sample read failed: {}", e))?;
+
+    Ok(result[0] as u32)
+}
+
+/// Launch the sampling kernel without syncing. Call `ctx.sync()` separately.
+pub fn gpu_sample_launch(
+    ctx: &DeviceContext,
+    logits: &DeviceVec,
+    probs_scratch: &mut CudaSlice<f32>,
+    out: &mut CudaSlice<i32>,
+    params: &crate::sampler::SamplingParams,
+    random_val: f32,
+) -> Result<()> {
     if params.is_greedy() {
-        // Fast path: deterministic argmax (avoids softmax tie-breaking issues with bf16)
         let (x_ptr, _gx) = logits.data.device_ptr(&ctx.stream);
         let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
         unsafe {
@@ -107,13 +170,17 @@ fn gpu_sample_core(
             );
         }
     }
+    Ok(())
+}
 
-    ctx.sync()?;
-
+/// Read back the sampling result after a prior `gpu_sample_launch` + `ctx.sync()`.
+pub fn gpu_sample_readback(
+    ctx: &DeviceContext,
+    out: &CudaSlice<i32>,
+) -> Result<u32> {
     let result = ctx
         .stream
         .clone_dtoh(out)
         .map_err(|e| anyhow!("D2H sample read failed: {}", e))?;
-
     Ok(result[0] as u32)
 }

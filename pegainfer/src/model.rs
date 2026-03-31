@@ -4,7 +4,7 @@ use anyhow::Result;
 use rand::rngs::StdRng;
 
 use crate::sampler::SamplingParams;
-use crate::tensor::DeviceVec;
+use crate::tensor::{DeviceContext, DeviceVec};
 
 pub(crate) mod cuda_graph;
 mod kv_cache;
@@ -45,6 +45,23 @@ pub trait ModelForward: Send {
         rng: &mut StdRng,
     ) -> Result<u32>;
     fn is_stop_token(&self, token_id: u32) -> bool;
+    fn device_context(&self) -> &DeviceContext;
+
+    /// Batched sampling: launch all sampling kernels, sync once, readback all.
+    /// Returns one token per request. Default falls back to sequential select_token.
+    fn select_tokens_batch(
+        &self,
+        states: &mut [Self::State],
+        slot_indices: &[usize],
+        params: &[&SamplingParams],
+        rng: &mut StdRng,
+    ) -> Result<Vec<u32>> {
+        let mut tokens = Vec::with_capacity(slot_indices.len());
+        for (i, &si) in slot_indices.iter().enumerate() {
+            tokens.push(self.select_token(&mut states[si], params[i], rng)?);
+        }
+        Ok(tokens)
+    }
 
     /// Batched decode: process B tokens from B requests in one forward pass.
     ///

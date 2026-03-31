@@ -14,11 +14,11 @@ use crate::tensor::DeviceVec;
 /// Per-request mutable state for Qwen3.
 pub struct Qwen3State {
     pub(super) ctx: crate::tensor::DeviceContext,
-    pub(super) decode_bufs: DecodeBuffers,
+    pub(crate) decode_bufs: DecodeBuffers,
     pub(super) kv_cache: KVCache,
     pub(super) graph_state: CudaGraphState,
     /// Logits from multi-token prefill (None after decode path — logits are in decode_bufs).
-    pub(super) prefill_logits: Option<DeviceVec>,
+    pub(crate) prefill_logits: Option<DeviceVec>,
 }
 
 // SAFETY: `Qwen3State` contains CUDA resources (`DeviceContext`, `CudaSlice` inside
@@ -135,6 +135,53 @@ impl ModelForward for Qwen3Model {
 
     fn is_stop_token(&self, token_id: u32) -> bool {
         self.config.is_stop_token(token_id)
+    }
+
+    fn device_context(&self) -> &crate::tensor::DeviceContext {
+        &self.ctx
+    }
+
+    fn select_tokens_batch(
+        &self,
+        states: &mut [Self::State],
+        slot_indices: &[usize],
+        params: &[&crate::sampler::SamplingParams],
+        rng: &mut rand::rngs::StdRng,
+    ) -> anyhow::Result<Vec<u32>> {
+        use rand::Rng;
+        let b = slot_indices.len();
+
+        // Phase 1: Launch all sampling kernels (no sync between them)
+        for i in 0..b {
+            let si = slot_indices[i];
+            let random_val: f32 = rng.random();
+            let logits = states[si]
+                .prefill_logits
+                .as_ref()
+                .unwrap_or(&states[si].decode_bufs.logits);
+            crate::ops::gpu_sample_launch(
+                &self.ctx,
+                logits,
+                &mut states[si].decode_bufs.sample_probs,
+                &mut states[si].decode_bufs.sample_out,
+                params[i],
+                random_val,
+            )?;
+        }
+
+        // Phase 2: Single sync
+        self.ctx.sync()?;
+
+        // Phase 3: Readback all results
+        let mut tokens = Vec::with_capacity(b);
+        for i in 0..b {
+            let si = slot_indices[i];
+            tokens.push(crate::ops::gpu_sample_readback(
+                &self.ctx,
+                &states[si].decode_bufs.sample_out,
+            )?);
+        }
+        Ok(tokens)
     }
 
     fn forward_decode_batch(
