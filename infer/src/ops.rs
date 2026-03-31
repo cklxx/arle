@@ -15,6 +15,7 @@ mod tests;
 // pub re-exports
 pub use attention::{
     FlashInferWorkspace, decode_prep_paged, flashinfer_batch_decode,
+    flashinfer_plan, flashinfer_run_layer,
     fused_attention_decode_batched_into, fused_attention_decode_into,
     prefill_attention_batch, prefill_attention_hd256_batch,
     prefill_attention_hd256_batch_with_scratch,
