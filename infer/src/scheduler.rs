@@ -34,6 +34,8 @@ use rand::rngs::StdRng;
 
 #[cfg(feature = "cuda")]
 use crate::model::{GenerationState, ModelForward};
+#[cfg(feature = "cuda")]
+use crate::paged_kv::PagedKVPool;
 use crate::sampler::SamplingParams;
 use crate::server_engine::StreamDelta;
 #[cfg(feature = "cuda")]
@@ -385,6 +387,8 @@ pub struct Scheduler<M: ModelForward> {
     active: Vec<ActiveRequest>,
     next_id: u64,
     rng: StdRng,
+    /// Paged KV cache pool shared across all slots (for batched decode).
+    paged_kv_pool: PagedKVPool,
     /// Round-robin index for fair decode scheduling.
     last_served: usize,
     /// Lifetime stats.
@@ -441,6 +445,39 @@ impl<M: ModelForward> Scheduler<M> {
             info!("Initialized state slot {}/{}", i + 1, num_slots);
         }
 
+        // Create the paged KV pool for batched decode.
+        // Query available GPU memory and allocate a budget for paged KV.
+        let paged_kv_pool = {
+            use crate::paged_kv::DEFAULT_PAGE_SIZE;
+            use crate::tensor::DeviceContext;
+
+            const PAGED_KV_RESERVED_BYTES: usize = 8 * 1024 * 1024 * 1024; // 8 GB headroom: contiguous KV still used for prefill + single decode
+
+            let budget_bytes = match DeviceContext::gpu_memory_info() {
+                Ok((free_bytes, _total_bytes)) => {
+                    free_bytes.saturating_sub(PAGED_KV_RESERVED_BYTES)
+                }
+                Err(e) => {
+                    info!(
+                        "PagedKVPool: could not query GPU memory ({}), using 1 GB default budget",
+                        e
+                    );
+                    1024 * 1024 * 1024 // 1 GB fallback
+                }
+            };
+
+            let ctx = model.device_context();
+            PagedKVPool::new(
+                ctx,
+                model.num_kv_layers(),
+                model.num_kv_heads(),
+                model.head_dim(),
+                DEFAULT_PAGE_SIZE,
+                num_slots,
+                budget_bytes,
+            )?
+        };
+
         info!(
             "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}",
             model_id,
@@ -463,6 +500,7 @@ impl<M: ModelForward> Scheduler<M> {
             active: Vec::new(),
             next_id: 0,
             rng: StdRng::seed_from_u64(seed),
+            paged_kv_pool,
             last_served: 0,
             total_completed: 0,
             total_generated_tokens: 0,
@@ -611,6 +649,22 @@ impl<M: ModelForward> Scheduler<M> {
                 prompt_tokens.len(),
                 self.waiting.len()
             );
+
+            // Pre-allocate paged KV pages for the prompt length.
+            let prompt_len = prompt_tokens.len();
+            if let Err(e) = self.paged_kv_pool.grow_slot(slot_idx, prompt_len) {
+                error!(
+                    "Request {}: failed to allocate paged KV for {} prompt tokens: {}",
+                    id, prompt_len, e
+                );
+                // Send error back and skip this request.
+                let _ = incoming.delta_tx.send(StreamDelta {
+                    text_delta: String::new(),
+                    finish_reason: Some(crate::server_engine::FinishReason::Stop),
+                    usage: None,
+                });
+                continue;
+            }
 
             self.active.push(ActiveRequest {
                 id,
@@ -842,6 +896,7 @@ impl<M: ModelForward> Scheduler<M> {
             states,
             active,
             rng,
+            paged_kv_pool,
             ..
         } = self;
 
@@ -890,13 +945,25 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let slot_indices: Vec<usize> = decode_indices.iter().map(|&i| active[i].slot_idx).collect();
 
+        // Allocate one additional page-worth of KV for each decode request (the new token).
+        for &slot in &slot_indices {
+            if let Err(e) = paged_kv_pool.grow_slot(slot, 1) {
+                error!("PagedKVPool: grow_slot({}, 1) failed: {}", slot, e);
+                // Mark all decode requests as finished on OOM (conservative).
+                for &i in &decode_indices {
+                    active[i].phase = Phase::Finished;
+                }
+                return;
+            }
+        }
+
         // Run forward pass
         let forward_result = if decode_indices.len() == 1 {
             // Single request: use regular path (benefits from CUDA Graph)
             model.forward(&[token_ids[0]], &mut states[slot_indices[0]])
         } else {
             // Multiple requests: batched decode (GEMM for projections)
-            model.forward_decode_batch(&token_ids, states, &slot_indices)
+            model.forward_decode_batch(&token_ids, states, &slot_indices, Some(paged_kv_pool))
         };
 
         if let Err(e) = forward_result {
@@ -946,6 +1013,9 @@ impl<M: ModelForward> Scheduler<M> {
             if matches!(self.active[i].phase, Phase::Finished) {
                 let req = self.active.remove(i);
                 let gen_tokens = req.generated_tokens.len() as u64;
+
+                // Free paged KV pages for this slot back to the pool.
+                self.paged_kv_pool.free_slot(req.slot_idx);
 
                 // Update slot's cached prompt for future prefix reuse
                 self.cached_prompts[req.slot_idx] = req.prompt_tokens;

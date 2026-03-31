@@ -101,6 +101,18 @@ impl ModelForward for Qwen35Model {
             * 2
     }
 
+    fn num_kv_layers(&self) -> usize {
+        self.config.num_full_attention_layers()
+    }
+
+    fn num_kv_heads(&self) -> usize {
+        self.config.num_key_value_heads
+    }
+
+    fn head_dim(&self) -> usize {
+        self.config.head_dim
+    }
+
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
         // Prefetch offloaded KV before PREFILL only.
         if tokens.len() > 1 && state.kv_cache.has_offloaded() {

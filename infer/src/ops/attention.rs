@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
+use crate::paged_kv::PagedKVPool;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Batched prefill attention with FlashAttention-2.
@@ -457,6 +458,299 @@ pub fn fused_attention_decode_into(
         )
     };
     result.result()?;
+
+    Ok(())
+}
+
+// ============================================================================
+// FlashInfer batch decode with paged KV cache
+// ============================================================================
+
+/// Workspace buffers for FlashInfer batch decode, allocated once and reused.
+///
+/// FlashInfer's plan/run API needs:
+/// - `float_workspace`: ~128MB GPU buffer for split-KV temp storage
+/// - `int_workspace`: ~8MB GPU buffer for plan metadata
+/// - `page_locked_workspace`: ~8MB CPU pinned buffer for plan H2D copy
+/// - `plan_info`: ~256 bytes opaque buffer for plan output
+pub struct FlashInferWorkspace {
+    /// GPU scratch for split-KV temporaries (~128MB)
+    pub float_workspace: CudaSlice<u8>,
+    pub float_workspace_bytes: usize,
+    /// GPU scratch for plan metadata (~8MB)
+    pub int_workspace: CudaSlice<u8>,
+    pub int_workspace_bytes: usize,
+    /// CPU pinned buffer for plan H2D copy (~8MB)
+    page_locked_workspace: *mut u8,
+    #[allow(dead_code)]
+    page_locked_workspace_bytes: usize,
+    /// Opaque plan info buffer (256 bytes, GPU)
+    pub plan_info: CudaSlice<u8>,
+    /// LSE output buffer (log-sum-exp), nullable but we allocate for max batch
+    pub lse: CudaSlice<f32>,
+}
+
+// SAFETY: The page_locked_workspace is a pinned CPU allocation that is only accessed
+// from the single inference thread (same thread that calls plan/run). No concurrent access.
+unsafe impl Send for FlashInferWorkspace {}
+
+impl FlashInferWorkspace {
+    /// Default sizes matching FlashInfer's typical requirements.
+    const FLOAT_WORKSPACE_BYTES: usize = 128 * 1024 * 1024; // 128 MB
+    const INT_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
+    const PAGE_LOCKED_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
+    const PLAN_INFO_BYTES: usize = 256;
+
+    /// Allocate FlashInfer workspace buffers.
+    ///
+    /// `max_batch_size` controls the LSE buffer size.
+    /// `num_qo_heads` is needed for LSE dimensioning.
+    pub fn new(ctx: &DeviceContext, max_batch_size: usize, num_qo_heads: usize) -> Result<Self> {
+        let float_workspace: CudaSlice<u8> = ctx
+            .stream
+            .alloc_zeros(Self::FLOAT_WORKSPACE_BYTES)
+            .map_err(|e| anyhow!("FlashInfer float_workspace alloc failed: {e}"))?;
+
+        let int_workspace: CudaSlice<u8> = ctx
+            .stream
+            .alloc_zeros(Self::INT_WORKSPACE_BYTES)
+            .map_err(|e| anyhow!("FlashInfer int_workspace alloc failed: {e}"))?;
+
+        let plan_info: CudaSlice<u8> = ctx
+            .stream
+            .alloc_zeros(Self::PLAN_INFO_BYTES)
+            .map_err(|e| anyhow!("FlashInfer plan_info alloc failed: {e}"))?;
+
+        let lse: CudaSlice<f32> = ctx
+            .stream
+            .alloc_zeros(max_batch_size * num_qo_heads)
+            .map_err(|e| anyhow!("FlashInfer lse alloc failed: {e}"))?;
+
+        // Allocate page-locked (pinned) CPU memory via CUDA API
+        let page_locked_workspace = unsafe {
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            let err = cudarc::driver::sys::cuMemAllocHost_v2(
+                &mut ptr as *mut *mut u8 as *mut *mut std::ffi::c_void,
+                Self::PAGE_LOCKED_WORKSPACE_BYTES,
+            );
+            if err != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(anyhow!(
+                    "cuMemAllocHost failed for page_locked_workspace: {:?}",
+                    err
+                ));
+            }
+            ptr
+        };
+
+        Ok(Self {
+            float_workspace,
+            float_workspace_bytes: Self::FLOAT_WORKSPACE_BYTES,
+            int_workspace,
+            int_workspace_bytes: Self::INT_WORKSPACE_BYTES,
+            page_locked_workspace,
+            page_locked_workspace_bytes: Self::PAGE_LOCKED_WORKSPACE_BYTES,
+            plan_info,
+            lse,
+        })
+    }
+}
+
+impl Drop for FlashInferWorkspace {
+    fn drop(&mut self) {
+        if !self.page_locked_workspace.is_null() {
+            unsafe {
+                let _ = cudarc::driver::sys::cuMemFreeHost(
+                    self.page_locked_workspace as *mut std::ffi::c_void,
+                );
+            }
+            self.page_locked_workspace = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Batched decode prep for paged KV cache: QK-norm + RoPE (in-place on Q) + paged KV write.
+///
+/// After this call:
+/// - `q_batch` contains RMSNorm'd + RoPE'd Q values (in-place, layout [B, num_qo_heads * head_dim])
+/// - K (normed + roped) and V (raw) are written to the paged KV cache at the correct positions
+///
+/// `positions`: [B] i32 on GPU — current_pos per request
+/// `page_table_gpu`: flattened page indices on GPU
+/// `page_indptr_gpu`: [B+1] i32 on GPU — cumulative page counts
+/// `last_page_len_gpu`: [B] i32 on GPU — tokens in last page (including the new token)
+#[allow(clippy::too_many_arguments)]
+pub fn decode_prep_paged(
+    ctx: &DeviceContext,
+    q_batch: &mut HiddenStates,
+    k_batch: &HiddenStates,
+    v_batch: &HiddenStates,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    positions: &CudaSlice<i32>,
+    kv_pool: &PagedKVPool,
+    layer_idx: usize,
+    page_table_gpu: &CudaSlice<i32>,
+    page_indptr_gpu: &CudaSlice<i32>,
+    last_page_len_gpu: &CudaSlice<i32>,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    page_size: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    let batch_size = q_batch.seq_len;
+    let stride_page = kv_pool.stride_page;
+
+    let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
+    let (k_ptr, _gk) = k_batch.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_batch.data.device_ptr(&ctx.stream);
+    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+    let (pos_ptr, _gp) = positions.device_ptr(&ctx.stream);
+    let (pt_ptr, _gpt) = page_table_gpu.device_ptr(&ctx.stream);
+    let (pi_ptr, _gpi) = page_indptr_gpu.device_ptr(&ctx.stream);
+    let (lp_ptr, _glp) = last_page_len_gpu.device_ptr(&ctx.stream);
+
+    let k_pool_ptr = kv_pool.k_pool_ptr(layer_idx, &ctx.stream);
+    let v_pool_ptr = kv_pool.v_pool_ptr(layer_idx, &ctx.stream);
+
+    unsafe {
+        ffi::decode_prep_paged_cuda(
+            q_ptr as *mut ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            pos_ptr as *const i32,
+            k_pool_ptr as *mut ffi::Half,
+            v_pool_ptr as *mut ffi::Half,
+            pt_ptr as *const i32,
+            pi_ptr as *const i32,
+            lp_ptr as *const i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            page_size as i32,
+            stride_page as i32,
+            batch_size as i32,
+            rms_eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
+/// FlashInfer batch decode attention with paged KV cache.
+///
+/// Calls `flashinfer_batch_decode_plan` (CPU-side scheduling) then
+/// `flashinfer_batch_decode_run` (GPU kernel launch).
+///
+/// Q must already have RMSNorm + RoPE applied, layout: [B, num_qo_heads * head_dim]
+/// (treated as [B, num_qo_heads, head_dim] by FlashInfer).
+/// K/V must already be in the paged cache with RoPE applied to K.
+///
+/// `indptr_h`: host-side [B+1] page indptr (needed by plan)
+/// `kv_indptr_gpu`, `kv_indices_gpu`, `kv_last_page_len_gpu`: GPU arrays
+#[allow(clippy::too_many_arguments)]
+pub fn flashinfer_batch_decode(
+    ctx: &DeviceContext,
+    q_batch: &HiddenStates,
+    kv_pool: &PagedKVPool,
+    layer_idx: usize,
+    indptr_h: &[i32],
+    kv_indptr_gpu: &CudaSlice<i32>,
+    kv_indices_gpu: &CudaSlice<i32>,
+    kv_last_page_len_gpu: &CudaSlice<i32>,
+    output: &mut HiddenStates,
+    workspace: &mut FlashInferWorkspace,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    page_size: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let batch_size = q_batch.seq_len;
+    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+
+    // Step 1: Plan (CPU-side scheduling)
+    {
+        let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
+        let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
+        let (pi_ptr, _gpi) = workspace.plan_info.device_ptr_mut(&ctx.stream);
+
+        let ret = unsafe {
+            ffi::flashinfer_batch_decode_plan(
+                fw_ptr as *mut u8,
+                workspace.float_workspace_bytes,
+                iw_ptr as *mut u8,
+                workspace.page_locked_workspace,
+                workspace.int_workspace_bytes,
+                indptr_h.as_ptr(),
+                batch_size as i32,
+                num_qo_heads as i32,
+                num_kv_heads as i32,
+                page_size as i32,
+                head_dim as i32,
+                pi_ptr as *mut u8,
+                ctx.stream.cu_stream(),
+            )
+        };
+        if ret != 0 {
+            return Err(anyhow!(
+                "flashinfer_batch_decode_plan failed with CUDA error {}",
+                ret
+            ));
+        }
+    }
+
+    // Step 2: Run (GPU kernel)
+    {
+        let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
+        let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
+        let (pi_ptr, _gpi) = workspace.plan_info.device_ptr(&ctx.stream);
+        let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
+        let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+        let (ind_ptr, _gind) = kv_indptr_gpu.device_ptr(&ctx.stream);
+        let (idx_ptr, _gidx) = kv_indices_gpu.device_ptr(&ctx.stream);
+        let (lp_ptr, _glp) = kv_last_page_len_gpu.device_ptr(&ctx.stream);
+        let (lse_ptr, _glse) = workspace.lse.device_ptr_mut(&ctx.stream);
+
+        let k_pool_ptr = kv_pool.k_pool_ptr(layer_idx, &ctx.stream);
+        let v_pool_ptr = kv_pool.v_pool_ptr(layer_idx, &ctx.stream);
+
+        let ret = unsafe {
+            ffi::flashinfer_batch_decode_run(
+                fw_ptr as *mut u8,
+                iw_ptr as *mut u8,
+                pi_ptr as *const u8,
+                q_ptr as *const ffi::Half,
+                k_pool_ptr as *const ffi::Half,
+                v_pool_ptr as *const ffi::Half,
+                ind_ptr as *const i32,
+                idx_ptr as *const i32,
+                lp_ptr as *const i32,
+                o_ptr as *mut ffi::Half,
+                lse_ptr as *mut f32,
+                batch_size as i32,
+                num_qo_heads as i32,
+                num_kv_heads as i32,
+                page_size as i32,
+                head_dim as i32,
+                sm_scale,
+                ctx.stream.cu_stream(),
+            )
+        };
+        if ret != 0 {
+            return Err(anyhow!(
+                "flashinfer_batch_decode_run failed with CUDA error {}",
+                ret
+            ));
+        }
+    }
 
     Ok(())
 }

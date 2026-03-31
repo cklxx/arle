@@ -1,16 +1,18 @@
 //! Batched decode: process multiple requests' decode tokens in one forward pass.
 //!
 //! Uses GEMM (matrix multiply) for all linear projections (QKV, O, MLP),
-//! batching B requests together. Attention is also batched: per-request KV cache
-//! pointers are gathered into GPU arrays and a single batched CUDA kernel
-//! (split-KV + reduce) handles all requests in 2 launches instead of 2*B.
+//! batching B requests together. Attention uses FlashInfer with a shared
+//! paged KV cache: QK-norm + RoPE + paged KV write are done in a prep kernel,
+//! then FlashInfer's batch decode handles attention in a single launch.
 
 use anyhow::Result;
-use cudarc::driver::{CudaSlice, DevicePtrMut};
+use cudarc::driver::CudaSlice;
 
 use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::ops;
+use crate::ops::FlashInferWorkspace;
+use crate::paged_kv::PagedKVPool;
 use crate::tensor::{DeviceContext, HiddenStates};
 
 /// Temporary buffers for batched decode, analogous to PrefillBuffers.
@@ -26,27 +28,20 @@ struct BatchDecodeBuffers {
     up_out: HiddenStates,
     act_out: HiddenStates,
 
-    // Batched attention buffers
+    // FlashInfer paged attention buffers
     /// Per-request positions on GPU: [B] i32
     positions: CudaSlice<i32>,
-    /// Per-request seq_lens on GPU: [B] i32
-    seq_lens: CudaSlice<i32>,
-    /// Per-request K cache device pointers on GPU: [B] u64
-    k_cache_ptrs: CudaSlice<u64>,
-    /// Per-request V cache device pointers on GPU: [B] u64
-    v_cache_ptrs: CudaSlice<u64>,
-    /// Split-KV partial output: [B * num_qheads * NUM_KV_SPLITS * HEAD_DIM] f32
-    partial_out: CudaSlice<f32>,
-    /// Split-KV partial max: [B * num_qheads * NUM_KV_SPLITS] f32
-    partial_m: CudaSlice<f32>,
-    /// Split-KV partial sum: [B * num_qheads * NUM_KV_SPLITS] f32
-    partial_l: CudaSlice<f32>,
+    /// Flattened page indices on GPU (concatenated page tables)
+    kv_indices_gpu: CudaSlice<i32>,
+    /// Page indptr on GPU: [B+1] i32
+    kv_indptr_gpu: CudaSlice<i32>,
+    /// Last page lengths on GPU: [B] i32
+    kv_last_page_len_gpu: CudaSlice<i32>,
+    /// FlashInfer workspace (plan scratch, split-KV temps, etc.)
+    flashinfer_ws: FlashInferWorkspace,
 }
 
 impl BatchDecodeBuffers {
-    /// NUM_KV_SPLITS must match the CUDA kernel constant.
-    const NUM_KV_SPLITS: usize = 4;
-
     #[allow(clippy::too_many_arguments)]
     fn new(
         ctx: &DeviceContext,
@@ -56,9 +51,9 @@ impl BatchDecodeBuffers {
         inter_dim: usize,
         batch_size: usize,
         num_qheads: usize,
-        head_dim: usize,
+        _head_dim: usize,
+        max_total_pages: usize,
     ) -> Result<Self> {
-        let partial_size = batch_size * num_qheads * Self::NUM_KV_SPLITS;
         Ok(Self {
             hidden_out: HiddenStates::zeros(ctx, hidden_dim, batch_size)?,
             normed: HiddenStates::zeros(ctx, hidden_dim, batch_size)?,
@@ -75,30 +70,19 @@ impl BatchDecodeBuffers {
                 .stream
                 .alloc_zeros(batch_size)
                 .map_err(|e| anyhow::anyhow!("Alloc positions failed: {e}"))?,
-            seq_lens: ctx
+            kv_indices_gpu: ctx
+                .stream
+                .alloc_zeros(max_total_pages)
+                .map_err(|e| anyhow::anyhow!("Alloc kv_indices failed: {e}"))?,
+            kv_indptr_gpu: ctx
+                .stream
+                .alloc_zeros(batch_size + 1)
+                .map_err(|e| anyhow::anyhow!("Alloc kv_indptr failed: {e}"))?,
+            kv_last_page_len_gpu: ctx
                 .stream
                 .alloc_zeros(batch_size)
-                .map_err(|e| anyhow::anyhow!("Alloc seq_lens failed: {e}"))?,
-            k_cache_ptrs: ctx
-                .stream
-                .alloc_zeros(batch_size)
-                .map_err(|e| anyhow::anyhow!("Alloc k_cache_ptrs failed: {e}"))?,
-            v_cache_ptrs: ctx
-                .stream
-                .alloc_zeros(batch_size)
-                .map_err(|e| anyhow::anyhow!("Alloc v_cache_ptrs failed: {e}"))?,
-            partial_out: ctx
-                .stream
-                .alloc_zeros(partial_size * head_dim)
-                .map_err(|e| anyhow::anyhow!("Alloc partial_out failed: {e}"))?,
-            partial_m: ctx
-                .stream
-                .alloc_zeros(partial_size)
-                .map_err(|e| anyhow::anyhow!("Alloc partial_m failed: {e}"))?,
-            partial_l: ctx
-                .stream
-                .alloc_zeros(partial_size)
-                .map_err(|e| anyhow::anyhow!("Alloc partial_l failed: {e}"))?,
+                .map_err(|e| anyhow::anyhow!("Alloc kv_last_page_len failed: {e}"))?,
+            flashinfer_ws: FlashInferWorkspace::new(ctx, batch_size, num_qheads)?,
         })
     }
 }
@@ -108,13 +92,13 @@ impl Qwen3Model {
     ///
     /// `tokens[b]` is the next token for request `b`, whose state is
     /// `states[slot_indices[b]]`. All linear projections are batched via GEMM;
-    /// attention is batched via a single CUDA kernel launch with per-request
-    /// KV cache pointer indirection.
+    /// attention uses FlashInfer with a shared paged KV cache.
     pub fn decode_batch(
         &self,
         tokens: &[u32],
         states: &mut [Qwen3State],
         slot_indices: &[usize],
+        paged_kv_pool: &mut PagedKVPool,
     ) -> Result<()> {
         let batch_size = tokens.len();
         debug_assert_eq!(batch_size, slot_indices.len());
@@ -127,13 +111,24 @@ impl Qwen3Model {
         let kv_dim = num_kv_heads * head_dim;
         let inter_dim = self.config.intermediate_size;
         let eps = self.config.rms_norm_eps;
-
-        // Initialize KV caches (lazy init on first use).
+        // Grow paged KV slots for the new tokens (1 per request)
         for &si in slot_indices {
-            states[si].kv_cache.init_if_needed(&self.ctx, head_dim)?;
+            paged_kv_pool.grow_slot(si, 1)?;
         }
 
-        // Allocate batch buffers (reused across layers).
+        // Build FlashInfer metadata from paged KV pool
+        let indptr_h = paged_kv_pool.build_indptr(slot_indices);
+        let indices_h = paged_kv_pool.build_indices(slot_indices);
+        let last_page_lens_h = paged_kv_pool.build_last_page_lens(slot_indices);
+        let max_total_pages = indices_h.len().max(1);
+
+        // Gather positions (current seq_len - 1 = position of the new token)
+        let positions_h: Vec<i32> = slot_indices
+            .iter()
+            .map(|&si| (paged_kv_pool.seq_len(si) - 1) as i32)
+            .collect();
+
+        // Allocate batch buffers
         let mut bufs = BatchDecodeBuffers::new(
             &self.ctx,
             self.config.hidden_size,
@@ -143,7 +138,26 @@ impl Qwen3Model {
             batch_size,
             num_heads,
             head_dim,
+            max_total_pages,
         )?;
+
+        // Upload metadata to GPU
+        self.ctx
+            .stream
+            .memcpy_htod(&positions_h, &mut bufs.positions)
+            .map_err(|e| anyhow::anyhow!("H2D positions failed: {e}"))?;
+        self.ctx
+            .stream
+            .memcpy_htod(&indptr_h, &mut bufs.kv_indptr_gpu)
+            .map_err(|e| anyhow::anyhow!("H2D indptr failed: {e}"))?;
+        self.ctx
+            .stream
+            .memcpy_htod(&indices_h, &mut bufs.kv_indices_gpu)
+            .map_err(|e| anyhow::anyhow!("H2D indices failed: {e}"))?;
+        self.ctx
+            .stream
+            .memcpy_htod(&last_page_lens_h, &mut bufs.kv_last_page_len_gpu)
+            .map_err(|e| anyhow::anyhow!("H2D last_page_len failed: {e}"))?;
 
         // 1. Batched embedding: [B, hidden_dim]
         let mut hidden = self.get_embeddings_batch(tokens)?;
@@ -155,15 +169,12 @@ impl Qwen3Model {
                 layer,
                 &mut hidden,
                 &mut bufs,
-                states,
-                slot_indices,
+                paged_kv_pool,
+                &indptr_h,
             )?;
         }
 
-        // 3. Increment KV cache seq_len for each request
-        for &si in slot_indices {
-            states[si].kv_cache.increment_seq_len();
-        }
+        // 3. (No need to increment KV cache seq_len — paged pool already updated by grow_slot)
 
         // 4. Compute logits for all requests in one batched norm + one GEMM
         ops::rms_norm_batch_into(&self.ctx, &hidden, &self.norm, eps, &mut bufs.normed);
@@ -182,11 +193,14 @@ impl Qwen3Model {
         layer: &TransformerBlock,
         hidden: &mut HiddenStates,
         bufs: &mut BatchDecodeBuffers,
-        states: &mut [Qwen3State],
-        slot_indices: &[usize],
+        kv_pool: &PagedKVPool,
+        indptr_h: &[i32],
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
-        let batch_size = slot_indices.len();
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim;
+        let page_size = kv_pool.page_size;
 
         // 1. Batched RMSNorm → bufs.normed [B, hidden_dim]
         ops::rms_norm_batch_into(
@@ -217,78 +231,47 @@ impl Qwen3Model {
             &mut bufs.v_batch,
         );
 
-        // 3. Batched attention — gather metadata, launch 2 kernels for all requests
-        {
-            let num_heads = self.config.num_attention_heads;
-            let num_kv_heads = self.config.num_key_value_heads;
-            let head_dim = self.config.head_dim;
-            let max_seq_len = 32768; // matches KVCache::max_seq_len default
+        // 3. Decode prep: QK-norm + RoPE (in-place on Q) + paged KV write
+        ops::decode_prep_paged(
+            &self.ctx,
+            &mut bufs.q_batch,
+            &bufs.k_batch,
+            &bufs.v_batch,
+            &layer.attention.q_norm,
+            &layer.attention.k_norm,
+            &self.cos_cache,
+            &self.sin_cache,
+            &bufs.positions,
+            kv_pool,
+            layer_idx,
+            &bufs.kv_indices_gpu,
+            &bufs.kv_indptr_gpu,
+            &bufs.kv_last_page_len_gpu,
+            num_heads,
+            num_kv_heads,
+            page_size,
+            eps,
+        )?;
 
-            // Gather per-request positions, seq_lens, and KV cache pointers (CPU side)
-            let mut positions_host = vec![0i32; batch_size];
-            let mut seq_lens_host = vec![0i32; batch_size];
-            let mut k_cache_ptrs_host = vec![0u64; batch_size];
-            let mut v_cache_ptrs_host = vec![0u64; batch_size];
+        // 4. FlashInfer batch decode attention
+        ops::flashinfer_batch_decode(
+            &self.ctx,
+            &bufs.q_batch,
+            kv_pool,
+            layer_idx,
+            indptr_h,
+            &bufs.kv_indptr_gpu,
+            &bufs.kv_indices_gpu,
+            &bufs.kv_last_page_len_gpu,
+            &mut bufs.attn_output,
+            &mut bufs.flashinfer_ws,
+            num_heads,
+            num_kv_heads,
+            page_size,
+            head_dim,
+        )?;
 
-            for b in 0..batch_size {
-                let si = slot_indices[b];
-                let state = &mut states[si];
-                let pos = state.kv_cache.len();
-                positions_host[b] = pos as i32;
-                seq_lens_host[b] = (pos + 1) as i32;
-
-                let (k_cache, v_cache) = state.kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
-                let (k_ptr, _gk) = k_cache.data.device_ptr_mut(&self.ctx.stream);
-                let (v_ptr, _gv) = v_cache.data.device_ptr_mut(&self.ctx.stream);
-                k_cache_ptrs_host[b] = k_ptr;
-                v_cache_ptrs_host[b] = v_ptr;
-            }
-
-            // Upload gathered arrays to GPU (one H2D copy each)
-            self.ctx
-                .stream
-                .memcpy_htod(&positions_host, &mut bufs.positions)
-                .map_err(|e| anyhow::anyhow!("H2D positions failed: {e}"))?;
-            self.ctx
-                .stream
-                .memcpy_htod(&seq_lens_host, &mut bufs.seq_lens)
-                .map_err(|e| anyhow::anyhow!("H2D seq_lens failed: {e}"))?;
-            self.ctx
-                .stream
-                .memcpy_htod(&k_cache_ptrs_host, &mut bufs.k_cache_ptrs)
-                .map_err(|e| anyhow::anyhow!("H2D k_cache_ptrs failed: {e}"))?;
-            self.ctx
-                .stream
-                .memcpy_htod(&v_cache_ptrs_host, &mut bufs.v_cache_ptrs)
-                .map_err(|e| anyhow::anyhow!("H2D v_cache_ptrs failed: {e}"))?;
-
-            // Launch batched attention: 2 kernel launches for all B requests
-            ops::fused_attention_decode_batched_into(
-                &self.ctx,
-                &bufs.q_batch,
-                &bufs.k_batch,
-                &bufs.v_batch,
-                &layer.attention.q_norm,
-                &layer.attention.k_norm,
-                &self.cos_cache,
-                &self.sin_cache,
-                &bufs.positions,
-                &bufs.seq_lens,
-                &bufs.k_cache_ptrs,
-                &bufs.v_cache_ptrs,
-                &mut bufs.attn_output,
-                &mut bufs.partial_out,
-                &mut bufs.partial_m,
-                &mut bufs.partial_l,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                max_seq_len,
-                eps,
-            )?;
-        }
-
-        // 4. Batched O projection → bufs.o_buf [B, hidden_dim]
+        // 5. Batched O projection → bufs.o_buf [B, hidden_dim]
         ops::gemm_into(
             &self.ctx,
             &layer.attention.o_proj,
@@ -296,11 +279,11 @@ impl Qwen3Model {
             &mut bufs.o_buf,
         );
 
-        // 5. Batched residual add: hidden + o_buf → hidden_out
+        // 6. Batched residual add: hidden + o_buf → hidden_out
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         std::mem::swap(hidden, &mut bufs.hidden_out);
 
-        // 6. Batched MLP RMSNorm
+        // 7. Batched MLP RMSNorm
         ops::rms_norm_batch_into(
             &self.ctx,
             hidden,
@@ -309,7 +292,7 @@ impl Qwen3Model {
             &mut bufs.normed,
         );
 
-        // 7. Batched MLP: gate + up → silu_mul → down
+        // 8. Batched MLP: gate + up → silu_mul → down
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.gate_proj,
@@ -330,7 +313,7 @@ impl Qwen3Model {
             &mut bufs.o_buf,
         );
 
-        // 8. Batched residual add
+        // 9. Batched residual add
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         std::mem::swap(hidden, &mut bufs.hidden_out);
 
