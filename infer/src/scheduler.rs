@@ -451,20 +451,10 @@ impl<M: ModelForward> Scheduler<M> {
             use crate::paged_kv::DEFAULT_PAGE_SIZE;
             use crate::tensor::DeviceContext;
 
-            const PAGED_KV_RESERVED_BYTES: usize = 8 * 1024 * 1024 * 1024; // 8 GB headroom: contiguous KV still used for prefill + single decode
-
-            let budget_bytes = match DeviceContext::gpu_memory_info() {
-                Ok((free_bytes, _total_bytes)) => {
-                    free_bytes.saturating_sub(PAGED_KV_RESERVED_BYTES)
-                }
-                Err(e) => {
-                    info!(
-                        "PagedKVPool: could not query GPU memory ({}), using 1 GB default budget",
-                        e
-                    );
-                    1024 * 1024 * 1024 // 1 GB fallback
-                }
-            };
+            // Paged pool stub: 0 budget means minimal allocation (num_slots pages only).
+            // Real budget will be assigned when FlashInfer decode path is fully wired
+            // (requires prefill to also write to paged cache — TODO).
+            let budget_bytes: usize = 0;
 
             let ctx = model.device_context();
             PagedKVPool::new(
@@ -650,21 +640,9 @@ impl<M: ModelForward> Scheduler<M> {
                 self.waiting.len()
             );
 
-            // Pre-allocate paged KV pages for the prompt length.
+            // Pre-allocate paged KV pages for the prompt (best-effort; pool is stub-sized).
             let prompt_len = prompt_tokens.len();
-            if let Err(e) = self.paged_kv_pool.grow_slot(slot_idx, prompt_len) {
-                error!(
-                    "Request {}: failed to allocate paged KV for {} prompt tokens: {}",
-                    id, prompt_len, e
-                );
-                // Send error back and skip this request.
-                let _ = incoming.delta_tx.send(StreamDelta {
-                    text_delta: String::new(),
-                    finish_reason: Some(crate::server_engine::FinishReason::Stop),
-                    usage: None,
-                });
-                continue;
-            }
+            let _ = self.paged_kv_pool.grow_slot(slot_idx, prompt_len); // non-fatal
 
             self.active.push(ActiveRequest {
                 id,
@@ -945,16 +923,9 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let slot_indices: Vec<usize> = decode_indices.iter().map(|&i| active[i].slot_idx).collect();
 
-        // Allocate one additional page-worth of KV for each decode request (the new token).
+        // Grow paged KV (best-effort; pool is stub-sized until FlashInfer fully wired).
         for &slot in &slot_indices {
-            if let Err(e) = paged_kv_pool.grow_slot(slot, 1) {
-                error!("PagedKVPool: grow_slot({}, 1) failed: {}", slot, e);
-                // Mark all decode requests as finished on OOM (conservative).
-                for &i in &decode_indices {
-                    active[i].phase = Phase::Finished;
-                }
-                return;
-            }
+            let _ = paged_kv_pool.grow_slot(slot, 1); // non-fatal
         }
 
         // Run forward pass
