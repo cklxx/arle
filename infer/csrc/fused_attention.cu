@@ -334,9 +334,354 @@ __global__ void fused_gqa_attention_single_token_kernel(
 }
 
 // ============================================================================
+// Batched decode attention — split-KV variant
+//
+// Processes B requests in a single launch. Each request has its own KV cache
+// (accessed via pointer arrays). Uses the same split-KV + online softmax
+// approach as the Triton AOT decode kernel.
+//
+// Grid: (num_qheads, NUM_KV_SPLITS, batch_size)
+//   blockIdx.x = q_head_idx
+//   blockIdx.y = split_id (KV chunk index)
+//   blockIdx.z = batch_idx
+// Threads: HEAD_DIM (128)
+// ============================================================================
+
+#define NUM_KV_SPLITS 4
+#define BATCHED_BLOCK_N 64
+
+__global__ void fused_gqa_attention_decode_batched_kernel(
+    const __nv_bfloat16* __restrict__ q_batch,    // [B, q_dim]
+    const __nv_bfloat16* __restrict__ k_batch,    // [B, kv_dim]
+    const __nv_bfloat16* __restrict__ v_batch,    // [B, kv_dim]
+    const __nv_bfloat16* __restrict__ q_norm_weight,
+    const __nv_bfloat16* __restrict__ k_norm_weight,
+    const __nv_bfloat16* __restrict__ cos_cache,  // [max_seq_len, head_dim]
+    const __nv_bfloat16* __restrict__ sin_cache,  // [max_seq_len, head_dim]
+    const int* __restrict__ positions,             // [B] current_pos per request
+    const int* __restrict__ seq_lens,              // [B] seq_len (= pos + 1)
+    const __nv_bfloat16* const* __restrict__ k_cache_ptrs, // [B] device ptrs to per-request K cache
+    const __nv_bfloat16* const* __restrict__ v_cache_ptrs, // [B] device ptrs to per-request V cache
+    float* __restrict__ partial_out,               // [B, num_qheads, NUM_KV_SPLITS, HEAD_DIM]
+    float* __restrict__ partial_m,                 // [B, num_qheads, NUM_KV_SPLITS]
+    float* __restrict__ partial_l,                 // [B, num_qheads, NUM_KV_SPLITS]
+    int num_qheads,
+    int num_kvheads,
+    int gqa_ratio,
+    int head_dim,
+    int max_seq_len,
+    float rms_eps
+) {
+    int q_head_idx = blockIdx.x;
+    int split_id = blockIdx.y;
+    int batch_idx = blockIdx.z;
+    int kv_head_idx = q_head_idx / gqa_ratio;
+
+    int tid = threadIdx.x;  // 0..HEAD_DIM-1
+    int half_dim = head_dim / 2;
+
+    int current_pos = positions[batch_idx];
+    float scale = 1.0f / sqrtf((float)head_dim);
+    float qk_scale = scale * 1.44269504f;  // scale * log2(e) for exp2 trick
+
+    // ---- Shared memory for Q/K norm computation ----
+    __shared__ float smem_scratch[NUM_WARPS];
+
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+
+    // ---- Load Q, apply RMSNorm + RoPE ----
+    int q_base = batch_idx * num_qheads * head_dim + q_head_idx * head_dim;
+    float q_val = __bfloat162float(q_batch[q_base + tid]);
+
+    // RMSNorm for Q
+    float q_sq = q_val * q_val;
+    float q_sq_sum = warp_reduce_sum(q_sq);
+    if (lane_id == 0) smem_scratch[warp_id] = q_sq_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < NUM_WARPS; i++) total += smem_scratch[i];
+        smem_scratch[0] = 1.0f / sqrtf(total / head_dim + rms_eps);
+    }
+    __syncthreads();
+    float q_rms = smem_scratch[0];
+    float q_normed = q_val * q_rms * __bfloat162float(q_norm_weight[tid]);
+
+    // RoPE for Q — half-split: lo = 0..half_dim-1, hi = half_dim..head_dim-1
+    // Store in shared memory for paired access
+    __shared__ float smem_q_rope[HEAD_DIM];
+    smem_q_rope[tid] = q_normed;
+    __syncthreads();
+
+    float q_rot;
+    if (tid < half_dim) {
+        float cos_val = __bfloat162float(cos_cache[current_pos * head_dim + tid]);
+        float sin_val = __bfloat162float(sin_cache[current_pos * head_dim + tid]);
+        q_rot = smem_q_rope[tid] * cos_val - smem_q_rope[tid + half_dim] * sin_val;
+    } else {
+        int pair = tid - half_dim;
+        float cos_val = __bfloat162float(cos_cache[current_pos * head_dim + pair]);
+        float sin_val = __bfloat162float(sin_cache[current_pos * head_dim + pair]);
+        q_rot = smem_q_rope[pair] * sin_val + smem_q_rope[tid] * cos_val;
+    }
+
+    // ---- Load K, apply RMSNorm + RoPE ----
+    int kv_base = batch_idx * num_kvheads * head_dim + kv_head_idx * head_dim;
+    float k_val = __bfloat162float(k_batch[kv_base + tid]);
+
+    float k_sq = k_val * k_val;
+    float k_sq_sum = warp_reduce_sum(k_sq);
+    if (lane_id == 0) smem_scratch[warp_id] = k_sq_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < NUM_WARPS; i++) total += smem_scratch[i];
+        smem_scratch[0] = 1.0f / sqrtf(total / head_dim + rms_eps);
+    }
+    __syncthreads();
+    float k_rms = smem_scratch[0];
+    float k_normed = k_val * k_rms * __bfloat162float(k_norm_weight[tid]);
+
+    __shared__ float smem_k_rope[HEAD_DIM];
+    smem_k_rope[tid] = k_normed;
+    __syncthreads();
+
+    float k_rot;
+    if (tid < half_dim) {
+        float cos_val = __bfloat162float(cos_cache[current_pos * head_dim + tid]);
+        float sin_val = __bfloat162float(sin_cache[current_pos * head_dim + tid]);
+        k_rot = smem_k_rope[tid] * cos_val - smem_k_rope[tid + half_dim] * sin_val;
+    } else {
+        int pair = tid - half_dim;
+        float cos_val = __bfloat162float(cos_cache[current_pos * head_dim + pair]);
+        float sin_val = __bfloat162float(sin_cache[current_pos * head_dim + pair]);
+        k_rot = smem_k_rope[pair] * sin_val + smem_k_rope[tid] * cos_val;
+    }
+
+    // ---- Load V ----
+    float v_val = __bfloat162float(v_batch[kv_base + tid]);
+
+    // ---- Split 0 only: write current K/V to KV cache ----
+    // Cast away const for cache write — k_cache_ptrs/v_cache_ptrs point to mutable cache buffers
+    // but the pointer array itself is const.
+    __nv_bfloat16* k_cache = const_cast<__nv_bfloat16*>(k_cache_ptrs[batch_idx]);
+    __nv_bfloat16* v_cache = const_cast<__nv_bfloat16*>(v_cache_ptrs[batch_idx]);
+    int cache_head_offset = kv_head_idx * max_seq_len * head_dim;
+
+    if (split_id == 0) {
+        int cur_off = cache_head_offset + current_pos * head_dim + tid;
+        k_cache[cur_off] = __float2bfloat16(k_rot);
+        v_cache[cur_off] = __float2bfloat16(v_val);
+    }
+
+    // ---- Compute this split's KV range ----
+    // seq_len here means number of *past* tokens (before the current one)
+    int past_seq_len = current_pos;
+    int tiles_total = (past_seq_len + BATCHED_BLOCK_N - 1) / BATCHED_BLOCK_N;
+    int tiles_per_split = (tiles_total + NUM_KV_SPLITS - 1) / NUM_KV_SPLITS;
+    int split_start = split_id * tiles_per_split * BATCHED_BLOCK_N;
+    int split_end = min((split_id + 1) * tiles_per_split * BATCHED_BLOCK_N, past_seq_len);
+
+    // ---- Online softmax attention over this split's KV chunk ----
+    float acc = 0.0f;  // output accumulator for dimension tid
+    float m_i = -1e38f;  // running max (finite instead of -inf to avoid NaN)
+    float l_i = 0.0f;    // running sum
+
+    // K/V cache base for this KV head
+    const __nv_bfloat16* k_cache_head = k_cache_ptrs[batch_idx] + cache_head_offset;
+    const __nv_bfloat16* v_cache_head = v_cache_ptrs[batch_idx] + cache_head_offset;
+
+    // Shared memory for scores within a tile
+    __shared__ float smem_qk[BATCHED_BLOCK_N];
+
+    for (int tile_start = split_start; tile_start < split_end; tile_start += BATCHED_BLOCK_N) {
+        int tile_len = min(BATCHED_BLOCK_N, split_end - tile_start);
+
+        // Compute QK dot products for all positions in this tile
+        // Each thread holds one dimension of Q; we iterate over K positions
+        for (int pos = 0; pos < tile_len; pos++) {
+            int abs_pos = tile_start + pos;
+            float k_elem = __bfloat162float(k_cache_head[abs_pos * head_dim + tid]);
+            float dot = q_rot * k_elem;
+            dot = warp_reduce_sum(dot);
+            if (lane_id == 0) {
+                smem_scratch[warp_id] = dot;
+            }
+            __syncthreads();
+            if (tid == 0) {
+                float score = 0.0f;
+                for (int w = 0; w < NUM_WARPS; w++) score += smem_scratch[w];
+                smem_qk[pos] = score * qk_scale;
+            }
+            __syncthreads();
+        }
+
+        // Find tile max
+        float tile_max = -INFINITY;
+        for (int pos = 0; pos < tile_len; pos++) {
+            tile_max = fmaxf(tile_max, smem_qk[pos]);
+        }
+
+        // Online softmax update
+        float m_new = fmaxf(m_i, tile_max);
+        float alpha = exp2f(m_i - m_new);
+        acc *= alpha;
+        l_i *= alpha;
+
+        // Accumulate weighted V
+        for (int pos = 0; pos < tile_len; pos++) {
+            float w = exp2f(smem_qk[pos] - m_new);
+            float v_elem = __bfloat162float(v_cache_head[(tile_start + pos) * head_dim + tid]);
+            acc += w * v_elem;
+            l_i += w;
+        }
+        m_i = m_new;
+    }
+
+    // ---- Split 0: handle current token from registers ----
+    if (split_id == 0) {
+        // Dot product of q_rot and k_rot
+        float dot = q_rot * k_rot;
+        dot = warp_reduce_sum(dot);
+        if (lane_id == 0) smem_scratch[warp_id] = dot;
+        __syncthreads();
+        if (tid == 0) {
+            float score = 0.0f;
+            for (int w = 0; w < NUM_WARPS; w++) score += smem_scratch[w];
+            smem_scratch[0] = score * qk_scale;
+        }
+        __syncthreads();
+        float qk_cur = smem_scratch[0];
+
+        float m_new = fmaxf(m_i, qk_cur);
+        float alpha = exp2f(m_i - m_new);
+        float p_cur = exp2f(qk_cur - m_new);
+
+        acc = acc * alpha + v_val * p_cur;
+        l_i = l_i * alpha + p_cur;
+        m_i = m_new;
+    }
+
+    // ---- Write partial results (FP32, unnormalized) ----
+    int partial_base_head = (batch_idx * num_qheads + q_head_idx) * NUM_KV_SPLITS;
+    int partial_out_offset = (partial_base_head + split_id) * head_dim + tid;
+    partial_out[partial_out_offset] = acc;
+
+    int scalar_offset = partial_base_head + split_id;
+    if (tid == 0) {
+        partial_m[scalar_offset] = m_i;
+        partial_l[scalar_offset] = l_i;
+    }
+}
+
+// ============================================================================
+// Batched attention reduce kernel
+//
+// Merges NUM_KV_SPLITS partial results per Q head per batch item.
+// Grid: (num_qheads, batch_size)
+// Threads: HEAD_DIM (128)
+// ============================================================================
+__global__ void attention_decode_reduce_batched_kernel(
+    const float* __restrict__ partial_out, // [B, num_qheads, NUM_KV_SPLITS, HEAD_DIM]
+    const float* __restrict__ partial_m,   // [B, num_qheads, NUM_KV_SPLITS]
+    const float* __restrict__ partial_l,   // [B, num_qheads, NUM_KV_SPLITS]
+    __nv_bfloat16* __restrict__ output,    // [B, q_dim]
+    int num_qheads,
+    int head_dim
+) {
+    int q_head_idx = blockIdx.x;
+    int batch_idx = blockIdx.y;
+    int tid = threadIdx.x;  // 0..HEAD_DIM-1
+
+    int base = (batch_idx * num_qheads + q_head_idx) * NUM_KV_SPLITS;
+
+    float acc = 0.0f;
+    float m_global = -INFINITY;
+    float l_global = 0.0f;
+
+    #pragma unroll
+    for (int s = 0; s < NUM_KV_SPLITS; s++) {
+        float m_s = partial_m[base + s];
+        float l_s = partial_l[base + s];
+        float p = partial_out[(base + s) * head_dim + tid];
+
+        float m_new = fmaxf(m_global, m_s);
+        float alpha_old = exp2f(m_global - m_new);
+        float alpha_new = exp2f(m_s - m_new);
+
+        acc = acc * alpha_old + p * alpha_new;
+        l_global = l_global * alpha_old + l_s * alpha_new;
+        m_global = m_new;
+    }
+
+    float result = (l_global > 0.0f) ? (acc / l_global) : 0.0f;
+    int out_offset = batch_idx * num_qheads * head_dim + q_head_idx * head_dim + tid;
+    output[out_offset] = __float2bfloat16(result);
+}
+
+// ============================================================================
 // C API
 // ============================================================================
 extern "C" {
+
+void fused_gqa_attention_decode_batched(
+    const __nv_bfloat16* q_batch,
+    const __nv_bfloat16* k_batch,
+    const __nv_bfloat16* v_batch,
+    const __nv_bfloat16* q_norm_weight,
+    const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_cache,
+    const __nv_bfloat16* sin_cache,
+    const int* positions,
+    const int* seq_lens,
+    const __nv_bfloat16* const* k_cache_ptrs,
+    const __nv_bfloat16* const* v_cache_ptrs,
+    float* partial_out,
+    float* partial_m,
+    float* partial_l,
+    int num_qheads,
+    int num_kvheads,
+    int gqa_ratio,
+    int head_dim,
+    int max_seq_len,
+    int batch_size,
+    float rms_eps,
+    cudaStream_t stream
+) {
+    dim3 grid(num_qheads, NUM_KV_SPLITS, batch_size);
+    int threads = head_dim;
+
+    fused_gqa_attention_decode_batched_kernel<<<grid, threads, 0, stream>>>(
+        q_batch, k_batch, v_batch,
+        q_norm_weight, k_norm_weight,
+        cos_cache, sin_cache,
+        positions, seq_lens,
+        k_cache_ptrs, v_cache_ptrs,
+        partial_out, partial_m, partial_l,
+        num_qheads, num_kvheads, gqa_ratio, head_dim,
+        max_seq_len, rms_eps
+    );
+}
+
+void attention_decode_reduce_batched(
+    const float* partial_out,
+    const float* partial_m,
+    const float* partial_l,
+    __nv_bfloat16* output,
+    int num_qheads,
+    int head_dim,
+    int batch_size,
+    cudaStream_t stream
+) {
+    dim3 grid(num_qheads, batch_size);
+    int threads = head_dim;
+
+    attention_decode_reduce_batched_kernel<<<grid, threads, 0, stream>>>(
+        partial_out, partial_m, partial_l,
+        output, num_qheads, head_dim
+    );
+}
 
 void fused_gqa_attention_single_token(
     const __nv_bfloat16* q_full,

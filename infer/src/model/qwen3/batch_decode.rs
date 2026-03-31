@@ -1,16 +1,17 @@
 //! Batched decode: process multiple requests' decode tokens in one forward pass.
 //!
 //! Uses GEMM (matrix multiply) for all linear projections (QKV, O, MLP),
-//! batching B requests together. Attention runs per-request (each has its own
-//! KV cache). Since projections dominate compute (~98%), this gives near-linear
-//! throughput scaling with batch size.
+//! batching B requests together. Attention is also batched: per-request KV cache
+//! pointers are gathered into GPU arrays and a single batched CUDA kernel
+//! (split-KV + reduce) handles all requests in 2 launches instead of 2*B.
 
 use anyhow::Result;
+use cudarc::driver::{CudaSlice, DevicePtrMut};
 
 use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::ops;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::tensor::{DeviceContext, HiddenStates};
 
 /// Temporary buffers for batched decode, analogous to PrefillBuffers.
 struct BatchDecodeBuffers {
@@ -24,9 +25,29 @@ struct BatchDecodeBuffers {
     gate_out: HiddenStates,
     up_out: HiddenStates,
     act_out: HiddenStates,
+
+    // Batched attention buffers
+    /// Per-request positions on GPU: [B] i32
+    positions: CudaSlice<i32>,
+    /// Per-request seq_lens on GPU: [B] i32
+    seq_lens: CudaSlice<i32>,
+    /// Per-request K cache device pointers on GPU: [B] u64
+    k_cache_ptrs: CudaSlice<u64>,
+    /// Per-request V cache device pointers on GPU: [B] u64
+    v_cache_ptrs: CudaSlice<u64>,
+    /// Split-KV partial output: [B * num_qheads * NUM_KV_SPLITS * HEAD_DIM] f32
+    partial_out: CudaSlice<f32>,
+    /// Split-KV partial max: [B * num_qheads * NUM_KV_SPLITS] f32
+    partial_m: CudaSlice<f32>,
+    /// Split-KV partial sum: [B * num_qheads * NUM_KV_SPLITS] f32
+    partial_l: CudaSlice<f32>,
 }
 
 impl BatchDecodeBuffers {
+    /// NUM_KV_SPLITS must match the CUDA kernel constant.
+    const NUM_KV_SPLITS: usize = 4;
+
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ctx: &DeviceContext,
         hidden_dim: usize,
@@ -34,7 +55,10 @@ impl BatchDecodeBuffers {
         kv_dim: usize,
         inter_dim: usize,
         batch_size: usize,
+        num_qheads: usize,
+        head_dim: usize,
     ) -> Result<Self> {
+        let partial_size = batch_size * num_qheads * Self::NUM_KV_SPLITS;
         Ok(Self {
             hidden_out: HiddenStates::zeros(ctx, hidden_dim, batch_size)?,
             normed: HiddenStates::zeros(ctx, hidden_dim, batch_size)?,
@@ -46,38 +70,37 @@ impl BatchDecodeBuffers {
             gate_out: HiddenStates::zeros(ctx, inter_dim, batch_size)?,
             up_out: HiddenStates::zeros(ctx, inter_dim, batch_size)?,
             act_out: HiddenStates::zeros(ctx, inter_dim, batch_size)?,
+
+            positions: ctx
+                .stream
+                .alloc_zeros(batch_size)
+                .map_err(|e| anyhow::anyhow!("Alloc positions failed: {e}"))?,
+            seq_lens: ctx
+                .stream
+                .alloc_zeros(batch_size)
+                .map_err(|e| anyhow::anyhow!("Alloc seq_lens failed: {e}"))?,
+            k_cache_ptrs: ctx
+                .stream
+                .alloc_zeros(batch_size)
+                .map_err(|e| anyhow::anyhow!("Alloc k_cache_ptrs failed: {e}"))?,
+            v_cache_ptrs: ctx
+                .stream
+                .alloc_zeros(batch_size)
+                .map_err(|e| anyhow::anyhow!("Alloc v_cache_ptrs failed: {e}"))?,
+            partial_out: ctx
+                .stream
+                .alloc_zeros(partial_size * head_dim)
+                .map_err(|e| anyhow::anyhow!("Alloc partial_out failed: {e}"))?,
+            partial_m: ctx
+                .stream
+                .alloc_zeros(partial_size)
+                .map_err(|e| anyhow::anyhow!("Alloc partial_m failed: {e}"))?,
+            partial_l: ctx
+                .stream
+                .alloc_zeros(partial_size)
+                .map_err(|e| anyhow::anyhow!("Alloc partial_l failed: {e}"))?,
         })
     }
-}
-
-/// Copy row `row` from a HiddenStates [B, dim] into a DeviceVec [dim].
-fn copy_row_to_vec(
-    ctx: &DeviceContext,
-    src: &HiddenStates,
-    row: usize,
-    dst: &mut DeviceVec,
-) -> Result<()> {
-    let dim = src.hidden_dim;
-    let src_view = src.data.slice(row * dim..(row + 1) * dim);
-    ctx.stream
-        .memcpy_dtod(&src_view, &mut dst.data)
-        .map_err(|e| anyhow::anyhow!("D2D row→vec failed: {e}"))?;
-    Ok(())
-}
-
-/// Copy a DeviceVec [dim] into row `row` of a HiddenStates [B, dim].
-fn copy_vec_to_row(
-    ctx: &DeviceContext,
-    src: &DeviceVec,
-    dst: &mut HiddenStates,
-    row: usize,
-) -> Result<()> {
-    let dim = dst.hidden_dim;
-    let mut dst_view = dst.data.slice_mut(row * dim..(row + 1) * dim);
-    ctx.stream
-        .memcpy_dtod(&src.data, &mut dst_view)
-        .map_err(|e| anyhow::anyhow!("D2D vec→row failed: {e}"))?;
-    Ok(())
 }
 
 impl Qwen3Model {
@@ -85,7 +108,8 @@ impl Qwen3Model {
     ///
     /// `tokens[b]` is the next token for request `b`, whose state is
     /// `states[slot_indices[b]]`. All linear projections are batched via GEMM;
-    /// attention runs per-request (each has its own KV cache).
+    /// attention is batched via a single CUDA kernel launch with per-request
+    /// KV cache pointer indirection.
     pub fn decode_batch(
         &self,
         tokens: &[u32],
@@ -117,6 +141,8 @@ impl Qwen3Model {
             kv_dim,
             inter_dim,
             batch_size,
+            num_heads,
+            head_dim,
         )?;
 
         // 1. Batched embedding: [B, hidden_dim]
@@ -191,55 +217,74 @@ impl Qwen3Model {
             &mut bufs.v_batch,
         );
 
-        // 3. Per-request attention (each has its own KV cache)
-        for b in 0..batch_size {
-            let si = slot_indices[b];
-            let state = &mut states[si];
-            let pos = state.kv_cache.len();
-            let seq_len_with_new = pos + 1;
+        // 3. Batched attention — gather metadata, launch 2 kernels for all requests
+        {
+            let num_heads = self.config.num_attention_heads;
+            let num_kv_heads = self.config.num_key_value_heads;
+            let head_dim = self.config.head_dim;
+            let max_seq_len = 32768; // matches KVCache::max_seq_len default
 
-            // Copy batch row b → per-request decode buffers
-            copy_row_to_vec(&self.ctx, &bufs.q_batch, b, &mut state.decode_bufs.q)?;
-            copy_row_to_vec(&self.ctx, &bufs.k_batch, b, &mut state.decode_bufs.k)?;
-            copy_row_to_vec(&self.ctx, &bufs.v_batch, b, &mut state.decode_bufs.v)?;
+            // Gather per-request positions, seq_lens, and KV cache pointers (CPU side)
+            let mut positions_host = vec![0i32; batch_size];
+            let mut seq_lens_host = vec![0i32; batch_size];
+            let mut k_cache_ptrs_host = vec![0u64; batch_size];
+            let mut v_cache_ptrs_host = vec![0u64; batch_size];
 
-            // Set decode metadata: [token_id (unused here), pos, seq_len]
+            for b in 0..batch_size {
+                let si = slot_indices[b];
+                let state = &mut states[si];
+                let pos = state.kv_cache.len();
+                positions_host[b] = pos as i32;
+                seq_lens_host[b] = (pos + 1) as i32;
+
+                let (k_cache, v_cache) = state.kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
+                let (k_ptr, _gk) = k_cache.data.device_ptr_mut(&self.ctx.stream);
+                let (v_ptr, _gv) = v_cache.data.device_ptr_mut(&self.ctx.stream);
+                k_cache_ptrs_host[b] = k_ptr;
+                v_cache_ptrs_host[b] = v_ptr;
+            }
+
+            // Upload gathered arrays to GPU (one H2D copy each)
             self.ctx
                 .stream
-                .memcpy_htod(
-                    &[0i32, pos as i32, seq_len_with_new as i32],
-                    &mut state.decode_bufs.decode_meta,
-                )
-                .map_err(|e| anyhow::anyhow!("H2D decode_meta failed: {e}"))?;
+                .memcpy_htod(&positions_host, &mut bufs.positions)
+                .map_err(|e| anyhow::anyhow!("H2D positions failed: {e}"))?;
+            self.ctx
+                .stream
+                .memcpy_htod(&seq_lens_host, &mut bufs.seq_lens)
+                .map_err(|e| anyhow::anyhow!("H2D seq_lens failed: {e}"))?;
+            self.ctx
+                .stream
+                .memcpy_htod(&k_cache_ptrs_host, &mut bufs.k_cache_ptrs)
+                .map_err(|e| anyhow::anyhow!("H2D k_cache_ptrs failed: {e}"))?;
+            self.ctx
+                .stream
+                .memcpy_htod(&v_cache_ptrs_host, &mut bufs.v_cache_ptrs)
+                .map_err(|e| anyhow::anyhow!("H2D v_cache_ptrs failed: {e}"))?;
 
-            // Run fused decode attention (QK-norm + RoPE + KV write + attention)
-            let (k_cache, v_cache) = state.kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
-            ops::fused_attention_decode_into(
+            // Launch batched attention: 2 kernel launches for all B requests
+            ops::fused_attention_decode_batched_into(
                 &self.ctx,
-                &state.decode_bufs.q,
-                &state.decode_bufs.k,
-                &state.decode_bufs.v,
+                &bufs.q_batch,
+                &bufs.k_batch,
+                &bufs.v_batch,
                 &layer.attention.q_norm,
                 &layer.attention.k_norm,
                 &self.cos_cache,
                 &self.sin_cache,
-                &state.decode_bufs.decode_meta,
-                k_cache,
-                v_cache,
-                &mut state.decode_bufs.attn_out,
-                &mut state.decode_bufs.partial_out,
-                &mut state.decode_bufs.partial_m,
-                &mut state.decode_bufs.partial_l,
-                self.config.num_attention_heads,
-                self.config.num_key_value_heads,
-            )?;
-
-            // Copy attention output back to batch row
-            copy_vec_to_row(
-                &self.ctx,
-                &state.decode_bufs.attn_out,
+                &bufs.positions,
+                &bufs.seq_lens,
+                &bufs.k_cache_ptrs,
+                &bufs.v_cache_ptrs,
                 &mut bufs.attn_output,
-                b,
+                &mut bufs.partial_out,
+                &mut bufs.partial_m,
+                &mut bufs.partial_l,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                max_seq_len,
+                eps,
             )?;
         }
 

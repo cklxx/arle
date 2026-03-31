@@ -35,6 +35,11 @@ struct Args {
     /// Number of concurrent request slots (each gets its own KV cache)
     #[arg(long, default_value_t = 4)]
     num_slots: usize,
+
+    /// Maximum sequence length (tokens) per KV cache slot. If unset, auto-computed
+    /// from available GPU memory to fit all slots without OOM.
+    #[arg(long)]
+    max_seq_len: Option<usize>,
 }
 
 #[tokio::main]
@@ -81,9 +86,15 @@ async fn main() {
                 Qwen35Model::from_safetensors_with_options(model_path, options.enable_cuda_graph)
                     .expect("Failed to load Qwen3.5 model");
             let tokenizer = Tokenizer::from_file(model_path).expect("Failed to load tokenizer");
-            let (scheduler, handle) =
-                Scheduler::new(model, tokenizer, &model_id, args.num_slots, 42)
-                    .expect("Failed to create scheduler");
+            let (scheduler, handle) = Scheduler::with_max_seq_len(
+                model,
+                tokenizer,
+                &model_id,
+                args.num_slots,
+                42,
+                args.max_seq_len,
+            )
+            .expect("Failed to create scheduler");
             std::thread::spawn(move || scheduler.run());
             handle
         }
@@ -96,9 +107,15 @@ async fn main() {
             )
             .expect("Failed to load Qwen3 model");
             let tokenizer = Tokenizer::from_file(model_path).expect("Failed to load tokenizer");
-            let (scheduler, handle) =
-                Scheduler::new(model, tokenizer, &model_id, args.num_slots, 42)
-                    .expect("Failed to create scheduler");
+            let (scheduler, handle) = Scheduler::with_max_seq_len(
+                model,
+                tokenizer,
+                &model_id,
+                args.num_slots,
+                42,
+                args.max_seq_len,
+            )
+            .expect("Failed to create scheduler");
             std::thread::spawn(move || scheduler.run());
             handle
         }

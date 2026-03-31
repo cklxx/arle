@@ -65,6 +65,10 @@ impl GenerationState for Qwen35State {
         self.kv_cache.set_max_gpu_seq_len(max_tokens);
     }
 
+    fn set_max_seq_len(&mut self, max_seq: usize) {
+        self.kv_cache.set_max_seq_len(max_seq);
+    }
+
     fn offload_kv_if_needed(&mut self) -> Result<()> {
         self.kv_cache.offload_if_needed(&self.ctx)
     }
@@ -86,6 +90,15 @@ impl ModelForward for Qwen35Model {
             graph_state: CudaGraphState::new(),
             prefill_logits: None,
         })
+    }
+
+    fn kv_cache_bytes_per_token(&self) -> usize {
+        // Only full-attention layers have KV cache (linear layers use recurrent state).
+        // 2 (K+V) * num_full_attn_layers * num_kv_heads * head_dim * 2 (bf16 = 2 bytes)
+        2 * self.config.num_full_attention_layers()
+            * self.config.num_key_value_heads
+            * self.config.head_dim
+            * 2
     }
 
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {

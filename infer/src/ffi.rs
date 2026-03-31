@@ -216,6 +216,47 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Batched fused GQA decode attention (CUDA, split-KV, HEAD_DIM=128)
+    // Processes B requests in one launch using per-request KV cache pointers.
+    // Grid: (num_qheads, NUM_KV_SPLITS=4, batch_size).
+    pub(crate) fn fused_gqa_attention_decode_batched(
+        q_batch: *const Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        positions: *const i32,
+        seq_lens: *const i32,
+        k_cache_ptrs: *const *const Half,
+        v_cache_ptrs: *const *const Half,
+        partial_out: *mut f32,
+        partial_m: *mut f32,
+        partial_l: *mut f32,
+        num_qheads: i32,
+        num_kvheads: i32,
+        gqa_ratio: i32,
+        head_dim: i32,
+        max_seq_len: i32,
+        batch_size: i32,
+        rms_eps: f32,
+        stream: CUstream,
+    );
+
+    // Batched attention reduce: merge split-KV partials for B requests.
+    // Grid: (num_qheads, batch_size).
+    pub(crate) fn attention_decode_reduce_batched(
+        partial_out: *const f32,
+        partial_m: *const f32,
+        partial_l: *const f32,
+        output: *mut Half,
+        num_qheads: i32,
+        head_dim: i32,
+        batch_size: i32,
+        stream: CUstream,
+    );
+
     // Fused GQA Attention — decode variant (Triton AOT, split-KV, HEAD_DIM=128)
     // Reads pos/seq_len from decode_meta; scale and rms_eps computed inside kernel.
     // Writes partial results to partial_out/m/l (FP32). Call attention_decode_reduce after.

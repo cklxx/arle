@@ -280,6 +280,107 @@ pub fn prefill_attention_hd256_batch_with_scratch(
     Ok(())
 }
 
+/// Batched fused GQA decode attention (CUDA, split-KV, HEAD_DIM=128).
+///
+/// Processes B requests in two kernel launches (split-KV + reduce) instead of
+/// 2*B launches from the per-request loop. Each request's KV cache is accessed
+/// via device pointer arrays.
+///
+/// Q/K/V are already in contiguous batch buffers [B, dim]. Output is written
+/// directly to `output` batch buffer [B, q_dim]. No D2D copies needed.
+///
+/// `positions`: [B] i32 on GPU — current_pos per request
+/// `seq_lens`: [B] i32 on GPU — seq_len per request (= pos + 1)
+/// `k_cache_ptrs`/`v_cache_ptrs`: [B] device pointers on GPU
+/// `partial_out/m/l`: pre-allocated FP32 scratch [B * num_qheads * NUM_KV_SPLITS * ...]
+#[allow(clippy::too_many_arguments)]
+pub fn fused_attention_decode_batched_into(
+    ctx: &DeviceContext,
+    q_batch: &HiddenStates,
+    k_batch: &HiddenStates,
+    v_batch: &HiddenStates,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache_base: &DeviceVec,
+    sin_cache_base: &DeviceVec,
+    positions: &CudaSlice<i32>,
+    seq_lens: &CudaSlice<i32>,
+    k_cache_ptrs: &CudaSlice<u64>,
+    v_cache_ptrs: &CudaSlice<u64>,
+    output: &mut HiddenStates,
+    partial_out: &mut CudaSlice<f32>,
+    partial_m: &mut CudaSlice<f32>,
+    partial_l: &mut CudaSlice<f32>,
+    num_qheads: usize,
+    num_kvheads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    let batch_size = q_batch.seq_len;
+    let gqa_ratio = num_qheads / num_kvheads;
+
+    let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k_batch.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_batch.data.device_ptr(&ctx.stream);
+    let (q_norm_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (k_norm_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gcos) = cos_cache_base.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gsin) = sin_cache_base.data.device_ptr(&ctx.stream);
+    let (pos_ptr, _gp) = positions.device_ptr(&ctx.stream);
+    let (sl_ptr, _gsl) = seq_lens.device_ptr(&ctx.stream);
+    let (kc_ptrs_ptr, _gkcp) = k_cache_ptrs.device_ptr(&ctx.stream);
+    let (vc_ptrs_ptr, _gvcp) = v_cache_ptrs.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (partial_out_ptr, _gpo) = partial_out.device_ptr_mut(&ctx.stream);
+    let (partial_m_ptr, _gpm) = partial_m.device_ptr_mut(&ctx.stream);
+    let (partial_l_ptr, _gpl) = partial_l.device_ptr_mut(&ctx.stream);
+
+    // Phase 1: split-KV attention (writes partials)
+    unsafe {
+        ffi::fused_gqa_attention_decode_batched(
+            q_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            q_norm_ptr as *const ffi::Half,
+            k_norm_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            pos_ptr as *const i32,
+            sl_ptr as *const i32,
+            kc_ptrs_ptr as *const *const ffi::Half,
+            vc_ptrs_ptr as *const *const ffi::Half,
+            partial_out_ptr as *mut f32,
+            partial_m_ptr as *mut f32,
+            partial_l_ptr as *mut f32,
+            num_qheads as i32,
+            num_kvheads as i32,
+            gqa_ratio as i32,
+            head_dim as i32,
+            max_seq_len as i32,
+            batch_size as i32,
+            rms_eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    // Phase 2: reduce partials → final bf16 output
+    unsafe {
+        ffi::attention_decode_reduce_batched(
+            partial_out_ptr as *const f32,
+            partial_m_ptr as *const f32,
+            partial_l_ptr as *const f32,
+            o_ptr as *mut ffi::Half,
+            num_qheads as i32,
+            head_dim as i32,
+            batch_size as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Fused GQA Attention for decode (Triton AOT, split-KV, HEAD_DIM=128).
 /// Reads pos/seq_len from decode_meta — CUDA Graph safe.
 /// cos_cache_base/sin_cache_base: full RoPE buffers [max_seq_len * head_dim].
