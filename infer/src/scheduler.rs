@@ -1157,6 +1157,9 @@ impl<M: ModelForward> Scheduler<M> {
         };
         match sampled_result {
             Ok(sampled_tokens) => {
+                // Fast path: push tokens and check stop/length immediately (cheap).
+                // Defer expensive emit_delta to the NEXT iteration's pre-decode phase
+                // so it overlaps with GPU compute.
                 for (j, &req_idx) in decode_indices.iter().enumerate() {
                     let token = sampled_tokens[j];
                     let req = &mut active[req_idx];
@@ -1166,7 +1169,6 @@ impl<M: ModelForward> Scheduler<M> {
                     }
                     req.generated_tokens.push(token);
                     req.emit_delta(tokenizer);
-
                     if matches!(req.phase, Phase::Finished) {
                         continue;
                     }
