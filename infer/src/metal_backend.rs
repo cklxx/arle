@@ -276,9 +276,10 @@ fn metal_generate(
     use mlx_rs::{
         fast,
         nn::silu,
-        ops::indexing::take_axis,
-        ops::{self, concatenate_axis, reshape, transpose_axes},
+        ops::indexing::{take_axis, TryIndexMutOp, TryIndexOp},
+        ops::{self, reshape, transpose_axes, zeros_dtype_device},
         transforms::eval,
+        StreamOrDevice,
     };
 
     let n_layers = config.num_hidden_layers;
@@ -290,8 +291,20 @@ fn metal_generate(
     let eos_id = config.eos_token_id;
     let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
 
-    // Per-layer KV cache: None until first use, then [1, n_kv_heads, kv_len, head_dim]
-    let mut kv_cache: Vec<Option<(Array, Array)>> = vec![None; n_layers];
+    // Pre-allocate KV cache: [1, n_kv_heads, max_seq_len, head_dim].
+    // Allocated once; each step writes via slice_update instead of concatenate,
+    // eliminating 2*n_layers Metal buffer allocations per decode step.
+    let max_seq_len = (input_ids.len() + max_new_tokens) as i32;
+    let kv_dtype = weights.layers[0].k_proj.dtype();
+    let cache_shape = [1i32, n_kv_heads, max_seq_len, head_dim];
+    let mut k_caches: Vec<Array> = (0..n_layers)
+        .map(|_| zeros_dtype_device(&cache_shape, kv_dtype, StreamOrDevice::default()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("pre-alloc k_caches")?;
+    let mut v_caches: Vec<Array> = (0..n_layers)
+        .map(|_| zeros_dtype_device(&cache_shape, kv_dtype, StreamOrDevice::default()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("pre-alloc v_caches")?;
 
     let mut generated: Vec<u32> = Vec::new();
     let mut first_token_logged = false;
@@ -341,19 +354,26 @@ fn metal_generate(
             let k = transpose_axes(&k, &[0, 2, 1, 3]).context("transpose k")?;
             let v = transpose_axes(&v, &[0, 2, 1, 3]).context("transpose v")?;
 
-            // 7. KV cache: concatenate along seq axis (axis=2)
-            let (k_full, v_full) = match kv_cache[li].take() {
-                None => (k, v),
-                Some((k_prev, v_prev)) => {
-                    let kk = concatenate_axis(&[&k_prev, &k], 2).context("concat k_cache")?;
-                    let vv = concatenate_axis(&[&v_prev, &v], 2).context("concat v_cache")?;
-                    (kk, vv)
-                }
-            };
+            // 7. KV cache: write new slice at [.., .., cache_len..end_pos, ..]
+            // then read filled prefix [.., .., 0..end_pos, ..] for attention.
+            // Pre-allocated buffers avoid per-step Metal buffer growth.
+            let end_pos = cache_len + seq;
+            k_caches[li]
+                .try_index_mut((.., .., cache_len..end_pos, ..), &k)
+                .context("slice_update k_cache")?;
+            v_caches[li]
+                .try_index_mut((.., .., cache_len..end_pos, ..), &v)
+                .context("slice_update v_cache")?;
+            let k_full = k_caches[li]
+                .try_index((.., .., 0i32..end_pos, ..))
+                .context("slice k_cache")?;
+            let v_full = v_caches[li]
+                .try_index((.., .., 0i32..end_pos, ..))
+                .context("slice v_cache")?;
 
             // 8. Grouped-query attention (Metal-optimised for seq_len=1 decode)
             // q: [1, n_heads, seq, head_dim]
-            // k/v: [1, n_kv_heads, total_kv_len, head_dim]
+            // k/v: [1, n_kv_heads, end_pos, head_dim]
             let use_causal = cache_len == 0 && seq > 1;
             let mask_arg = if use_causal {
                 Some(fast::ScaledDotProductAttentionMask::Causal)
@@ -364,8 +384,6 @@ fn metal_generate(
                 fast::scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, mask_arg)
                     .context("scaled_dot_product_attention")?;
             // attn_out: [1, n_heads, seq, head_dim]
-
-            kv_cache[li] = Some((k_full, v_full));
 
             // 9. Reshape back to [seq, hidden] and project
             let attn_out =
