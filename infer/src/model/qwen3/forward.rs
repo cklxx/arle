@@ -213,17 +213,16 @@ impl ModelForward for Qwen3Model {
         tokens: &[u32],
         states: &mut [Self::State],
         slot_indices: &[usize],
-        paged_kv_pool: Option<&mut crate::paged_kv::PagedKVPool>,
+        _paged_kv_pool: Option<&mut crate::paged_kv::PagedKVPool>,
     ) -> Result<()> {
         if tokens.len() <= 1 {
-            // Fall back to single-token path for bs=1 (benefits from CUDA Graph)
             if tokens.len() == 1 {
                 return self.forward(&[tokens[0]], &mut states[slot_indices[0]]);
             }
             return Ok(());
         }
-        let pool = paged_kv_pool
-            .expect("FlashInfer batched decode requires a PagedKVPool");
-        self.decode_batch(tokens, states, slot_indices, pool)
+        // Use old batched decode path with contiguous KV cache.
+        // FlashInfer paged path requires prefill to also write to paged cache (TODO).
+        self.decode_batch_contiguous(tokens, states, slot_indices)
     }
 }

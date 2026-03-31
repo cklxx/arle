@@ -60,9 +60,12 @@ impl PagedKVPool {
         let stride_page = num_kv_heads * page_size * head_dim;
         let bytes_per_page_per_layer = stride_page * 2; // bf16 = 2 bytes
         let bytes_per_page = bytes_per_page_per_layer * num_layers * 2; // K + V
-        let max_pages = budget_bytes / bytes_per_page;
-
-        ensure!(max_pages >= num_slots, "Not enough memory for even 1 page per slot");
+        let max_pages = if bytes_per_page > 0 {
+            budget_bytes / bytes_per_page
+        } else {
+            0
+        };
+        let max_pages = max_pages.max(num_slots); // at least 1 page per slot (may be 0-sized)
 
         info!(
             "PagedKVPool: {} pages × {} tokens/page = {} max tokens, \
@@ -76,22 +79,24 @@ impl PagedKVPool {
             head_dim,
         );
 
-        // Allocate K and V pools per layer
+        // Allocate K and V pools per layer (skip if budget is 0 — stub mode)
         let mut k_pools = Vec::with_capacity(num_layers);
         let mut v_pools = Vec::with_capacity(num_layers);
         let pool_elements = max_pages * stride_page;
 
-        for _ in 0..num_layers {
-            let k: CudaSlice<u16> = ctx
-                .stream
-                .alloc_zeros(pool_elements)
-                .map_err(|e| anyhow!("KV pool alloc failed: {e}"))?;
-            let v: CudaSlice<u16> = ctx
-                .stream
-                .alloc_zeros(pool_elements)
-                .map_err(|e| anyhow!("KV pool alloc failed: {e}"))?;
-            k_pools.push(k);
-            v_pools.push(v);
+        if pool_elements > 0 {
+            for _ in 0..num_layers {
+                let k: CudaSlice<u16> = ctx
+                    .stream
+                    .alloc_zeros(pool_elements)
+                    .map_err(|e| anyhow!("KV pool alloc failed: {e}"))?;
+                let v: CudaSlice<u16> = ctx
+                    .stream
+                    .alloc_zeros(pool_elements)
+                    .map_err(|e| anyhow!("KV pool alloc failed: {e}"))?;
+                k_pools.push(k);
+                v_pools.push(v);
+            }
         }
 
         // Initialize free list (all pages free)

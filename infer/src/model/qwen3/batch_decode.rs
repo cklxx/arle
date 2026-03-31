@@ -10,6 +10,7 @@ use cudarc::driver::CudaSlice;
 
 use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
+use crate::model::ModelForward;
 use crate::ops;
 use crate::ops::FlashInferWorkspace;
 use crate::paged_kv::PagedKVPool;
@@ -90,6 +91,20 @@ impl BatchDecodeBuffers {
 impl Qwen3Model {
     /// Batched decode: process B tokens from B different requests in one pass.
     ///
+    /// Batched decode using contiguous (per-slot) KV cache.
+    /// Falls back to sequential forward() calls — correct but not optimal.
+    pub fn decode_batch_contiguous(
+        &self,
+        tokens: &[u32],
+        states: &mut [Qwen3State],
+        slot_indices: &[usize],
+    ) -> Result<()> {
+        for (i, &token) in tokens.iter().enumerate() {
+            self.forward(&[token], &mut states[slot_indices[i]])?;
+        }
+        Ok(())
+    }
+
     /// `tokens[b]` is the next token for request `b`, whose state is
     /// `states[slot_indices[b]]`. All linear projections are batched via GEMM;
     /// attention uses FlashInfer with a shared paged KV cache.
