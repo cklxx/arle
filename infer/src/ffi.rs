@@ -463,6 +463,48 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // ─── Batched decode prep for paged KV: QK-norm + RoPE + paged KV write ───
+
+    pub(crate) fn decode_prep_paged_cuda(
+        q_batch: *mut Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        positions: *const i32,
+        k_pool: *mut Half,
+        v_pool: *mut Half,
+        page_table: *const i32,
+        page_indptr: *const i32,
+        last_page_len: *const i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        page_size: i32,
+        stride_page: i32,
+        batch_size: i32,
+        rms_eps: f32,
+        stream: CUstream,
+    );
+
+    // ─── Paged KV cache append ───
+
+    pub(crate) fn paged_kv_append_cuda(
+        k_batch: *const Half,
+        v_batch: *const Half,
+        k_data: *mut Half,
+        v_data: *mut Half,
+        page_indices: *const i32,
+        indptr: *const i32,
+        positions: *const i32,
+        batch_size: i32,
+        num_kv_heads: i32,
+        page_size: i32,
+        head_dim: i32,
+        stream: CUstream,
+    );
+
     // ─── FlashInfer batch decode with paged KV cache ───
 
     pub(crate) fn flashinfer_batch_decode_plan(

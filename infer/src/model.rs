@@ -3,6 +3,7 @@
 use anyhow::Result;
 use rand::rngs::StdRng;
 
+use crate::paged_kv::PagedKVPool;
 use crate::sampler::SamplingParams;
 use crate::tensor::{DeviceContext, DeviceVec};
 
@@ -47,6 +48,16 @@ pub trait ModelForward: Send {
     /// Formula: 2 (K+V) * num_kv_layers * num_kv_heads * head_dim * 2 (bf16 bytes)
     fn kv_cache_bytes_per_token(&self) -> usize;
 
+    /// Number of KV cache layers (for paged KV pool sizing).
+    /// For hybrid models, this is the number of full-attention layers only.
+    fn num_kv_layers(&self) -> usize;
+
+    /// Number of KV heads per layer (for paged KV pool sizing).
+    fn num_kv_heads(&self) -> usize;
+
+    /// Head dimension (for paged KV pool sizing).
+    fn head_dim(&self) -> usize;
+
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()>;
     fn select_token(
         &self,
@@ -78,12 +89,16 @@ pub trait ModelForward: Send {
     /// `tokens[b]` is decoded using `states[slot_indices[b]]`. Uses GEMM for
     /// linear projections (batched) and per-request attention.
     ///
+    /// `paged_kv_pool` is provided when the scheduler owns a paged KV pool.
+    /// Implementations may use it for paged attention in batched decode.
+    ///
     /// Default implementation falls back to sequential `forward()` calls.
     fn forward_decode_batch(
         &self,
         tokens: &[u32],
         states: &mut [Self::State],
         slot_indices: &[usize],
+        _paged_kv_pool: Option<&mut PagedKVPool>,
     ) -> Result<()> {
         for (i, &token) in tokens.iter().enumerate() {
             self.forward(&[token], &mut states[slot_indices[i]])?;

@@ -93,6 +93,18 @@ impl ModelForward for Qwen3Model {
             * 2
     }
 
+    fn num_kv_layers(&self) -> usize {
+        self.config.num_hidden_layers
+    }
+
+    fn num_kv_heads(&self) -> usize {
+        self.config.num_key_value_heads
+    }
+
+    fn head_dim(&self) -> usize {
+        self.config.head_dim
+    }
+
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
         // Prefetch offloaded KV before PREFILL only (not every decode step).
         // During decode of a single request, all KV stays on GPU.
@@ -201,6 +213,7 @@ impl ModelForward for Qwen3Model {
         tokens: &[u32],
         states: &mut [Self::State],
         slot_indices: &[usize],
+        paged_kv_pool: Option<&mut crate::paged_kv::PagedKVPool>,
     ) -> Result<()> {
         if tokens.len() <= 1 {
             // Fall back to single-token path for bs=1 (benefits from CUDA Graph)
@@ -209,6 +222,8 @@ impl ModelForward for Qwen3Model {
             }
             return Ok(());
         }
-        self.decode_batch(tokens, states, slot_indices)
+        let pool = paged_kv_pool
+            .expect("FlashInfer batched decode requires a PagedKVPool");
+        self.decode_batch(tokens, states, slot_indices, pool)
     }
 }
