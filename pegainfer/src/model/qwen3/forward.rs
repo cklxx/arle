@@ -21,8 +21,18 @@ pub struct Qwen3State {
     pub(super) prefill_logits: Option<DeviceVec>,
 }
 
-// SAFETY: Contains raw CUDA pointers (CudaSlice, etc.) that are not Send by default.
-// We only access state from the single inference thread.
+// SAFETY: `Qwen3State` contains CUDA resources (`DeviceContext`, `CudaSlice` inside
+// `DecodeBuffers`, `KVCache`, `CudaGraphState`, `DeviceVec`) that hold raw CUDA
+// device pointers.  These types are `!Send` by default because CUDA contexts and
+// allocations must be accessed from the thread that created them.
+//
+// Invariant upheld: every `Qwen3State` instance is exclusively owned by its
+// scheduler slot and only ever accessed from the single blocking inference
+// thread that runs `Scheduler::run()`.  No other thread holds a reference to
+// or borrows from this state while the inference thread is running.
+//
+// Violation would mean: concurrent access from multiple threads could cause
+// data races on GPU memory or corrupt the CUDA driver state.
 unsafe impl Send for Qwen3State {}
 
 impl GenerationState for Qwen3State {

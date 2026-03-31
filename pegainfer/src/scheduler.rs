@@ -593,7 +593,14 @@ impl<M: ModelForward> Scheduler<M> {
             );
             let suffix = &req.prompt_tokens[prefix_len..];
             if suffix.is_empty() {
-                vec![*req.prompt_tokens.last().unwrap()]
+                // prompt_tokens is guaranteed non-empty (checked in assign_slots).
+                // Defensive: treat empty as a fatal request error instead of panicking.
+                let Some(&last_tok) = req.prompt_tokens.last() else {
+                    error!("Request {}: prompt_tokens empty on full prefix hit — dropping", req.id);
+                    req.phase = Phase::Finished;
+                    return;
+                };
+                vec![last_tok]
             } else {
                 suffix.to_vec()
             }
@@ -750,10 +757,30 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        let token_ids: Vec<u32> = decode_indices
-            .iter()
-            .map(|&i| *active[i].generated_tokens.last().unwrap())
-            .collect();
+        // Collect the last generated token for each decode request.
+        // Requests in Decoding phase always have ≥1 generated token (invariant upheld by
+        // step_prefill_chunk), but we handle the impossible-empty case defensively.
+        let mut token_ids: Vec<u32> = Vec::with_capacity(decode_indices.len());
+        let mut valid_decode_indices: Vec<usize> = Vec::with_capacity(decode_indices.len());
+        for &i in &decode_indices {
+            match active[i].generated_tokens.last() {
+                Some(&tok) => {
+                    token_ids.push(tok);
+                    valid_decode_indices.push(i);
+                }
+                None => {
+                    error!(
+                        "Request {}: Decoding state with no generated tokens — dropping",
+                        active[i].id
+                    );
+                    active[i].phase = Phase::Finished;
+                }
+            }
+        }
+        let decode_indices = valid_decode_indices;
+        if decode_indices.is_empty() {
+            return;
+        }
         let slot_indices: Vec<usize> = decode_indices.iter().map(|&i| active[i].slot_idx).collect();
 
         // Run forward pass
