@@ -246,6 +246,15 @@ impl TokenKVPool {
         indices
     }
 
+    /// Build only the LAST token index per slot (for incremental GPU update).
+    /// Returns B values — the most recently allocated pool index for each slot.
+    pub fn build_last_indices(&self, slots: &[usize]) -> Vec<i32> {
+        slots
+            .iter()
+            .map(|&slot| *self.token_indices[slot].last().expect("slot has no tokens") as i32)
+            .collect()
+    }
+
     /// Build FlashInfer last_page_len array — always all-1s for page_size=1.
     pub fn build_last_page_lens(&self, slots: &[usize]) -> Vec<i32> {
         slots
