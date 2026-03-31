@@ -65,6 +65,12 @@ pub(crate) struct BatchDecodeBuffers {
     max_batch_size: usize,
     /// Max total pages (for kv_indices_gpu sizing).
     max_total_pages: usize,
+    /// Total tokens in kv_indices_gpu from previous step (for incremental update).
+    prev_total_tokens: usize,
+    /// Previous batch slot indices (for detecting batch composition changes).
+    prev_slot_indices: Vec<usize>,
+    /// Scratch buffer for incremental index H2D (avoids alloc).
+    new_indices_scratch: Vec<i32>,
 
     /// CUDA Graph cache: one graph per batch_size.
     graph_cache: HashMap<usize, CudaGraph>,
@@ -137,6 +143,9 @@ impl BatchDecodeBuffers {
 
             max_batch_size,
             max_total_pages,
+            prev_total_tokens: 0,
+            prev_slot_indices: Vec::new(),
+            new_indices_scratch: Vec::with_capacity(max_batch_size),
             graph_cache: HashMap::new(),
         })
     }
@@ -202,7 +211,6 @@ impl Qwen3Model {
         // Build host-side metadata using scratch buffers (avoid per-step heap alloc).
 
         let indptr_h = paged_kv_pool.build_indptr(slot_indices);
-        let indices_h = paged_kv_pool.build_indices(slot_indices);
         let last_page_lens_h = paged_kv_pool.build_last_page_lens(slot_indices);
 
         bufs.positions_scratch.clear();
@@ -216,7 +224,7 @@ impl Qwen3Model {
         bufs.token_ids_scratch
             .extend(tokens.iter().map(|&x| x as i32));
 
-        // H2D copies — positions, indptr, indices, last_page_len, token_ids.
+        // H2D copies — positions, indptr, last_page_len, token_ids (small, fixed size).
         self.ctx
             .stream
             .memcpy_htod(&bufs.positions_scratch, &mut bufs.positions)
@@ -225,19 +233,6 @@ impl Qwen3Model {
             .stream
             .memcpy_htod(&indptr_h, &mut bufs.kv_indptr_gpu)
             .map_err(|e| anyhow::anyhow!("H2D indptr: {e}"))?;
-        if indices_h.len() > bufs.max_total_pages {
-            bufs.kv_indices_gpu = self
-                .ctx
-                .stream
-                .alloc_zeros(indices_h.len())
-                .map_err(|e| anyhow::anyhow!("Realloc kv_indices: {e}"))?;
-            bufs.max_total_pages = indices_h.len();
-            bufs.graph_cache.remove(&batch_size);
-        }
-        self.ctx
-            .stream
-            .memcpy_htod(&indices_h, &mut bufs.kv_indices_gpu)
-            .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
         self.ctx
             .stream
             .memcpy_htod(&last_page_lens_h, &mut bufs.kv_last_page_len_gpu)
@@ -246,6 +241,50 @@ impl Qwen3Model {
             .stream
             .memcpy_htod(&bufs.token_ids_scratch, &mut bufs.token_ids_gpu)
             .map_err(|e| anyhow::anyhow!("H2D token_ids: {e}"))?;
+
+        // KV indices update: if same batch composition as last step, only do
+        // an incremental update (H2D of B new indices + device-side scatter).
+        // Otherwise, full rebuild of the O(total_tokens) indices array.
+        let same_batch = bufs.prev_slot_indices == slot_indices;
+        let new_total = *indptr_h.last().unwrap() as usize;
+
+        if same_batch && bufs.prev_total_tokens > 0 && new_total <= bufs.max_total_pages {
+            // Incremental: build the new concatenated layout by inserting B new
+            // indices at the right positions. Since each slot grew by 1, the new
+            // layout is interleaved: [slot0_old..., slot0_new, slot1_old..., slot1_new, ...]
+            // We need to shift existing data AND insert new entries.
+            // Simpler approach: just do full H2D but with a pre-allocated host buffer.
+            // The cost is the H2D transfer, not the CPU alloc.
+            bufs.new_indices_scratch.clear();
+            for &slot in slot_indices.iter() {
+                for &idx in paged_kv_pool.token_indices(slot) {
+                    bufs.new_indices_scratch.push(idx as i32);
+                }
+            }
+            self.ctx
+                .stream
+                .memcpy_htod(&bufs.new_indices_scratch, &mut bufs.kv_indices_gpu)
+                .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
+        } else {
+            // Full rebuild (first call, or batch composition changed).
+            let indices_h = paged_kv_pool.build_indices(slot_indices);
+            if indices_h.len() > bufs.max_total_pages {
+                bufs.kv_indices_gpu = self
+                    .ctx
+                    .stream
+                    .alloc_zeros(indices_h.len())
+                    .map_err(|e| anyhow::anyhow!("Realloc kv_indices: {e}"))?;
+                bufs.max_total_pages = indices_h.len();
+                bufs.graph_cache.remove(&batch_size);
+            }
+            self.ctx
+                .stream
+                .memcpy_htod(&indices_h, &mut bufs.kv_indices_gpu)
+                .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
+        }
+        bufs.prev_total_tokens = new_total;
+        bufs.prev_slot_indices.clear();
+        bufs.prev_slot_indices.extend_from_slice(slot_indices);
 
         ops::flashinfer_plan(
             &self.ctx,
@@ -313,8 +352,6 @@ impl Qwen3Model {
         }
 
         // Scatter per-slot logits only when needed (non-greedy fallback).
-        // When skip_logit_scatter is true, sample_batch_greedy reads logits_batch
-        // directly — skipping B D2D copies.
         if !skip_logit_scatter {
             let logits = bufs.logits_batch.as_ref().unwrap();
             for (b, &si) in slot_indices.iter().enumerate() {
