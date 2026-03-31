@@ -739,14 +739,6 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        // Each step does TWO things:
-        // 1. Batch decode ALL active decode requests (1 token each)
-        // 2. Run ONE prefill chunk (so new requests don't starve)
-        //
-        // This interleaves decode and prefill properly. Without step 2,
-        // decode-priority would completely starve prefills, making requests
-        // process sequentially instead of concurrently.
-
         let has_decode = self
             .active
             .iter()
@@ -755,14 +747,35 @@ impl<M: ModelForward> Scheduler<M> {
             self.step_decode_batch();
         }
 
-        // Run one prefill operation with decode-aware chunk sizing.
-        // When decode is active, use a smaller chunk to minimize decode latency impact.
-        for idx in 0..num {
-            if matches!(self.active[idx].phase, Phase::Prefilling { .. }) {
-                self.step_prefill_chunk(idx, has_decode);
-                return;
+        // Run ALL pending short prefills in one go before returning to the loop.
+        // This fills empty slots faster after a batch of requests finishes,
+        // keeping the decode batch full. Long prefills (> one chunk) still
+        // interleave with decode via the chunked path.
+        let mut did_prefill = true;
+        while did_prefill {
+            did_prefill = false;
+            for idx in 0..self.active.len() {
+                if matches!(self.active[idx].phase, Phase::Prefilling { .. }) {
+                    self.step_prefill_chunk(idx, has_decode);
+                    did_prefill = true;
+                    break;
+                }
+            }
+            // If we just completed a short prefill (request moved to Decoding),
+            // check for more. If it's still Prefilling (multi-chunk), stop here
+            // and let decode run next iteration.
+            if did_prefill {
+                let still_prefilling = self
+                    .active
+                    .iter()
+                    .any(|r| matches!(r.phase, Phase::Prefilling { .. }));
+                if still_prefilling {
+                    break; // multi-chunk prefill in progress, yield to decode
+                }
             }
         }
+
+        // Process New requests: assign prefix cache, start prefill.
         for idx in 0..num {
             if matches!(self.active[idx].phase, Phase::New) {
                 self.step_new(idx);
@@ -1711,7 +1724,7 @@ mod tests {
 
         let id0 = sched.add_request(vec![1, 2, 3, 4], 8, RequestPriority::Normal);
         let id1 = sched.add_request(vec![5, 6, 7, 8], 8, RequestPriority::Normal);
-        let id2 = sched.add_request(vec![9, 10, 11, 12], 8, RequestPriority::Normal);
+        let _id2 = sched.add_request(vec![9, 10, 11, 12], 8, RequestPriority::Normal);
 
         // --- Prefill phase: one request per step (scheduler admits one chunk at a time) ---
         // Step 1: prefill req 0
