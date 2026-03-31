@@ -1,0 +1,49 @@
+//! Backend abstraction for inference execution.
+//!
+//! Both the CUDA path and the Metal (MLX) path implement [`InferenceBackend`],
+//! allowing the scheduler and HTTP server to be backend-agnostic.
+
+use std::path::Path;
+
+use anyhow::Result;
+
+use crate::sampler::SamplingParams;
+
+/// A single-request, synchronous inference backend.
+///
+/// Implementors load model weights once, then answer repeated `generate` calls.
+/// For multi-request batching use the [`crate::scheduler::Scheduler`] on top
+/// of the CUDA path; the Metal backend currently supports one request at a time.
+pub trait InferenceBackend: Send + Sync {
+    /// Load model weights and tokenizer from `model_path` (a local directory
+    /// containing `config.json`, `tokenizer.json`, and `.safetensors` files).
+    ///
+    /// Called once at startup. Must be called before [`generate`].
+    fn load(&mut self, model_path: &Path) -> Result<()>;
+
+    /// Run a single completion and return the generated text.
+    ///
+    /// `prompt` is a raw text string (not token IDs).  The backend is
+    /// responsible for tokenisation, sampling, and detokenisation.
+    fn generate(&self, prompt: &str, params: &SamplingParams) -> Result<GenerateResult>;
+
+    /// Backend name for logging / metrics.
+    fn name(&self) -> &'static str;
+}
+
+/// Output from a single [`InferenceBackend::generate`] call.
+#[derive(Debug, Clone)]
+pub struct GenerateResult {
+    /// Generated text (not including the prompt).
+    pub text: String,
+    /// Number of tokens in the prompt.
+    pub prompt_tokens: usize,
+    /// Number of generated tokens.
+    pub completion_tokens: usize,
+    /// Why generation stopped (`"stop"`, `"length"`, …).
+    pub finish_reason: String,
+    /// Prompt throughput in tokens/s (0.0 if unknown).
+    pub prompt_tps: f64,
+    /// Generation throughput in tokens/s (0.0 if unknown).
+    pub generation_tps: f64,
+}

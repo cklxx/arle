@@ -11,11 +11,14 @@ pub mod tensor;
 pub mod weight_loader;
 
 // Always-available modules (pure Rust, no GPU dependency).
+pub mod backend;
 pub mod block_manager;
 pub mod chat;
 pub mod cuda_graph_pool;
+pub mod hf_hub;
 pub mod http_server;
 pub mod logging;
+pub mod metal_backend;
 pub mod metrics;
 pub mod model_registry;
 pub mod prefix_cache;
