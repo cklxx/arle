@@ -6,17 +6,23 @@ Pure Rust LLM inference engine with multi-turn agent tool-calling. Built on **In
 
 ---
 
-## Performance vs SGLang (Qwen3-4B, A100-40GB)
+## Performance vs SGLang (Qwen3-4B, A100-SXM4-40GB)
 
-| Metric | agent-infer | SGLang | Ratio |
-|--------|-------------|--------|-------|
-| TTFT | **8.6ms** | 39.3ms | **4.6x faster** |
-| 8-concurrent tok/s | 756 | 886 | **0.85x** |
-| ITL (decode step) | 9.6ms | 8.2ms | 1.17x |
+| Metric | agent-infer | SGLang v0.5.9 | Ratio |
+|--------|-------------|---------------|-------|
+| TTFT (C=1) | **17.9ms** | 40.5ms | **2.3x faster** |
+| Throughput C=1 | 119.5 tok/s | 121.0 tok/s | **0.99x** |
+| Throughput C=4 | 414.8 tok/s | 419.4 tok/s | **0.99x** |
+| Throughput C=8 | 417.2 tok/s | 814.8 tok/s | **0.51x** |
+| ITL (decode step) | 8.3ms | 8.0ms | 1.04x |
 
-**TTFT lead**: Rust runtime eliminates Python dispatch overhead; CUDA Graph decode removes per-step CPU→GPU launches, cutting first-token latency to 8.6ms vs SGLang's 39.3ms.
+**Benchmark parameters**: 50 synthetic prompts, max_tokens=128, temperature=0 (greedy), same machine/GPU.
 
-**Concurrent throughput**: Closed from 0.18x → **0.85x** of SGLang through 6 optimization phases (128 → 756 tok/s at 8-concurrent). Remaining 1.17x gap is ~1.4ms/step of mixed kernel launch + misc overhead.
+**TTFT lead**: Rust runtime eliminates Python dispatch overhead; CUDA Graph decode removes per-step CPU→GPU launches.
+
+**Single-request parity**: At C=1, agent-infer matches SGLang throughput (119.5 vs 121.0 tok/s) with 2.3x faster first-token latency.
+
+**Concurrent gap**: At C=8, agent-infer's 4-slot scheduler saturates at C=4 throughput. SGLang scales to higher concurrency with its mature batching system. This is the primary optimization target.
 
 ---
 
@@ -76,21 +82,49 @@ User
 ## Quick Start
 
 ```bash
-# 1. Clone
-git clone https://github.com/cklxx/agent-infer && cd agent-infer
+# 1. Clone (with submodules for Dynamo support)
+git clone --recurse-submodules https://github.com/cklxx/agent-infer && cd agent-infer
 
-# 2. Build (CPU-only, no CUDA)
-cargo build --release --no-default-features --features no-cuda
+# 2. Build inference server (requires CUDA toolkit)
+cd infer && cargo build --release
 
-# 3. Build with GPU support
-CUDA_HOME=/usr/local/cuda cargo build --release
+# 3. Start HTTP server
+LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64:$LD_LIBRARY_PATH \
+  ./target/release/infer \
+    --model-path /path/to/Qwen3-4B \
+    --port 8000 \
+    --num-slots 4 \
+    --cuda-graph true
 
-# Run interactive agent REPL
-./target/release/agent-infer --model-path /path/to/Qwen3-8B
-
-# Run OpenAI-compatible HTTP server
-./target/release/infer --model-path /path/to/Qwen3-8B --port 8000
+# 4. Test with curl
+curl http://localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Hello","max_tokens":32,"temperature":0}'
 ```
+
+### Startup Flow
+
+```
+main()
+  1. Parse args (model-path, port, num-slots, cuda-graph, max-seq-len)
+  2. Detect model type (Qwen3 / Qwen3.5) from config.json
+  3. Load model weights from safetensors (~2s for 4B on A100)
+  4. Create Scheduler with N state slots + TokenKVPool
+  5. Warm up CUDA Graphs for batch sizes 1..N (~0.4s)
+  6. Bind HTTP server on 0.0.0.0:port
+  7. Scheduler run loop on dedicated thread:
+       ─ Decode priority: all active decodes run before new prefills
+       ─ Chunked prefill: 512 tokens/chunk (64 when decode active)
+       ─ Batched decode: FlashInfer paged attention + CUDA Graph replay
+```
+
+### Prerequisites
+
+- CUDA Toolkit 12.x
+- NVIDIA driver with compute capability >= 8.0 (A100, H100, 4090, ...)
+- Rust 1.85+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
+- Python 3.10+ with `flashinfer-python` installed (for Triton AOT compilation at build time)
+- Model weights in safetensors format (HuggingFace Qwen3 or Qwen3.5)
 
 ---
 
@@ -218,24 +252,42 @@ requests=42 active=2 waiting=0 tokens_out=3891 kv_util=72.0% ttft_p50=85ms ttft_
 ### Running
 
 ```bash
-# Agent benchmark (5 prompts, 10 turns each)
+# Start server
+./target/release/infer --model-path models/Qwen3-4B --port 8000 --num-slots 4 --cuda-graph true
+
+# Throughput benchmark (synthetic, aligned with SGLang comparison)
+python3 scripts/bench_throughput.py --url http://localhost:8000 \
+  --dataset synthetic --num-prompts 50 --concurrency 4 --max-tokens 128 --temperature 0
+
+# Agent benchmark (multi-turn tool calling)
 python3 scripts/bench_agent.py /path/to/Qwen3-8B
 
-# HTTP server throughput
-python3 scripts/bench_throughput.py --num-prompts 1000 --concurrency 32
-
-# KV cache correctness
-python3 scripts/verify_kv_cache.py http://localhost:8000
+# Multi-request stress test
+python3 scripts/bench_multi_request.py --url http://localhost:8000
 ```
 
-### Results (NVIDIA A100-SXM4-40GB)
+### Throughput Results (Qwen3-4B, A100-SXM4-40GB)
+
+| Concurrency | agent-infer tok/s | SGLang tok/s | TTFT (ours) | TTFT (SGLang) |
+|-------------|-------------------|--------------|-------------|---------------|
+| 1 | 119.5 | 121.0 | **17.9ms** | 40.5ms |
+| 4 | 414.8 | 419.4 | **53.1ms** | 137.0ms |
+| 8 | 417.2 | 814.8 | 1123ms | 78.1ms |
+
+### Agent Benchmark Results
 
 | Model | Prompts | Turns | Tool Calls | KV Hit Rate | Avg Time |
 |-------|---------|-------|-----------|-------------|----------|
 | Qwen3-4B | 5 | 10 | 8 | 100% | 31.9s |
 | Qwen3-8B | 5 | 10 | 11 | 100% | 88.5s |
 
-Test environment: A100-SXM4-40GB · Intel Xeon @ 2.20GHz · 83GB RAM · CUDA 13.0
+### Test Environment
+
+- GPU: NVIDIA A100-SXM4-40GB
+- Driver: 580.82.07 / CUDA 13.0
+- SGLang: v0.5.9 (FlashInfer backend, `--disable-radix-cache`)
+- agent-infer: `--num-slots 4 --cuda-graph true`
+- Benchmark: `bench_throughput.py --dataset synthetic --num-prompts 50 --max-tokens 128 --temperature 0 --seed 42`
 
 ---
 
