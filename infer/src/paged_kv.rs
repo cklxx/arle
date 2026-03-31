@@ -18,7 +18,7 @@ pub const DEFAULT_PAGE_SIZE: usize = 16;
 /// Paged KV cache pool — shared across all request slots.
 pub struct PagedKVPool {
     /// K pages for all layers: `[num_layers]` each `[max_pages * num_kv_heads * page_size * head_dim]` bf16
-    k_pools: Vec<CudaSlice<u16>>,
+    pub(crate) k_pools: Vec<CudaSlice<u16>>,
     /// V pages for all layers
     v_pools: Vec<CudaSlice<u16>>,
 
@@ -239,5 +239,64 @@ impl PagedKVPool {
             .iter()
             .map(|&slot| self.last_page_len(slot) as i32)
             .collect()
+    }
+
+    /// Migrate KV data from contiguous cache to paged pool for one slot.
+    ///
+    /// Called after prefill completes. Copies `seq_len` tokens of K/V from each
+    /// contiguous layer buffer into the corresponding pages in the pool.
+    pub fn migrate_from_contiguous(
+        &self,
+        ctx: &crate::tensor::DeviceContext,
+        slot: usize,
+        contiguous_k_caches: &[crate::tensor::DeviceVec],  // [num_layers]
+        contiguous_v_caches: &[crate::tensor::DeviceVec],
+        max_seq_len_contiguous: usize,
+    ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+
+        let seq_len = self.seq_lens[slot];
+        if seq_len == 0 || self.k_pools.is_empty() {
+            return Ok(());
+        }
+
+        let page_table = &self.page_tables[slot];
+        if page_table.is_empty() {
+            return Ok(());
+        }
+
+        // Upload page table to GPU
+        let page_indices_i32: Vec<i32> = page_table.iter().map(|&p| p as i32).collect();
+        let page_indices_gpu: cudarc::driver::CudaSlice<i32> = ctx
+            .stream
+            .memcpy_stod(&page_indices_i32)
+            .map_err(|e| anyhow!("H2D page_indices failed: {e}"))?;
+
+        for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
+            let (k_src_ptr, _gk) = contiguous_k_caches[layer].data.device_ptr(&ctx.stream);
+            let (v_src_ptr, _gv) = contiguous_v_caches[layer].data.device_ptr(&ctx.stream);
+            let (k_dst_ptr, _gkd) = self.k_pools[layer].device_ptr(&ctx.stream);
+            let (v_dst_ptr, _gvd) = self.v_pools[layer].device_ptr(&ctx.stream);
+            let (pi_ptr, _gpi) = page_indices_gpu.device_ptr(&ctx.stream);
+
+            unsafe {
+                crate::ffi::kv_cache_to_paged_cuda(
+                    k_src_ptr as *const crate::ffi::Half,
+                    v_src_ptr as *const crate::ffi::Half,
+                    k_dst_ptr as *mut crate::ffi::Half,
+                    v_dst_ptr as *mut crate::ffi::Half,
+                    pi_ptr as *const i32,
+                    max_seq_len_contiguous as i32,
+                    seq_len as i32,
+                    self.num_kv_heads as i32,
+                    self.page_size as i32,
+                    self.head_dim as i32,
+                    self.stride_page as i32,
+                    ctx.stream.cu_stream(),
+                );
+            }
+        }
+
+        Ok(())
     }
 }
