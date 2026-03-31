@@ -108,6 +108,18 @@ pub enum WeightTensor {
     },
 }
 
+#[cfg(feature = "metal")]
+impl WeightTensor {
+    /// Returns the element dtype: for Dense the array dtype; for Quantized the scales dtype
+    /// (scales hold the dequantization type, e.g. bfloat16).
+    pub fn dtype(&self) -> mlx_rs::Dtype {
+        match self {
+            WeightTensor::Dense(a) => a.dtype(),
+            WeightTensor::Quantized { scales, .. } => scales.dtype(),
+        }
+    }
+}
+
 /// Weight tensors loaded from safetensors shards into Metal unified memory.
 // GPU required: all fields are mlx-rs Arrays backed by Metal buffers.
 #[cfg(feature = "metal")]
