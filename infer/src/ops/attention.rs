@@ -500,8 +500,8 @@ pub struct FlashInferWorkspace {
     page_locked_workspace: *mut u8,
     #[allow(dead_code)]
     page_locked_workspace_bytes: usize,
-    /// Opaque plan info buffer (256 bytes, GPU)
-    pub plan_info: CudaSlice<u8>,
+    /// Opaque plan info buffer (256 bytes, HOST pinned — used by CPU memcpy in FlashInfer)
+    pub plan_info: *mut u8,
     /// LSE output buffer (log-sum-exp), nullable but we allocate for max batch
     pub lse: CudaSlice<f32>,
 }
@@ -532,10 +532,23 @@ impl FlashInferWorkspace {
             .alloc_zeros(Self::INT_WORKSPACE_BYTES)
             .map_err(|e| anyhow!("FlashInfer int_workspace alloc failed: {e}"))?;
 
-        let plan_info: CudaSlice<u8> = ctx
-            .stream
-            .alloc_zeros(Self::PLAN_INFO_BYTES)
-            .map_err(|e| anyhow!("FlashInfer plan_info alloc failed: {e}"))?;
+        // plan_info is read/written by CPU memcpy in FlashInfer — must be host memory
+        let plan_info = unsafe {
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            let err = cudarc::driver::sys::cuMemAllocHost_v2(
+                &mut ptr as *mut *mut u8 as *mut *mut std::ffi::c_void,
+                Self::PLAN_INFO_BYTES,
+            );
+            if err != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(anyhow!(
+                    "cuMemAllocHost failed for plan_info: {:?}",
+                    err
+                ));
+            }
+            // Zero-initialize
+            std::ptr::write_bytes(ptr, 0, Self::PLAN_INFO_BYTES);
+            ptr
+        };
 
         let lse: CudaSlice<f32> = ctx
             .stream
@@ -580,6 +593,14 @@ impl Drop for FlashInferWorkspace {
                 );
             }
             self.page_locked_workspace = std::ptr::null_mut();
+        }
+        if !self.plan_info.is_null() {
+            unsafe {
+                let _ = cudarc::driver::sys::cuMemFreeHost(
+                    self.plan_info as *mut std::ffi::c_void,
+                );
+            }
+            self.plan_info = std::ptr::null_mut();
         }
     }
 }
@@ -696,7 +717,6 @@ pub fn flashinfer_batch_decode(
     {
         let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
         let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
-        let (pi_ptr, _gpi) = workspace.plan_info.device_ptr_mut(&ctx.stream);
 
         let ret = unsafe {
             ffi::flashinfer_batch_decode_plan(
@@ -711,7 +731,7 @@ pub fn flashinfer_batch_decode(
                 num_kv_heads as i32,
                 page_size as i32,
                 head_dim as i32,
-                pi_ptr as *mut u8,
+                workspace.plan_info as *mut u8, // host pointer — FlashInfer uses CPU memcpy
                 ctx.stream.cu_stream(),
             )
         };
@@ -727,7 +747,6 @@ pub fn flashinfer_batch_decode(
     {
         let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
         let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
-        let (pi_ptr, _gpi) = workspace.plan_info.device_ptr(&ctx.stream);
         let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
         let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
         let (ind_ptr, _gind) = kv_indptr_gpu.device_ptr(&ctx.stream);
@@ -742,7 +761,7 @@ pub fn flashinfer_batch_decode(
             ffi::flashinfer_batch_decode_run(
                 fw_ptr as *mut u8,
                 iw_ptr as *mut u8,
-                pi_ptr as *const u8,
+                workspace.plan_info as *const u8, // host pointer — FlashInfer uses CPU memcpy
                 q_ptr as *const ffi::Half,
                 k_pool_ptr as *const ffi::Half,
                 v_pool_ptr as *const ffi::Half,

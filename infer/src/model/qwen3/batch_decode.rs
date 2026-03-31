@@ -126,10 +126,9 @@ impl Qwen3Model {
         let kv_dim = num_kv_heads * head_dim;
         let inter_dim = self.config.intermediate_size;
         let eps = self.config.rms_norm_eps;
-        // Allocate token slots for the new tokens (1 per request)
-        for &si in slot_indices {
-            paged_kv_pool.alloc_tokens(si, 1)?;
-        }
+
+        // NOTE: Token allocation is done by the scheduler (step_decode_batch)
+        // before calling this function. Do NOT allocate here to avoid double allocation.
 
         // Build FlashInfer metadata from paged KV pool
         let indptr_h = paged_kv_pool.build_indptr(slot_indices);

@@ -278,9 +278,13 @@ impl ModelForward for Qwen3Model {
             }
             return Ok(());
         }
-        // Use sequential contiguous decode for now — FlashInfer paged decode
-        // needs more debugging for concurrent correctness.
-        let _ = paged_kv_pool;
-        self.decode_batch_contiguous(tokens, states, slot_indices)
+        // FlashInfer token-pool path: use paged decode when pool has data.
+        // Falls back to sequential contiguous decode when pool is stub-sized.
+        match paged_kv_pool {
+            Some(pool) if !pool.k_buffers.is_empty() => {
+                self.decode_batch(tokens, states, slot_indices, pool)
+            }
+            _ => self.decode_batch_contiguous(tokens, states, slot_indices),
+        }
     }
 }
