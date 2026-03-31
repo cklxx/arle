@@ -40,11 +40,17 @@ pub(crate) struct BatchDecodeBuffers {
     embedding_out: HiddenStates,
     /// Batched logits buffer [max_batch_size, vocab_size] — avoids alloc in graph.
     logits_batch: Option<HiddenStates>,
-    /// Pre-allocated per-slot logits buffers — avoids GPU alloc in extract loop.
+    /// Pre-allocated per-slot logits buffers (unused, kept for future non-greedy).
     logits_per_slot: Vec<DeviceVec>,
+    /// Pre-allocated batch argmax output [max_batch_size] i32.
+    argmax_out: CudaSlice<i32>,
 
     /// Pre-allocated token_ids buffer — avoids clone_htod alloc every step.
     token_ids_gpu: CudaSlice<i32>,
+
+    /// Reusable host-side scratch vectors to avoid per-step heap allocation.
+    positions_scratch: Vec<i32>,
+    token_ids_scratch: Vec<i32>,
 
     // FlashInfer paged attention buffers
     positions: CudaSlice<i32>,
@@ -94,12 +100,19 @@ impl BatchDecodeBuffers {
 
             embedding_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
             logits_batch: None, // lazy-allocated on first use (needs vocab_size)
-            logits_per_slot: Vec::new(), // lazy-allocated on first use (needs vocab_size)
+            logits_per_slot: Vec::new(),
+            argmax_out: ctx
+                .stream
+                .alloc_zeros(max_batch_size)
+                .map_err(|e| anyhow::anyhow!("Alloc argmax_out failed: {e}"))?,
 
             token_ids_gpu: ctx
                 .stream
                 .alloc_zeros(max_batch_size)
                 .map_err(|e| anyhow::anyhow!("Alloc token_ids_gpu failed: {e}"))?,
+
+            positions_scratch: Vec::with_capacity(max_batch_size),
+            token_ids_scratch: Vec::with_capacity(max_batch_size),
 
             positions: ctx
                 .stream
@@ -182,18 +195,27 @@ impl Qwen3Model {
         bufs.set_batch_size(batch_size);
 
         // ── Pre-graph: metadata H2D + FlashInfer plan + embedding ──
+        // Build host-side metadata using scratch buffers (avoid per-step heap alloc).
 
         let indptr_h = paged_kv_pool.build_indptr(slot_indices);
         let indices_h = paged_kv_pool.build_indices(slot_indices);
         let last_page_lens_h = paged_kv_pool.build_last_page_lens(slot_indices);
-        let positions_h: Vec<i32> = slot_indices
-            .iter()
-            .map(|&si| (paged_kv_pool.seq_len(si) - 1) as i32)
-            .collect();
 
+        bufs.positions_scratch.clear();
+        bufs.positions_scratch.extend(
+            slot_indices
+                .iter()
+                .map(|&si| (paged_kv_pool.seq_len(si) - 1) as i32),
+        );
+
+        bufs.token_ids_scratch.clear();
+        bufs.token_ids_scratch
+            .extend(tokens.iter().map(|&x| x as i32));
+
+        // H2D copies — positions, indptr, indices, last_page_len, token_ids.
         self.ctx
             .stream
-            .memcpy_htod(&positions_h, &mut bufs.positions)
+            .memcpy_htod(&bufs.positions_scratch, &mut bufs.positions)
             .map_err(|e| anyhow::anyhow!("H2D positions: {e}"))?;
         self.ctx
             .stream
@@ -216,6 +238,10 @@ impl Qwen3Model {
             .stream
             .memcpy_htod(&last_page_lens_h, &mut bufs.kv_last_page_len_gpu)
             .map_err(|e| anyhow::anyhow!("H2D last_page_len: {e}"))?;
+        self.ctx
+            .stream
+            .memcpy_htod(&bufs.token_ids_scratch, &mut bufs.token_ids_gpu)
+            .map_err(|e| anyhow::anyhow!("H2D token_ids: {e}"))?;
 
         ops::flashinfer_plan(
             &self.ctx,
@@ -228,13 +254,8 @@ impl Qwen3Model {
             head_dim,
         )?;
 
-        // Embedding (has H2D copy — must be outside graph)
+        // Embedding (token_ids already on GPU from the batch H2D above)
         bufs.embedding_out.seq_len = batch_size;
-        let token_ids_i32: Vec<i32> = tokens.iter().map(|&x| x as i32).collect();
-        self.ctx
-            .stream
-            .memcpy_htod(&token_ids_i32, &mut bufs.token_ids_gpu)
-            .map_err(|e| anyhow::anyhow!("H2D token_ids: {e}"))?;
         ops::embedding_batch(
             &self.ctx,
             &self.embed_tokens,
