@@ -463,4 +463,43 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // ─── FlashInfer batch decode with paged KV cache ───
+
+    pub(crate) fn flashinfer_batch_decode_plan(
+        float_workspace: *mut u8,
+        float_workspace_bytes: usize,
+        int_workspace: *mut u8,
+        page_locked_workspace: *mut u8,
+        int_workspace_bytes: usize,
+        indptr_h: *const i32,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        page_size: i32,
+        head_dim: i32,
+        plan_info_out: *mut u8,
+        stream: CUstream,
+    ) -> i32;
+
+    pub(crate) fn flashinfer_batch_decode_run(
+        float_workspace: *mut u8,
+        int_workspace: *mut u8,
+        plan_info: *const u8,
+        q: *const Half,
+        k_data: *const Half,
+        v_data: *const Half,
+        kv_indptr: *const i32,
+        kv_indices: *const i32,
+        kv_last_page_len: *const i32,
+        o: *mut Half,
+        lse: *mut f32,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        page_size: i32,
+        head_dim: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
 }

@@ -742,6 +742,27 @@ fn main() {
         nvcc_args.extend(arch_args.clone());
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
 
+        // FlashInfer headers for flashinfer_decode.cu
+        if stem == "flashinfer_decode" {
+            // Find FlashInfer include path from pip
+            if let Ok(output) = Command::new("python3")
+                .args(["-c", "import flashinfer; import os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data', 'include'))"])
+                .output()
+            {
+                if output.status.success() {
+                    let fi_include = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if Path::new(&fi_include).exists() {
+                        nvcc_args.extend([
+                            format!("-I{}", fi_include),
+                            "-std=c++17".to_string(),
+                            "--expt-relaxed-constexpr".to_string(),
+                        ]);
+                        println!("cargo:warning=FlashInfer include: {}", fi_include);
+                    }
+                }
+            }
+        }
+
         let status = Command::new(&nvcc)
             .args(&nvcc_args)
             .status()
