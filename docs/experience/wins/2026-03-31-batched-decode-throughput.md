@@ -56,3 +56,11 @@ Remaining ~1.4ms ITL gap: CUDA Graph (~1.0ms kernel launch overhead) + misc over
 - **SGLang's architecture is the reference** — token pool, batched GEMM, FlashInfer paged attention, CUDA Graph per batch size. Follow this blueprint.
 - **Host/device pointer mismatches are silent killers** — FlashInfer's C++ API uses CPU memcpy for some buffers. Always verify whether a pointer argument is host or device.
 - **Allocation in hot loops is expensive** — GPU buffer allocation via cuMemAllocAsync costs ~0.5ms per call. Pre-allocate everything.
+
+### Phase 6: CUDA Graph for Batched Decode (700 -> 756 tok/s, +8%)
+
+Captured CUDA Graphs for the decode layer loop (36 layers x ~14 kernels = ~504 launches). One graph per batch_size cached in HashMap. First call captures, subsequent calls replay.
+
+Key insight (from SGLang source): FlashInfer plan() runs outside graph, only run() is captured. Graph replays kernel launches with same GPU buffer pointers but updated data.
+
+**Final: 756 tok/s at 8-concurrent (SGLang: 886, gap: 1.17x)**
