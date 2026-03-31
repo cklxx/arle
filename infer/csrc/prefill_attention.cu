@@ -133,12 +133,12 @@ void prefill_attention_prep_cuda(
     int head_dim,
     int seq_len,
     int start_pos,
+    int max_seq_len,
     float rms_eps,
     cudaStream_t stream
 ) {
     int q_dim = num_q_heads * head_dim;
     int kv_dim = num_kv_heads * head_dim;
-    int max_seq_len = 4096;
 
     // Step 1: QK norm + RoPE (in-place)
     dim3 norm_grid(num_q_heads + num_kv_heads, seq_len);

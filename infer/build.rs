@@ -381,7 +381,7 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
         artifact_dir: "attention_decode",
         kernel_path: "tools/triton/attention_decode_kernel.py",
         kernel_name: "fused_attention_decode_kernel",
-        signature: "*bf16,*bf16,*bf16,*bf16,*bf16,*bf16,*bf16,*i32,*bf16,*bf16,*fp32,*fp32,*fp32,i32,i32,i32,4,64,128",
+        signature: "*bf16,*bf16,*bf16,*bf16,*bf16,*bf16,*bf16,*i32,*bf16,*bf16,*fp32,*fp32,*fp32,i32,i32,i32,i32,4,64,128",
         grid: "num_qheads,4,1",
         out_name: "triton_attention_decode",
         num_warps: 4,
@@ -393,7 +393,7 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
         &attention_decode_c,
         "triton_attention_decode_wrapper.c",
         format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr q_full, CUdeviceptr k_full, CUdeviceptr v_full, CUdeviceptr q_norm_weight, CUdeviceptr k_norm_weight, CUdeviceptr cos_cache_base, CUdeviceptr sin_cache_base, CUdeviceptr decode_meta, CUdeviceptr k_cache, CUdeviceptr v_cache, CUdeviceptr partial_out, CUdeviceptr partial_m, CUdeviceptr partial_l, int32_t num_qheads, int32_t num_kvheads, int32_t gqa_ratio);\n\nCUresult fused_gqa_attention_decode(const uint16_t* q_full, const uint16_t* k_full, const uint16_t* v_full, const uint16_t* q_norm_weight, const uint16_t* k_norm_weight, const uint16_t* cos_cache_base, const uint16_t* sin_cache_base, const int32_t* decode_meta, uint16_t* k_cache, uint16_t* v_cache, float* partial_out, float* partial_m, float* partial_l, int32_t num_qheads, int32_t num_kvheads, int32_t gqa_ratio, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)q_full, (CUdeviceptr)k_full, (CUdeviceptr)v_full, (CUdeviceptr)q_norm_weight, (CUdeviceptr)k_norm_weight, (CUdeviceptr)cos_cache_base, (CUdeviceptr)sin_cache_base, (CUdeviceptr)decode_meta, (CUdeviceptr)k_cache, (CUdeviceptr)v_cache, (CUdeviceptr)partial_out, (CUdeviceptr)partial_m, (CUdeviceptr)partial_l, num_qheads, num_kvheads, gqa_ratio);\n}}\n",
+            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr q_full, CUdeviceptr k_full, CUdeviceptr v_full, CUdeviceptr q_norm_weight, CUdeviceptr k_norm_weight, CUdeviceptr cos_cache_base, CUdeviceptr sin_cache_base, CUdeviceptr decode_meta, CUdeviceptr k_cache, CUdeviceptr v_cache, CUdeviceptr partial_out, CUdeviceptr partial_m, CUdeviceptr partial_l, int32_t num_qheads, int32_t num_kvheads, int32_t gqa_ratio, int32_t max_seq_len);\n\nCUresult fused_gqa_attention_decode(const uint16_t* q_full, const uint16_t* k_full, const uint16_t* v_full, const uint16_t* q_norm_weight, const uint16_t* k_norm_weight, const uint16_t* cos_cache_base, const uint16_t* sin_cache_base, const int32_t* decode_meta, uint16_t* k_cache, uint16_t* v_cache, float* partial_out, float* partial_m, float* partial_l, int32_t num_qheads, int32_t num_kvheads, int32_t gqa_ratio, int32_t max_seq_len, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)q_full, (CUdeviceptr)k_full, (CUdeviceptr)v_full, (CUdeviceptr)q_norm_weight, (CUdeviceptr)k_norm_weight, (CUdeviceptr)cos_cache_base, (CUdeviceptr)sin_cache_base, (CUdeviceptr)decode_meta, (CUdeviceptr)k_cache, (CUdeviceptr)v_cache, (CUdeviceptr)partial_out, (CUdeviceptr)partial_m, (CUdeviceptr)partial_l, num_qheads, num_kvheads, gqa_ratio, max_seq_len);\n}}\n",
             func = attention_decode_func
         ),
     );
@@ -403,13 +403,14 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     // FlashAttention-2 prefill kernel: fused QK + softmax + V for all query tokens
     // Grid: (cdiv(seq_len, BLOCK_M=128), num_q_heads, 1)
     // Signature: Q(*bf16), K_cache(*bf16), V_cache(*bf16), Output(*bf16),
-    //   num_q_heads(i32), num_kv_heads(i32), gqa_ratio(i32), seq_len(i32), start_pos(i32), q_dim(i32),
+    //   num_q_heads(i32), num_kv_heads(i32), gqa_ratio(i32), seq_len(i32), start_pos(i32),
+    //   max_seq_len(i32), q_dim(i32),
     //   constexprs: BLOCK_M=128, BLOCK_N=64, HEAD_DIM=128
     let flash_attn_prefill_spec = TritonKernelSpec {
         artifact_dir: "flash_attention_prefill",
         kernel_path: "tools/triton/flash_attention_prefill_kernel.py",
         kernel_name: "flash_attention_prefill_kernel",
-        signature: "*bf16,*bf16,*bf16,*bf16,i32,i32,i32,i32,i32,i32,128,64,128",
+        signature: "*bf16,*bf16,*bf16,*bf16,i32,i32,i32,i32,i32,i32,i32,128,64,128",
         grid: "(seq_len + 127) / 128,num_q_heads,1",
         out_name: "triton_flash_attention_prefill",
         num_warps: 4,
@@ -421,7 +422,7 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
         &flash_attn_c,
         "triton_flash_attention_prefill_wrapper.c",
         format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr Q, CUdeviceptr K_cache, CUdeviceptr V_cache, CUdeviceptr Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, int32_t start_pos, int32_t q_dim);\n\nCUresult flash_attention_prefill_cuda(const uint16_t* Q, const uint16_t* K_cache, const uint16_t* V_cache, uint16_t* Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, int32_t start_pos, int32_t q_dim, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)Q, (CUdeviceptr)K_cache, (CUdeviceptr)V_cache, (CUdeviceptr)Output, num_q_heads, num_kv_heads, gqa_ratio, seq_len, start_pos, q_dim);\n}}\n",
+            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr Q, CUdeviceptr K_cache, CUdeviceptr V_cache, CUdeviceptr Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, int32_t start_pos, int32_t max_seq_len, int32_t q_dim);\n\nCUresult flash_attention_prefill_cuda(const uint16_t* Q, const uint16_t* K_cache, const uint16_t* V_cache, uint16_t* Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, int32_t start_pos, int32_t max_seq_len, int32_t q_dim, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)Q, (CUdeviceptr)K_cache, (CUdeviceptr)V_cache, (CUdeviceptr)Output, num_q_heads, num_kv_heads, gqa_ratio, seq_len, start_pos, max_seq_len, q_dim);\n}}\n",
             func = flash_attn_func
         ),
     );
@@ -432,7 +433,7 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
         artifact_dir: "flash_attention_prefill_hd256",
         kernel_path: "tools/triton/flash_attention_prefill_hd256_kernel.py",
         kernel_name: "flash_attention_prefill_hd256_kernel",
-        signature: "*bf16,*bf16,*bf16,*bf16,i32,i32,i32,i32,*i32,i32,64,64,256",
+        signature: "*bf16,*bf16,*bf16,*bf16,i32,i32,i32,i32,*i32,i32,i32,64,64,256",
         grid: "(seq_len + 63) / 64,num_q_heads,1",
         out_name: "triton_flash_attention_prefill_hd256",
         num_warps: 4,
@@ -448,7 +449,7 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
         &flash_attn_hd256_c,
         "triton_flash_attention_prefill_hd256_wrapper.c",
         format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr Q, CUdeviceptr K_cache, CUdeviceptr V_cache, CUdeviceptr Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, CUdeviceptr start_pos_ptr, int32_t q_dim);\n\nCUresult flash_attention_prefill_hd256_cuda(const uint16_t* Q, const uint16_t* K_cache, const uint16_t* V_cache, uint16_t* Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, const int32_t* start_pos_ptr, int32_t q_dim, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)Q, (CUdeviceptr)K_cache, (CUdeviceptr)V_cache, (CUdeviceptr)Output, num_q_heads, num_kv_heads, gqa_ratio, seq_len, (CUdeviceptr)start_pos_ptr, q_dim);\n}}\n",
+            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr Q, CUdeviceptr K_cache, CUdeviceptr V_cache, CUdeviceptr Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, CUdeviceptr start_pos_ptr, int32_t max_seq_len, int32_t q_dim);\n\nCUresult flash_attention_prefill_hd256_cuda(const uint16_t* Q, const uint16_t* K_cache, const uint16_t* V_cache, uint16_t* Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, const int32_t* start_pos_ptr, int32_t max_seq_len, int32_t q_dim, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)Q, (CUdeviceptr)K_cache, (CUdeviceptr)V_cache, (CUdeviceptr)Output, num_q_heads, num_kv_heads, gqa_ratio, seq_len, (CUdeviceptr)start_pos_ptr, max_seq_len, q_dim);\n}}\n",
             func = flash_attn_hd256_func
         ),
     );

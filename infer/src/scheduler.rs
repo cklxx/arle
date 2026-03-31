@@ -841,42 +841,9 @@ impl<M: ModelForward> Scheduler<M> {
         let slot_idx = req.slot_idx;
         let state = &mut states[slot_idx];
 
-        // Run forward pass for this chunk, scatter-writing K/V to pool if available.
-        let forward_result = if !paged_kv_pool.k_buffers.is_empty() {
-            // Allocate pool token slots for this chunk.
-            let chunk_len = chunk.len();
-            match paged_kv_pool.alloc_tokens(slot_idx, chunk_len) {
-                Ok(new_indices) => {
-                    // Upload pool indices to GPU as i32.
-                    let indices_i32: Vec<i32> = new_indices.iter().map(|&i| i as i32).collect();
-                    let ctx = model.device_context();
-                    match ctx.stream.clone_htod(&indices_i32) {
-                        Ok(indices_gpu) => {
-                            model.forward_prefill_with_pool(
-                                chunk,
-                                state,
-                                paged_kv_pool,
-                                slot_idx,
-                                &indices_gpu,
-                            )
-                        }
-                        Err(e) => {
-                            error!("Request {}: H2D token indices failed: {}", req.id, e);
-                            // Fall back to non-pool path.
-                            model.forward(chunk, state)
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Request {}: pool alloc for chunk failed: {}", req.id, e);
-                    // Fall back to non-pool path.
-                    model.forward(chunk, state)
-                }
-            }
-        } else {
-            // No pool — use standard prefill path.
-            model.forward(chunk, state)
-        };
+        // Run standard prefill forward pass.
+        // Pool token allocation and K/V migration happen after all chunks complete.
+        let forward_result = model.forward(chunk, state);
 
         if let Err(e) = forward_result {
             error!("Request {}: prefill chunk failed: {}", req.id, e);
@@ -898,7 +865,22 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        // All chunks done — sample first token
+        // All chunks done — allocate pool tokens and migrate KV from contiguous cache.
+        // This copies the processed K/V (with QK-norm + RoPE) from the contiguous
+        // cache into the token pool so FlashInfer batched decode can read from it.
+        if !paged_kv_pool.k_buffers.is_empty() {
+            // `total` is the number of effective tokens processed during prefill.
+            if let Err(e) = paged_kv_pool.alloc_tokens(slot_idx, total) {
+                error!("Request {}: pool alloc for migration failed: {}", req.id, e);
+            } else {
+                let ctx = model.device_context();
+                if let Err(e) = state.migrate_kv_to_paged(ctx, paged_kv_pool, slot_idx) {
+                    error!("Request {}: KV migration to pool failed: {}", req.id, e);
+                }
+            }
+        }
+
+        // Sample first token
         match model.select_token(state, &req.sampling, rng) {
             Ok(token) => {
                 if !req.sampling.ignore_eos && model.is_stop_token(token) {
