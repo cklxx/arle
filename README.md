@@ -6,39 +6,31 @@ Pure Rust LLM inference engine with multi-turn agent tool-calling. Built on **In
 
 ---
 
-## Performance (Qwen3-4B, A100-40GB)
+## Performance vs SGLang (Qwen3-4B, A100-40GB)
 
 | Metric | agent-infer | SGLang | Ratio |
 |--------|-------------|--------|-------|
-| TTFT | 8.6ms | 39.3ms | **4.6x faster** |
-| Single-request tok/s | 112 | 122 | 0.92x |
-| 4-concurrent tok/s | 205 | 482 | 0.43x |
-| 8-concurrent tok/s | 152 | 860 | 0.18x |
+| TTFT | **8.6ms** | 39.3ms | **4.6x faster** |
+| 8-concurrent tok/s | 756 | 886 | **0.85x** |
+| ITL (decode step) | 9.6ms | 8.2ms | 1.17x |
 
-**TTFT lead**: Rust runtime eliminates Python dispatch overhead; CUDA Graph decode removes per-step CPU→GPU launches, cutting first-token latency to 8.6ms.
+**TTFT lead**: Rust runtime eliminates Python dispatch overhead; CUDA Graph decode removes per-step CPU→GPU launches, cutting first-token latency to 8.6ms vs SGLang's 39.3ms.
 
-**Concurrency gap**: Batch decode attention is currently being migrated from a per-request loop to FlashInfer's batched kernel — once complete, multi-request throughput is expected to close significantly toward SGLang levels. (In progress.)
+**Concurrent throughput**: Closed from 0.18x → **0.85x** of SGLang through 6 optimization phases (128 → 756 tok/s at 8-concurrent). Remaining 1.17x gap is ~1.4ms/step of mixed kernel launch + misc overhead.
 
 ---
 
-## Quick Start
+## Optimization Journey (8-concurrent, A100-40GB)
 
-```bash
-# 1. Clone
-git clone https://github.com/cklxx/agent-infer && cd agent-infer
-
-# 2. Build (CPU-only, no CUDA)
-cargo build --release --no-default-features --features no-cuda
-
-# 3. Build with GPU support
-CUDA_HOME=/usr/local/cuda cargo build --release
-
-# Run interactive agent REPL
-./target/release/agent-infer --model-path /path/to/Qwen3-8B
-
-# Run OpenAI-compatible HTTP server
-./target/release/infer --model-path /path/to/Qwen3-8B --port 8000
-```
+| Phase | Optimization | Throughput | Delta |
+|-------|-------------|-----------|-------|
+| Baseline | Per-request decode loop | 128 tok/s | — |
+| 1 | Token-level KV pool + FlashInfer paged decode | 434 tok/s | +239% |
+| 2 | Buffer pre-allocation (eliminate per-step GPU alloc) | 681 tok/s | +57% |
+| 3 | FlashInfer plan once per step (not per layer) | 690 tok/s | +1% |
+| 4 | Embedding + logits buffer pre-allocation | 700 tok/s | +1% |
+| 5 | CUDA Graph investigation (CPU memcpy constraint) | 700 tok/s | — |
+| 6 | CUDA Graph batched decode (one graph per batch_size) | **756 tok/s** | +8% |
 
 ---
 
@@ -81,6 +73,27 @@ User
 
 ---
 
+## Quick Start
+
+```bash
+# 1. Clone
+git clone https://github.com/cklxx/agent-infer && cd agent-infer
+
+# 2. Build (CPU-only, no CUDA)
+cargo build --release --no-default-features --features no-cuda
+
+# 3. Build with GPU support
+CUDA_HOME=/usr/local/cuda cargo build --release
+
+# Run interactive agent REPL
+./target/release/agent-infer --model-path /path/to/Qwen3-8B
+
+# Run OpenAI-compatible HTTP server
+./target/release/infer --model-path /path/to/Qwen3-8B --port 8000
+```
+
+---
+
 ## Supported Models
 
 | Model | Attention | Status |
@@ -92,6 +105,32 @@ User
 | Mistral / Mixtral | GQA | 🔜 Planned (Phase 1) |
 | Gemma 2 / 3 | MHA | 🔜 Planned (Phase 1) |
 | Phi-4 | GQA | 🔜 Planned (Phase 1) |
+
+---
+
+## Features
+
+### KV Prefix Cache
+Reuses KV cache across multi-turn conversations. When a new prompt shares a prefix with the previous one, only the new suffix is computed. Saves 12–38% of prefill computation on agent workloads.
+
+### KV Offload (GPU → CPU)
+When GPU HBM is full, older KV blocks are migrated to CPU RAM and prefetched back before attention. Enables contexts beyond GPU VRAM capacity.
+
+### Continuous Batching + Chunked Prefill
+Scheduler interleaves multiple requests on a single GPU. Long prefills are chunked (512 tokens) so decode steps can run between chunks, keeping decode latency low for concurrent requests.
+
+### CUDA Graph Decode
+Decode layer loop (36 layers × ~14 kernels = ~504 launches) is captured into CUDA Graphs — one graph per batch_size, cached in a HashMap. First call captures; subsequent calls replay. Eliminates CPU→GPU dispatch overhead per step.
+
+### FlashInfer Batched Decode
+Token-level KV pool (SGLang's `TokenToKVPool` pattern, page_size=1) enables `BatchDecodeWithPagedKVCacheDispatched` across all requests in a single kernel launch. FlashInfer plan runs once per step (not per layer) with buffers pre-allocated at startup.
+
+### Dynamo Integration
+```bash
+cargo build --release --features dynamo
+./target/release/agent-infer --model-path ... --dynamo
+```
+Registers with Dynamo's ETCD service registry and NATS event bus for service discovery and KV-aware routing.
 
 ---
 
@@ -174,69 +213,6 @@ requests=42 active=2 waiting=0 tokens_out=3891 kv_util=72.0% ttft_p50=85ms ttft_
 
 ---
 
-## Built-in Agent Tools
-
-| Tool | Description |
-|------|-------------|
-| `python` | Execute Python 3 snippets via `python3 -c` |
-| `shell` | Execute shell commands via `bash -c` |
-
----
-
-## Server Options
-
-```bash
-./target/release/infer \
-  --model-path /path/to/model  \  # Required
-  --port 8000                  \  # Default: 8000
-  --num-slots 4                \  # Concurrent request slots (each gets own KV cache)
-  --cuda-graph true            \  # CUDA graph decode (default: true)
-  --trace-output-path ./traces    # Optional: write Chrome trace JSON files
-```
-
----
-
-## Agent Options
-
-```bash
-./target/release/agent-infer \
-  --model-path /path/to/model  \  # Required
-  --max-turns 10               \  # Agent loop iterations
-  --max-tokens 4096            \  # Tokens per turn
-  --temperature 0.0            \  # 0.0 = greedy
-  --no-cuda-graph              \  # Disable CUDA graph (for debugging)
-  --max-gpu-kv 512             \  # Limit GPU KV tokens (tests CPU offload)
-  --dynamo                        # Register with Dynamo runtime
-```
-
----
-
-## Features
-
-### KV Prefix Cache
-Reuses KV cache across multi-turn conversations. When a new prompt shares a prefix with the previous one, only the new suffix is computed. Saves 12–38% of prefill computation on agent workloads.
-
-### KV Offload (GPU → CPU)
-When GPU HBM is full, older KV blocks are migrated to CPU RAM and prefetched back before attention. Enables contexts beyond GPU VRAM capacity.
-
-### Continuous Batching + Chunked Prefill
-Scheduler interleaves multiple requests on a single GPU. Long prefills are chunked (512 tokens) so decode steps can run between chunks, keeping decode latency low for concurrent requests.
-
-### CUDA Graph Decode
-First decode token captures a CUDA graph; subsequent tokens replay it, eliminating CPU→GPU dispatch overhead per step.
-
-### FlashInfer Batched Decode (In Progress)
-Batch decode attention is being migrated to FlashInfer's batched kernel, replacing the current per-request loop. This is the primary work item for closing the concurrency throughput gap vs SGLang.
-
-### Dynamo Integration
-```bash
-cargo build --release --features dynamo
-./target/release/agent-infer --model-path ... --dynamo
-```
-Registers with Dynamo's ETCD service registry and NATS event bus for service discovery and KV-aware routing.
-
----
-
 ## Benchmarks
 
 ### Running
@@ -296,6 +272,37 @@ agent-infer/
 └── Cargo.toml
 ```
 
+### Server Options
+
+```bash
+./target/release/infer \
+  --model-path /path/to/model  \  # Required
+  --port 8000                  \  # Default: 8000
+  --num-slots 4                \  # Concurrent request slots (each gets own KV cache)
+  --cuda-graph true            \  # CUDA graph decode (default: true)
+  --trace-output-path ./traces    # Optional: write Chrome trace JSON files
+```
+
+### Agent Options
+
+```bash
+./target/release/agent-infer \
+  --model-path /path/to/model  \  # Required
+  --max-turns 10               \  # Agent loop iterations
+  --max-tokens 4096            \  # Tokens per turn
+  --temperature 0.0            \  # 0.0 = greedy
+  --no-cuda-graph              \  # Disable CUDA graph (for debugging)
+  --max-gpu-kv 512             \  # Limit GPU KV tokens (tests CPU offload)
+  --dynamo                        # Register with Dynamo runtime
+```
+
+### Built-in Agent Tools
+
+| Tool | Description |
+|------|-------------|
+| `python` | Execute Python 3 snippets via `python3 -c` |
+| `shell` | Execute shell commands via `bash -c` |
+
 ### Building
 
 ```bash
@@ -347,3 +354,9 @@ See [ROADMAP.md](ROADMAP.md) for the full phased plan.
 | 3 | Tensor/Pipeline Parallel | 🔜 Planned |
 | 4 | Advanced decoding (beam search, speculative) | 🔜 Planned |
 | 5 | Performance optimization | 🔜 Planned |
+
+---
+
+## License
+
+MIT
