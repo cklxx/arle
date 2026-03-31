@@ -868,10 +868,10 @@ mod tests {
     ///     --lib -- bench_bf16 --ignored --nocapture
     /// ```
     #[test]
-    #[ignore = "requires Metal GPU + model weights at models/Qwen3-0.6B"]
+    #[ignore = "requires Metal GPU + model weights at models/Qwen3-0.6B-bf16"]
     fn bench_bf16() {
         let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("models/Qwen3-0.6B");
+            .join("models/Qwen3-0.6B-bf16");
         run_bench(&model_dir, "Qwen3-0.6B BF16");
     }
 }
