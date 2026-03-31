@@ -185,10 +185,26 @@ impl Qwen3Model {
             .memcpy_htod(&last_page_lens_h, &mut bufs.kv_last_page_len_gpu)
             .map_err(|e| anyhow::anyhow!("H2D last_page_len failed: {e}"))?;
 
+        // FlashInfer plan: call ONCE per decode step (not per layer).
+        // The plan result is valid for all layers since KV layout is identical.
+        let num_kv_heads = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim;
+        let page_size = 1;
+        ops::flashinfer_plan(
+            &self.ctx,
+            &indptr_h,
+            &mut bufs.flashinfer_ws,
+            batch_size,
+            num_heads,
+            num_kv_heads,
+            page_size,
+            head_dim,
+        )?;
+
         // 1. Batched embedding: [B, hidden_dim]
         let mut hidden = self.get_embeddings_batch(tokens)?;
 
-        // 2. Process all layers
+        // 2. Process all layers (using pre-computed plan)
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             self.decode_batch_layer(
                 layer_idx,
@@ -196,7 +212,6 @@ impl Qwen3Model {
                 &mut hidden,
                 bufs,
                 paged_kv_pool,
-                &indptr_h,
             )?;
         }
 
@@ -218,7 +233,6 @@ impl Qwen3Model {
         hidden: &mut HiddenStates,
         bufs: &mut BatchDecodeBuffers,
         kv_pool: &PagedKVPool,
-        indptr_h: &[i32],
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
         let num_heads = self.config.num_attention_heads;
@@ -277,13 +291,12 @@ impl Qwen3Model {
             eps,
         )?;
 
-        // 4. FlashInfer batch decode attention
-        ops::flashinfer_batch_decode(
+        // 4. FlashInfer batch decode attention (run only — plan was called once before loop)
+        ops::flashinfer_run_layer(
             &self.ctx,
             &bufs.q_batch,
             kv_pool,
             layer_idx,
-            indptr_h,
             &bufs.kv_indptr_gpu,
             &bufs.kv_indices_gpu,
             &bufs.kv_last_page_len_gpu,
