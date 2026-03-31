@@ -293,28 +293,27 @@ fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
     let v: serde_json::Value =
         serde_json::from_str(&raw).context("config.json is not valid JSON")?;
 
-    fn get_usize(v: &serde_json::Value, key: &str, default: usize) -> usize {
+    let get_usize = |key: &str, default: usize| -> usize {
         v.get(key)
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or(default)
-    }
-    fn get_f64(v: &serde_json::Value, key: &str, default: f64) -> f64 {
+            .and_then(serde_json::Value::as_u64)
+            .map_or(default, |x| x as usize)
+    };
+    let get_f64 = |key: &str, default: f64| -> f64 {
         v.get(key)
-            .and_then(|x| x.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or(default)
-    }
+    };
 
     Ok(MetalModelConfig {
-        hidden_size:              get_usize(&v, "hidden_size",              2048),
-        num_attention_heads:      get_usize(&v, "num_attention_heads",      16),
-        num_key_value_heads:      get_usize(&v, "num_key_value_heads",      8),
-        num_hidden_layers:        get_usize(&v, "num_hidden_layers",        24),
-        intermediate_size:        get_usize(&v, "intermediate_size",        11008),
-        vocab_size:               get_usize(&v, "vocab_size",               151936),
-        max_position_embeddings:  get_usize(&v, "max_position_embeddings",  32768),
-        rms_norm_eps:             get_f64(&v,   "rms_norm_eps",             1e-6),
-        rope_theta:               get_f64(&v,   "rope_theta",               10000.0),
+        hidden_size:              get_usize("hidden_size",              2048),
+        num_attention_heads:      get_usize("num_attention_heads",      16),
+        num_key_value_heads:      get_usize("num_key_value_heads",      8),
+        num_hidden_layers:        get_usize("num_hidden_layers",        24),
+        intermediate_size:        get_usize("intermediate_size",        11_008),
+        vocab_size:               get_usize("vocab_size",               151_936),
+        max_position_embeddings:  get_usize("max_position_embeddings",  32_768),
+        rms_norm_eps:             get_f64("rms_norm_eps",               1e-6),
+        rope_theta:               get_f64("rope_theta",                 10_000.0),
     })
 }
 
