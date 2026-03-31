@@ -174,6 +174,12 @@ impl Qwen3Model {
 
         bufs.set_batch_size(batch_size);
 
+        static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 5 || n % 50 == 0 {
+            info!("decode_batch step={} B={}", n, batch_size);
+        }
+
         // ── Pre-graph: metadata H2D + FlashInfer plan + embedding ──
 
         let indptr_h = paged_kv_pool.build_indptr(slot_indices);
@@ -214,14 +220,40 @@ impl Qwen3Model {
         // ── Graph body: layers + final norm + logits GEMM ──
         // All use pre-allocated buffers with stable pointers.
 
-        // Lazy-init logits buffer
+        // Lazy-init logits buffer (allocation — must be before any graph capture)
         if bufs.logits_batch.is_none() {
             let vocab_size = self.output_projection().rows;
             bufs.logits_batch = Some(HiddenStates::zeros(&self.ctx, vocab_size, bufs.max_batch_size)?);
         }
 
-        // Run layers + norm + logits
-        self.decode_batch_graph_body(bufs, paged_kv_pool, batch_size)?;
+        // ── CUDA Graph: capture on first call per batch_size, replay on subsequent ──
+        // plan() was called above (updates int_workspace). graph_body only does
+        // kernel launches — no allocs, no H2D, no CPU memcpy (except FlashInfer's
+        // plan_info read which sets kernel params, baked on capture, stable per bs).
+        if let Some(graph) = bufs.graph_cache.get(&batch_size) {
+            graph.launch()
+                .map_err(|e| anyhow::anyhow!("CUDA Graph replay (B={}): {e}", batch_size))?;
+        } else {
+            info!("Capturing CUDA Graph for batched decode B={}...", batch_size);
+            self.ctx.stream.begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                .map_err(|e| anyhow::anyhow!("begin_capture: {e}"))?;
+
+            self.decode_batch_graph_body(bufs, paged_kv_pool, batch_size)?;
+
+            let graph_opt = self.ctx.stream
+                .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+                .map_err(|e| anyhow::anyhow!("end_capture: {e}"))?;
+
+            if let Some(graph) = graph_opt {
+                graph.launch()
+                    .map_err(|e| anyhow::anyhow!("Graph first launch (B={}): {e}", batch_size))?;
+                info!("CUDA Graph captured for batched decode B={}", batch_size);
+                bufs.graph_cache.insert(batch_size, graph);
+            } else {
+                // Fallback: capture returned None (shouldn't happen)
+                self.decode_batch_graph_body(bufs, paged_kv_pool, batch_size)?;
+            }
+        }
 
         // Extract per-slot logits
         let logits = bufs.logits_batch.as_mut().unwrap();
