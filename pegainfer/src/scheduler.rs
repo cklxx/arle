@@ -379,6 +379,8 @@ pub struct Scheduler<M: ModelForward> {
     /// Per-slot cached prompts for prefix reuse.
     cached_prompts: Vec<Vec<u32>>,
     request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
+    /// Shared waiting count with the handle (for backpressure decrement).
+    waiting_count: Arc<AtomicUsize>,
     waiting: VecDeque<IncomingRequest>,
     active: Vec<ActiveRequest>,
     next_id: u64,
@@ -418,12 +420,15 @@ impl<M: ModelForward> Scheduler<M> {
             model_id, num_slots, seed
         );
 
+        let waiting_count = Arc::new(AtomicUsize::new(0));
+
         let scheduler = Self {
             model,
             tokenizer,
             states,
             cached_prompts,
             request_rx: rx,
+            waiting_count: Arc::clone(&waiting_count),
             waiting: VecDeque::new(),
             active: Vec::new(),
             next_id: 0,
@@ -436,8 +441,8 @@ impl<M: ModelForward> Scheduler<M> {
         let handle = SchedulerHandle {
             tx,
             model_id: Arc::from(model_id),
-            waiting_count: Arc::new(AtomicUsize::new(0)),
-            max_waiting: 0, // unlimited
+            waiting_count,
+            max_waiting: num_slots * 4,
         };
 
         Ok((scheduler, handle))
@@ -449,13 +454,17 @@ impl<M: ModelForward> Scheduler<M> {
         loop {
             // 1. Drain incoming requests
             while let Ok(req) = self.request_rx.try_recv() {
+                self.waiting_count.fetch_sub(1, Ordering::Relaxed);
                 self.waiting.push_back(req);
             }
 
             // 2. If idle, block for next request
             if self.active.is_empty() && self.waiting.is_empty() {
                 match self.request_rx.blocking_recv() {
-                    Some(req) => self.waiting.push_back(req),
+                    Some(req) => {
+                        self.waiting_count.fetch_sub(1, Ordering::Relaxed);
+                        self.waiting.push_back(req);
+                    }
                     None => {
                         info!("Scheduler shutting down: all handles dropped");
                         break;
@@ -800,13 +809,15 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        // Sample and emit for each request
-        for &req_idx in &decode_indices {
-            let req = &mut active[req_idx];
-            let state = &mut states[req.slot_idx];
+        // Batched sampling: launch all B kernels, single sync, readback all.
+        let sampling_params: Vec<&crate::sampler::SamplingParams> =
+            decode_indices.iter().map(|&i| &active[i].sampling).collect();
 
-            match model.select_token(state, &req.sampling, rng) {
-                Ok(token) => {
+        match model.select_tokens_batch(states, &slot_indices, &sampling_params, rng) {
+            Ok(sampled_tokens) => {
+                for (j, &req_idx) in decode_indices.iter().enumerate() {
+                    let token = sampled_tokens[j];
+                    let req = &mut active[req_idx];
                     if !req.sampling.ignore_eos && model.is_stop_token(token) {
                         req.finish(FinishReason::Stop, tokenizer);
                         continue;
@@ -821,9 +832,11 @@ impl<M: ModelForward> Scheduler<M> {
                         req.finish(FinishReason::Length, tokenizer);
                     }
                 }
-                Err(e) => {
-                    error!("Request {}: select_token failed: {}", req.id, e);
-                    req.phase = Phase::Finished;
+            }
+            Err(e) => {
+                error!("Batched sampling failed: {}", e);
+                for &req_idx in &decode_indices {
+                    active[req_idx].phase = Phase::Finished;
                 }
             }
         }

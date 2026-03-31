@@ -136,4 +136,8 @@ impl ModelForward for Qwen35Model {
     fn is_stop_token(&self, token_id: u32) -> bool {
         token_id == self.config.eos_token_id
     }
+
+    fn device_context(&self) -> &crate::tensor::DeviceContext {
+        &self.ctx
+    }
 }

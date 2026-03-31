@@ -120,24 +120,33 @@ impl KVCache {
     ) -> Result<(&mut DeviceVec, &mut DeviceVec)> {
         // Initialize on first access
         if self.k_cache.is_empty() {
+            let mut k_tmp = Vec::with_capacity(self.num_layers);
+            let mut v_tmp = Vec::with_capacity(self.num_layers);
             for _ in 0..self.num_layers {
                 // Allocate max size upfront
                 let cache_size = self.num_kv_heads * self.max_seq_len * self.head_dim;
-                self.k_cache.push(DeviceVec::zeros(ctx, cache_size)?);
-                self.v_cache.push(DeviceVec::zeros(ctx, cache_size)?);
+                k_tmp.push(DeviceVec::zeros(ctx, cache_size)?);
+                v_tmp.push(DeviceVec::zeros(ctx, cache_size)?);
             }
+            self.k_cache = k_tmp;
+            self.v_cache = v_tmp;
         }
         Ok((&mut self.k_cache[layer], &mut self.v_cache[layer]))
     }
 
     pub(crate) fn init_if_needed(&mut self, ctx: &DeviceContext, head_dim: usize) -> Result<()> {
         if self.head_dim == 0 {
-            self.head_dim = head_dim;
+            let mut k_tmp = Vec::with_capacity(self.num_layers);
+            let mut v_tmp = Vec::with_capacity(self.num_layers);
             for _ in 0..self.num_layers {
                 let cache_size = self.num_kv_heads * self.max_seq_len * head_dim;
-                self.k_cache.push(DeviceVec::zeros(ctx, cache_size)?);
-                self.v_cache.push(DeviceVec::zeros(ctx, cache_size)?);
+                k_tmp.push(DeviceVec::zeros(ctx, cache_size)?);
+                v_tmp.push(DeviceVec::zeros(ctx, cache_size)?);
             }
+            // All allocations succeeded — commit state atomically.
+            self.k_cache = k_tmp;
+            self.v_cache = v_tmp;
+            self.head_dim = head_dim;
             // Initialize host buffers (empty initially).
             self.k_host = vec![Vec::new(); self.num_layers];
             self.v_host = vec![Vec::new(); self.num_layers];

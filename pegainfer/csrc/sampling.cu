@@ -1,45 +1,161 @@
 #include "common.cuh"
 
 // ============================================================================
-// Argmax: find index of maximum value
+// Argmax: find index of maximum value (fast single-request version)
 // ============================================================================
-__global__ void argmax_kernel(const __nv_bfloat16 *__restrict__ x,
-                              int *__restrict__ out, int n) {
-  extern __shared__ char shared_mem[];
-  float *shared_vals = (float *)shared_mem;
-  int *shared_idxs = (int *)(shared_mem + blockDim.x * sizeof(float));
+// 1 block of 1024 threads. Each thread processes ceil(n/1024) elements using
+// vectorized bf16x2 loads where possible. Final reduction via warp shuffles
+// to avoid shared memory bank conflicts in the tail.
+// ============================================================================
 
-  int tid = threadIdx.x;
-  int stride = blockDim.x;
+#define ARGMAX_BLOCK 1024
+#define ARGMAX_NUM_WARPS (ARGMAX_BLOCK / WARP_SIZE)
 
-  float local_max = -INFINITY;
-  int local_idx = 0;
-  for (int i = tid; i < n; i += stride) {
-    float val = __bfloat162float(x[i]);
-    if (val > local_max || (val == local_max && i < local_idx)) {
-      local_max = val;
-      local_idx = i;
+// Warp-level argmax reduction: returns (max_val, max_idx) in lane 0.
+__device__ __forceinline__ void warp_reduce_argmax(float &val, int &idx) {
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        float other_val = __shfl_down_sync(0xffffffff, val, offset);
+        int other_idx = __shfl_down_sync(0xffffffff, idx, offset);
+        if (other_val > val || (other_val == val && other_idx < idx)) {
+            val = other_val;
+            idx = other_idx;
+        }
     }
-  }
-  shared_vals[tid] = local_max;
-  shared_idxs[tid] = local_idx;
-  __syncthreads();
+}
 
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (tid < s) {
-      if (shared_vals[tid + s] > shared_vals[tid] ||
-          (shared_vals[tid + s] == shared_vals[tid] &&
-           shared_idxs[tid + s] < shared_idxs[tid])) {
-        shared_vals[tid] = shared_vals[tid + s];
-        shared_idxs[tid] = shared_idxs[tid + s];
-      }
+__global__ void argmax_kernel_fast(const __nv_bfloat16 *__restrict__ x,
+                                   int *__restrict__ out, int n) {
+    int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+
+    float local_max = -INFINITY;
+    int local_idx = 0;
+
+    // Vectorized bf16x2 loads: process 2 elements per load
+    int n_pairs = n / 2;
+    const __nv_bfloat162 *x2 = (const __nv_bfloat162 *)x;
+    for (int i = tid; i < n_pairs; i += ARGMAX_BLOCK) {
+        __nv_bfloat162 pair = x2[i];
+        float v0 = __bfloat162float(pair.x);
+        float v1 = __bfloat162float(pair.y);
+        int i0 = i * 2;
+        int i1 = i0 + 1;
+        if (v0 > local_max || (v0 == local_max && i0 < local_idx)) {
+            local_max = v0;
+            local_idx = i0;
+        }
+        if (v1 > local_max || (v1 == local_max && i1 < local_idx)) {
+            local_max = v1;
+            local_idx = i1;
+        }
+    }
+    // Handle odd trailing element
+    if (n & 1) {
+        int last = n - 1;
+        if ((last % ARGMAX_BLOCK) == tid || (tid == 0 && ARGMAX_BLOCK > n)) {
+            float v = __bfloat162float(x[last]);
+            if (v > local_max || (v == local_max && last < local_idx)) {
+                local_max = v;
+                local_idx = last;
+            }
+        }
+    }
+
+    // Warp-level reduction
+    warp_reduce_argmax(local_max, local_idx);
+
+    // Write warp results to shared memory
+    __shared__ float warp_vals[ARGMAX_NUM_WARPS];
+    __shared__ int warp_idxs[ARGMAX_NUM_WARPS];
+    if (lane_id == 0) {
+        warp_vals[warp_id] = local_max;
+        warp_idxs[warp_id] = local_idx;
     }
     __syncthreads();
-  }
 
-  if (tid == 0) {
-    out[0] = shared_idxs[0];
-  }
+    // Final reduction in first warp
+    if (warp_id == 0) {
+        float val = (lane_id < ARGMAX_NUM_WARPS) ? warp_vals[lane_id] : -INFINITY;
+        int idx = (lane_id < ARGMAX_NUM_WARPS) ? warp_idxs[lane_id] : 0;
+        warp_reduce_argmax(val, idx);
+        if (lane_id == 0) {
+            out[0] = idx;
+        }
+    }
+}
+
+// ============================================================================
+// Batched argmax: one block per request, processes B logit vectors in one launch
+// ============================================================================
+// Input:  logits [B, vocab_size] contiguous bf16
+// Output: token_ids [B] int32
+// Launch: B blocks of 1024 threads
+// ============================================================================
+
+__global__ void argmax_batch_kernel(const __nv_bfloat16 *__restrict__ logits,
+                                    int *__restrict__ token_ids,
+                                    int vocab_size) {
+    int bid = blockIdx.x;   // request index
+    int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+
+    const __nv_bfloat16 *row = logits + (long long)bid * vocab_size;
+
+    float local_max = -INFINITY;
+    int local_idx = 0;
+
+    // Vectorized bf16x2 loads
+    int n_pairs = vocab_size / 2;
+    const __nv_bfloat162 *row2 = (const __nv_bfloat162 *)row;
+    for (int i = tid; i < n_pairs; i += ARGMAX_BLOCK) {
+        __nv_bfloat162 pair = row2[i];
+        float v0 = __bfloat162float(pair.x);
+        float v1 = __bfloat162float(pair.y);
+        int i0 = i * 2;
+        int i1 = i0 + 1;
+        if (v0 > local_max || (v0 == local_max && i0 < local_idx)) {
+            local_max = v0;
+            local_idx = i0;
+        }
+        if (v1 > local_max || (v1 == local_max && i1 < local_idx)) {
+            local_max = v1;
+            local_idx = i1;
+        }
+    }
+    // Handle odd trailing element
+    if ((vocab_size & 1) && tid == 0) {
+        int last = vocab_size - 1;
+        float v = __bfloat162float(row[last]);
+        if (v > local_max || (v == local_max && last < local_idx)) {
+            local_max = v;
+            local_idx = last;
+        }
+    }
+
+    // Warp-level reduction
+    warp_reduce_argmax(local_max, local_idx);
+
+    // Write warp results to shared memory
+    __shared__ float warp_vals[ARGMAX_NUM_WARPS];
+    __shared__ int warp_idxs[ARGMAX_NUM_WARPS];
+    if (lane_id == 0) {
+        warp_vals[warp_id] = local_max;
+        warp_idxs[warp_id] = local_idx;
+    }
+    __syncthreads();
+
+    // Final reduction in first warp
+    if (warp_id == 0) {
+        float val = (lane_id < ARGMAX_NUM_WARPS) ? warp_vals[lane_id] : -INFINITY;
+        int idx = (lane_id < ARGMAX_NUM_WARPS) ? warp_idxs[lane_id] : 0;
+        warp_reduce_argmax(val, idx);
+        if (lane_id == 0) {
+            token_ids[bid] = idx;
+        }
+    }
 }
 
 // ============================================================================
@@ -302,7 +418,12 @@ __global__ void gpu_sample_kernel(
 
 extern "C" {
 void argmax_cuda(const __nv_bfloat16 *x, int *out, int n, cudaStream_t stream) {
-  argmax_kernel<<<1, SAMPLE_BLOCK, SAMPLE_BLOCK * (sizeof(float) + sizeof(int)), stream>>>(x, out, n);
+  argmax_kernel_fast<<<1, ARGMAX_BLOCK, 0, stream>>>(x, out, n);
+}
+
+void argmax_batch_cuda(const __nv_bfloat16 *logits, int *token_ids,
+                       int batch_size, int vocab_size, cudaStream_t stream) {
+  argmax_batch_kernel<<<batch_size, ARGMAX_BLOCK, 0, stream>>>(logits, token_ids, vocab_size);
 }
 
 void gpu_sample_cuda(const __nv_bfloat16 *logits, float *probs_scratch, int *output,
