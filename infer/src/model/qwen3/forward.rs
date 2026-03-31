@@ -271,6 +271,7 @@ impl ModelForward for Qwen3Model {
         states: &mut [Self::State],
         slot_indices: &[usize],
         paged_kv_pool: Option<&mut crate::paged_kv::PagedKVPool>,
+        decode_bufs_cache: &mut Option<Box<dyn std::any::Any + Send>>,
     ) -> Result<()> {
         if tokens.len() <= 1 {
             if tokens.len() == 1 {
@@ -282,7 +283,40 @@ impl ModelForward for Qwen3Model {
         // Falls back to sequential contiguous decode when pool is stub-sized.
         match paged_kv_pool {
             Some(pool) if !pool.k_buffers.is_empty() => {
-                self.decode_batch(tokens, states, slot_indices, pool)
+                use super::batch_decode::BatchDecodeBuffers;
+
+                // Lazy-init or reuse pre-allocated buffers
+                let bufs = match decode_bufs_cache {
+                    Some(cache) => cache.downcast_mut::<BatchDecodeBuffers>()
+                        .expect("decode_bufs_cache type mismatch"),
+                    None => {
+                        let num_heads = self.config.num_attention_heads;
+                        let num_kv_heads = self.config.num_key_value_heads;
+                        let head_dim = self.config.head_dim;
+                        let q_dim = num_heads * head_dim;
+                        let kv_dim = num_kv_heads * head_dim;
+                        let inter_dim = self.config.intermediate_size;
+                        let max_bs = states.len(); // max possible batch size = num_slots
+                        // max_total_pages: worst case = max_bs * max_seq_len
+                        let max_pages = pool.max_total_tokens;
+                        let b: Box<dyn std::any::Any + Send> = Box::new(
+                            BatchDecodeBuffers::new(
+                                &self.ctx,
+                                self.config.hidden_size,
+                                q_dim,
+                                kv_dim,
+                                inter_dim,
+                                max_bs,
+                                num_heads,
+                                max_pages,
+                            )?
+                        );
+                        *decode_bufs_cache = Some(b);
+                        decode_bufs_cache.as_mut().unwrap()
+                            .downcast_mut::<BatchDecodeBuffers>().unwrap()
+                    }
+                };
+                self.decode_batch(tokens, states, slot_indices, pool, bufs)
             }
             _ => self.decode_batch_contiguous(tokens, states, slot_indices),
         }
