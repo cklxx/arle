@@ -31,10 +31,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # --lib: binaries reference CUDA-only modules and won't compile without GPU.
-      # agent-infer has an optional dynamo submodule not checked out in CI.
+      # Build from infer/ directory (not workspace root) since agent-infer
+      # depends on the dynamo submodule which is not checked out in CI.
       - name: cargo check (CPU-only)
-        run: cargo check --no-default-features --features no-cuda -p pegainfer --lib
+        working-directory: infer
+        run: cargo check --no-default-features --features no-cuda --lib
 
   test:
     name: Test
@@ -57,7 +58,8 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: cargo test (CPU-only)
-        run: cargo test --no-default-features --features no-cuda -p pegainfer --lib
+        working-directory: infer
+        run: cargo test --no-default-features --features no-cuda --lib
 
   clippy:
     name: Clippy
@@ -82,7 +84,8 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: cargo clippy (CPU-only)
-        run: cargo clippy --no-default-features --features no-cuda -p pegainfer --lib -- -D warnings
+        working-directory: infer
+        run: cargo clippy --no-default-features --features no-cuda --lib -- -D warnings
 
   fmt:
     name: Format
@@ -95,7 +98,9 @@ jobs:
         with:
           components: rustfmt
 
+      # fmt runs from infer/ since workspace root needs dynamo submodule.
       - name: cargo fmt check
+        working-directory: infer
         run: cargo fmt --all -- --check
 
   python-test:

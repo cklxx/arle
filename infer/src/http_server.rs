@@ -73,14 +73,16 @@ where
     let usage = delta.usage;
     let is_terminal = delta.finish_reason.is_some();
     let chunk = make_chunk(delta);
-    let mut events = vec![Ok(Event::default()
-        .data(serde_json::to_string(&chunk).expect("chunk serialization")))];
+    let mut events = vec![Ok(
+        Event::default().data(serde_json::to_string(&chunk).expect("chunk serialization"))
+    )];
 
     if include_usage && is_terminal {
         if let Some(u) = usage {
             let usage_chunk = make_usage(u);
-            events.push(Ok(Event::default()
-                .data(serde_json::to_string(&usage_chunk).expect("usage chunk serialization"))));
+            events.push(Ok(Event::default().data(
+                serde_json::to_string(&usage_chunk).expect("usage chunk serialization"),
+            )));
         }
     }
     events
@@ -171,7 +173,10 @@ async fn completions(
             }
         };
 
-        if tokio::time::timeout(RESPONSE_TIMEOUT, collect).await.is_err() {
+        if tokio::time::timeout(RESPONSE_TIMEOUT, collect)
+            .await
+            .is_err()
+        {
             error!(
                 "Non-streaming request timed out after {}s",
                 RESPONSE_TIMEOUT.as_secs()
@@ -253,8 +258,10 @@ async fn chat_completions(
         // First chunk carries the role field.
         let role_event = {
             let chunk = ChatStreamChunk::role_chunk(&request_id, created, &model_id);
-            Ok::<_, Infallible>(Event::default()
-                .data(serde_json::to_string(&chunk).expect("ChatStreamChunk serialization")))
+            Ok::<_, Infallible>(
+                Event::default()
+                    .data(serde_json::to_string(&chunk).expect("ChatStreamChunk serialization")),
+            )
         };
 
         let req_id = request_id;
@@ -295,7 +302,10 @@ async fn chat_completions(
             }
         };
 
-        if tokio::time::timeout(RESPONSE_TIMEOUT, collect).await.is_err() {
+        if tokio::time::timeout(RESPONSE_TIMEOUT, collect)
+            .await
+            .is_err()
+        {
             error!(
                 "Non-streaming chat request timed out after {}s",
                 RESPONSE_TIMEOUT.as_secs()

@@ -540,10 +540,7 @@ impl FlashInferWorkspace {
                 Self::PLAN_INFO_BYTES,
             );
             if err != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                return Err(anyhow!(
-                    "cuMemAllocHost failed for plan_info: {:?}",
-                    err
-                ));
+                return Err(anyhow!("cuMemAllocHost failed for plan_info: {:?}", err));
             }
             // Zero-initialize
             std::ptr::write_bytes(ptr, 0, Self::PLAN_INFO_BYTES);
@@ -596,9 +593,7 @@ impl Drop for FlashInferWorkspace {
         }
         if !self.plan_info.is_null() {
             unsafe {
-                let _ = cudarc::driver::sys::cuMemFreeHost(
-                    self.plan_info as *mut std::ffi::c_void,
-                );
+                let _ = cudarc::driver::sys::cuMemFreeHost(self.plan_info as *mut std::ffi::c_void);
             }
             self.plan_info = std::ptr::null_mut();
         }

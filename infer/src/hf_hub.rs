@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use hf_hub::{
-    api::sync::{Api, ApiBuilder, ApiRepo},
     Repo, RepoType,
+    api::sync::{Api, ApiBuilder, ApiRepo},
 };
 
 /// Resolve a model source string to a local directory containing model files.
@@ -53,11 +53,7 @@ pub fn download_from_hub(model_id: &str) -> Result<PathBuf> {
         .info()
         .with_context(|| format!("failed to fetch repo info for '{model_id}'"))?;
 
-    let filenames: Vec<String> = info
-        .siblings
-        .iter()
-        .map(|s| s.rfilename.clone())
-        .collect();
+    let filenames: Vec<String> = info.siblings.iter().map(|s| s.rfilename.clone()).collect();
 
     log::info!(
         "Hub repo '{}' has {} files — selecting required ones",
@@ -66,11 +62,7 @@ pub fn download_from_hub(model_id: &str) -> Result<PathBuf> {
     );
 
     // ── mandatory files ────────────────────────────────────────────────────
-    let mandatory = [
-        "config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-    ];
+    let mandatory = ["config.json", "tokenizer.json", "tokenizer_config.json"];
     for name in &mandatory {
         if filenames.iter().any(|f| f == name) {
             fetch_file(&repo, name, model_id)?;
@@ -109,9 +101,7 @@ pub fn download_from_hub(model_id: &str) -> Result<PathBuf> {
         .collect();
 
     if weight_files.is_empty() {
-        anyhow::bail!(
-            "no weight files (.safetensors or .bin) found in HF repo '{model_id}'"
-        );
+        anyhow::bail!("no weight files (.safetensors or .bin) found in HF repo '{model_id}'");
     }
 
     for name in &weight_files {
@@ -134,11 +124,7 @@ pub fn download_from_hub(model_id: &str) -> Result<PathBuf> {
         .parent()
         .map_or_else(|| file_path.clone(), Path::to_path_buf);
 
-    log::info!(
-        "Model '{}' ready at: {}",
-        model_id,
-        cache_dir.display()
-    );
+    log::info!("Model '{}' ready at: {}", model_id, cache_dir.display());
     Ok(cache_dir)
 }
 

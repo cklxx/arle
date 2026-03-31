@@ -433,11 +433,8 @@ impl<M: ModelForward> Scheduler<M> {
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Compute the effective max_seq_len for KV cache allocation.
-        let effective_max_seq_len = Self::compute_max_seq_len(
-            &model,
-            num_slots,
-            max_seq_len_override,
-        );
+        let effective_max_seq_len =
+            Self::compute_max_seq_len(&model, num_slots, max_seq_len_override);
 
         let mut states = Vec::with_capacity(num_slots);
         let mut cached_prompts = Vec::with_capacity(num_slots);
@@ -487,8 +484,7 @@ impl<M: ModelForward> Scheduler<M> {
             model_id,
             num_slots,
             seed,
-            effective_max_seq_len
-                .map_or_else(|| "32768 (default)".to_string(), |n| n.to_string()),
+            effective_max_seq_len.map_or_else(|| "32768 (default)".to_string(), |n| n.to_string()),
         );
 
         let waiting_count = Arc::new(AtomicUsize::new(0));
@@ -623,7 +619,10 @@ impl<M: ModelForward> Scheduler<M> {
                 &mut self.decode_bufs,
             ) {
                 // OOM during graph capture is non-fatal — just skip larger batch sizes
-                info!("Warmup: graph capture for B={} failed ({}), skipping larger sizes", bs, e);
+                info!(
+                    "Warmup: graph capture for B={} failed ({}), skipping larger sizes",
+                    bs, e
+                );
                 break;
             }
             let _ = self.model.device_context().sync();
@@ -805,7 +804,10 @@ impl<M: ModelForward> Scheduler<M> {
                 // prompt_tokens is guaranteed non-empty (checked in assign_slots).
                 // Defensive: treat empty as a fatal request error instead of panicking.
                 let Some(&last_tok) = req.prompt_tokens.last() else {
-                    error!("Request {}: prompt_tokens empty on full prefix hit — dropping", req.id);
+                    error!(
+                        "Request {}: prompt_tokens empty on full prefix hit — dropping",
+                        req.id
+                    );
                     req.phase = Phase::Finished;
                     return;
                 };
@@ -847,7 +849,10 @@ impl<M: ModelForward> Scheduler<M> {
             } else {
                 let ctx = self.model.device_context();
                 if let Err(e) = state.migrate_kv_to_paged(ctx, &self.paged_kv_pool, si) {
-                    error!("Request {}: prefix KV migration to pool failed: {}", req.id, e);
+                    error!(
+                        "Request {}: prefix KV migration to pool failed: {}",
+                        req.id, e
+                    );
                     // Non-fatal: pool may have stale data for prefix, but we continue.
                 }
             }
@@ -1050,7 +1055,11 @@ impl<M: ModelForward> Scheduler<M> {
         // Triton and FlashInfer attention kernels produce numerically different
         // results, so greedy (temperature=0) output depends on which path ran.
         let forward_result = model.forward_decode_batch(
-            &token_ids, states, &slot_indices, Some(paged_kv_pool), decode_bufs,
+            &token_ids,
+            states,
+            &slot_indices,
+            Some(paged_kv_pool),
+            decode_bufs,
         );
 
         if let Err(e) = forward_result {
@@ -1062,8 +1071,10 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         // Batched sampling: launch all B kernels, single sync, readback all.
-        let sampling_params: Vec<&crate::sampler::SamplingParams> =
-            decode_indices.iter().map(|&i| &active[i].sampling).collect();
+        let sampling_params: Vec<&crate::sampler::SamplingParams> = decode_indices
+            .iter()
+            .map(|&i| &active[i].sampling)
+            .collect();
 
         match model.select_tokens_batch(states, &slot_indices, &sampling_params, rng) {
             Ok(sampled_tokens) => {
@@ -1305,7 +1316,10 @@ impl BatchScheduler {
         req.kv_tokens += 1;
         let blocks_needed = self.block_manager.blocks_for_tokens(req.kv_tokens);
         if blocks_needed > req.blocks.len() {
-            match self.block_manager.allocate_gpu(blocks_needed - req.blocks.len()) {
+            match self
+                .block_manager
+                .allocate_gpu(blocks_needed - req.blocks.len())
+            {
                 Ok(new_blocks) => req.blocks.extend(new_blocks),
                 Err(_) => return false, // OOM — caller should abort request
             }
@@ -1344,14 +1358,20 @@ impl BatchScheduler {
         // 3. Try to admit one prefill chunk with the remaining token budget.
         //    Skip if any preemption happened this step.
         let decode_tokens = self.running.len(); // 1 token per running request
-        let budget = self.config.max_tokens_per_step.saturating_sub(decode_tokens);
+        let budget = self
+            .config
+            .max_tokens_per_step
+            .saturating_sub(decode_tokens);
         let prefill_batch = (!preempted && has_waiting && budget > 0)
             .then(|| self.try_admit_prefill_chunk(budget))
             .flatten();
 
         // 4. Compose decision.
         match (decode_batch, prefill_batch) {
-            (Some(d), Some(p)) => ScheduleDecision::Mixed { decode: d, prefill: p },
+            (Some(d), Some(p)) => ScheduleDecision::Mixed {
+                decode: d,
+                prefill: p,
+            },
             (Some(d), None) => ScheduleDecision::DecodeBatch(d),
             (None, Some(p)) => ScheduleDecision::PrefillBatch(p),
             (None, None) => ScheduleDecision::Idle,
@@ -1445,7 +1465,11 @@ impl BatchScheduler {
             block_tables.push(req.blocks.clone());
         }
 
-        DecodeBatch { req_ids, input_ids, block_tables }
+        DecodeBatch {
+            req_ids,
+            input_ids,
+            block_tables,
+        }
     }
 
     /// Attempt to emit one prefill chunk for the head of `waiting`.
@@ -1696,7 +1720,10 @@ mod tests {
                 assert_eq!(p.req_ids, vec![id0]);
                 assert_eq!(p.input_ids, vec![1, 2, 3, 4]);
             }
-            other => panic!("expected PrefillBatch, got {:?}", matches!(other, ScheduleDecision::Idle)),
+            other => panic!(
+                "expected PrefillBatch, got {:?}",
+                matches!(other, ScheduleDecision::Idle)
+            ),
         }
         // After prefill of id0 it moved to running; id1 and id2 still waiting.
         assert!(sched.is_running(id0));
@@ -1790,7 +1817,10 @@ mod tests {
         match sched.schedule_step() {
             ScheduleDecision::DecodeBatch(d) => {
                 // id2 should have been preempted; only id0 and id1 decode.
-                assert!(!d.req_ids.contains(&id2), "id2 should be preempted, not decoding");
+                assert!(
+                    !d.req_ids.contains(&id2),
+                    "id2 should be preempted, not decoding"
+                );
                 assert!(d.req_ids.contains(&id0) || d.req_ids.contains(&id1));
             }
             ScheduleDecision::Mixed { decode, .. } => {
@@ -1834,7 +1864,10 @@ mod tests {
                 assert_eq!(p.input_ids[chunk_size - 1], chunk_size as u32);
                 assert_eq!(p.seq_lens, vec![chunk_size]);
             }
-            other => panic!("expected PrefillBatch chunk 1, got Idle={}", matches!(other, ScheduleDecision::Idle)),
+            other => panic!(
+                "expected PrefillBatch chunk 1, got Idle={}",
+                matches!(other, ScheduleDecision::Idle)
+            ),
         }
         // Request still in waiting (partial chunk).
         assert!(!sched.is_running(id));
@@ -1848,7 +1881,10 @@ mod tests {
                 assert_eq!(p.input_ids[0], chunk_size as u32 + 1);
                 assert_eq!(p.seq_lens, vec![chunk_size * 2]);
             }
-            other => panic!("expected PrefillBatch chunk 2, got Idle={}", matches!(other, ScheduleDecision::Idle)),
+            other => panic!(
+                "expected PrefillBatch chunk 2, got Idle={}",
+                matches!(other, ScheduleDecision::Idle)
+            ),
         }
         assert!(!sched.is_running(id));
 
@@ -1860,7 +1896,10 @@ mod tests {
                 assert_eq!(p.input_ids[0], 17);
                 assert_eq!(p.seq_lens, vec![20]);
             }
-            other => panic!("expected PrefillBatch final chunk, got Idle={}", matches!(other, ScheduleDecision::Idle)),
+            other => panic!(
+                "expected PrefillBatch final chunk, got Idle={}",
+                matches!(other, ScheduleDecision::Idle)
+            ),
         }
         // After last chunk the request moves to running.
         assert!(sched.is_running(id));

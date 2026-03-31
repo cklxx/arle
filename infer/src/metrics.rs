@@ -351,11 +351,7 @@ impl ServerMetrics {
 
         out.push_str("# HELP infer_kv_gpu_utilization GPU KV cache utilization [0,1].\n");
         out.push_str("# TYPE infer_kv_gpu_utilization gauge\n");
-        writeln!(
-            out,
-            "infer_kv_gpu_utilization{{{labels}}} {utilization:.4}"
-        )
-        .unwrap();
+        writeln!(out, "infer_kv_gpu_utilization{{{labels}}} {utilization:.4}").unwrap();
 
         out.push_str("# HELP infer_kv_gpu_blocks_free Free GPU KV cache blocks.\n");
         out.push_str("# TYPE infer_kv_gpu_blocks_free gauge\n");

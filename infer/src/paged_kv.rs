@@ -313,9 +313,9 @@ impl TokenKVPool {
                     max_seq_len_contiguous as i32,
                     seq_len as i32,
                     self.num_kv_heads as i32,
-                    1,                   // page_size = 1
+                    1, // page_size = 1
                     self.head_dim as i32,
-                    self.kv_dim as i32,  // stride_page = kv_dim (one token row)
+                    self.kv_dim as i32, // stride_page = kv_dim (one token row)
                     ctx.stream.cu_stream(),
                 );
             }
