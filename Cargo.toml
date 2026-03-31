@@ -10,6 +10,8 @@ cuda = ["pegainfer/cuda"]
 dynamo = ["dep:dynamo-runtime", "dep:tokio"]
 # Marker feature for CPU-only builds (CI, macOS). Pass --no-default-features --features no-cuda.
 no-cuda = ["pegainfer/no-cuda"]
+# Metal backend via mlx-rs (Apple Silicon). Use with --no-default-features --features metal,no-cuda.
+metal = ["pegainfer/metal"]
 
 [dependencies]
 dynamo-runtime = { path = "dynamo/lib/runtime", optional = true }

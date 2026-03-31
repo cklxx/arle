@@ -19,11 +19,6 @@ Usage (GPU server):
 
 Usage (local mock server, no GPU):
   python3 scripts/bench_throughput.py --mock --num-prompts 20 --concurrency 4
-
-Usage (MLX backend, Apple Silicon — starts a local MLX server automatically):
-  python3 scripts/bench_throughput.py --backend mlx \\
-      --mlx-model mlx-community/Qwen2.5-0.5B-Instruct-4bit \\
-      --num-prompts 20 --concurrency 1 --max-tokens 64
 """
 
 import argparse
@@ -31,7 +26,6 @@ import asyncio
 import json
 import random
 import statistics
-import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -484,16 +478,6 @@ def parse_args():
                    help="Per-token delay in mock server (default: 5ms)")
     p.add_argument("--mock-tokens", type=int, default=32,
                    help="Tokens per mock response (default: 32)")
-    # MLX backend
-    p.add_argument("--backend", choices=["default", "mlx"], default="default",
-                   help="Inference backend: 'default' (external server) or 'mlx' "
-                        "(start a local MLX server automatically, Apple Silicon only)")
-    p.add_argument("--mlx-model",
-                   default="mlx-community/Qwen2.5-0.5B-Instruct-4bit",
-                   help="HuggingFace repo or local path for --backend mlx "
-                        "(default: mlx-community/Qwen2.5-0.5B-Instruct-4bit)")
-    p.add_argument("--mlx-port", type=int, default=18080,
-                   help="Port for the auto-started MLX server (default: 18080)")
     return p.parse_args()
 
 
@@ -501,7 +485,6 @@ async def async_main():
     args = parse_args()
 
     server_task = None
-    mlx_proc = None
 
     # ------------------------------------------------------------------ mock
     if args.mock:
@@ -514,45 +497,6 @@ async def async_main():
             _mock_server_raw(host, port, args.mock_tokens, args.mock_delay_ms)
         )
         await asyncio.sleep(0.2)  # let server start
-
-    # ------------------------------------------------------------------ MLX
-    elif args.backend == "mlx":
-        host = "127.0.0.1"
-        port = args.mlx_port
-        url = f"http://{host}:{port}"
-        model = args.mlx_model or args.model
-        if not model:
-            sys.exit("--mlx-model (or --model) is required with --backend mlx")
-        print(f"Starting MLX server on {url}  model={model} ...")
-        mlx_proc = subprocess.Popen(
-            [
-                sys.executable, "-m", "agent_infer.mlx_server",
-                "--model", model,
-                "--host", host,
-                "--port", str(port),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        # Wait until the server is accepting connections (up to 120 s for model load).
-        deadline = time.perf_counter() + 120
-        import socket
-        while time.perf_counter() < deadline:
-            try:
-                with socket.create_connection((host, port), timeout=1):
-                    break
-            except OSError:
-                if mlx_proc.poll() is not None:
-                    out, _ = mlx_proc.communicate()
-                    sys.exit(f"MLX server exited unexpectedly:\n{out.decode()}")
-                await asyncio.sleep(1)
-        else:
-            mlx_proc.terminate()
-            sys.exit(f"MLX server did not start within 120 s on {url}")
-        print(f"MLX server is up.")
-        # Use the mlx model name for the benchmark request header.
-        if not args.model:
-            args.model = model
 
     else:
         url = args.url
@@ -597,12 +541,6 @@ async def async_main():
 
     if server_task:
         server_task.cancel()
-    if mlx_proc is not None:
-        mlx_proc.terminate()
-        try:
-            mlx_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            mlx_proc.kill()
 
 
 def main():
