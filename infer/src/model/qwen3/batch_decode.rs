@@ -182,6 +182,7 @@ impl Qwen3Model {
         tokens: &[u32],
         states: &mut [Qwen3State],
         slot_indices: &[usize],
+        skip_logit_scatter: bool,
         paged_kv_pool: &mut PagedKVPool,
         bufs: &mut BatchDecodeBuffers,
     ) -> Result<()> {
@@ -311,14 +312,15 @@ impl Qwen3Model {
             }
         }
 
-        // Extract per-slot logits directly into each state's pre-allocated decode_bufs.logits.
-        // This avoids GPU memory allocation on every step (the previous path allocated
-        // a new DeviceVec per request per step via extract_vec).
-        let logits = bufs.logits_batch.as_ref().unwrap();
-        for (b, &si) in slot_indices.iter().enumerate() {
-            ops::extract_vec_into(&self.ctx, logits, b, &mut states[si].decode_bufs.logits)?;
-            // Clear prefill_logits so select_tokens_batch reads from decode_bufs.logits.
-            states[si].prefill_logits = None;
+        // Scatter per-slot logits only when needed (non-greedy fallback).
+        // When skip_logit_scatter is true, sample_batch_greedy reads logits_batch
+        // directly — skipping B D2D copies.
+        if !skip_logit_scatter {
+            let logits = bufs.logits_batch.as_ref().unwrap();
+            for (b, &si) in slot_indices.iter().enumerate() {
+                ops::extract_vec_into(&self.ctx, logits, b, &mut states[si].decode_bufs.logits)?;
+                states[si].prefill_logits = None;
+            }
         }
 
         Ok(())

@@ -617,6 +617,7 @@ impl<M: ModelForward> Scheduler<M> {
                 si,
                 Some(&mut self.paged_kv_pool),
                 &mut self.decode_bufs,
+                false, // warmup: need logit scatter for graph capture
             ) {
                 // OOM during graph capture is non-fatal — just skip larger batch sizes
                 info!(
@@ -1066,12 +1067,22 @@ impl<M: ModelForward> Scheduler<M> {
         // larger batch, FlashInfer reads stale pool data. Additionally, the
         // Triton and FlashInfer attention kernels produce numerically different
         // results, so greedy (temperature=0) output depends on which path ran.
+        // Check greedy early — tells forward to skip D2D logit scatter.
+        let sampling_params: Vec<&crate::sampler::SamplingParams> = decode_indices
+            .iter()
+            .map(|&i| &active[i].sampling)
+            .collect();
+        let all_greedy = sampling_params
+            .iter()
+            .all(|p| p.is_greedy() && !p.has_penalties());
+
         let forward_result = model.forward_decode_batch(
             &token_ids,
             states,
             &slot_indices,
             Some(paged_kv_pool),
             decode_bufs,
+            all_greedy,
         );
 
         if let Err(e) = forward_result {
@@ -1081,16 +1092,6 @@ impl<M: ModelForward> Scheduler<M> {
             }
             return;
         }
-
-        // Batched sampling: launch all B kernels, single sync, readback all.
-        let sampling_params: Vec<&crate::sampler::SamplingParams> = decode_indices
-            .iter()
-            .map(|&i| &active[i].sampling)
-            .collect();
-
-        let all_greedy = sampling_params
-            .iter()
-            .all(|p| p.is_greedy() && !p.has_penalties());
         let sampled_result = if all_greedy {
             match model.sample_batch_greedy(&slot_indices, decode_bufs) {
                 Ok(Some(tokens)) => Ok(tokens),

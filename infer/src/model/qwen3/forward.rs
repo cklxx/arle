@@ -316,6 +316,7 @@ impl ModelForward for Qwen3Model {
         slot_indices: &[usize],
         paged_kv_pool: Option<&mut crate::paged_kv::PagedKVPool>,
         decode_bufs_cache: &mut Option<Box<dyn std::any::Any + Send>>,
+        skip_logit_scatter: bool,
     ) -> Result<()> {
         if tokens.is_empty() {
             return Ok(());
@@ -363,7 +364,7 @@ impl ModelForward for Qwen3Model {
                             .unwrap()
                     }
                 };
-                self.decode_batch(tokens, states, slot_indices, pool, bufs)
+                self.decode_batch(tokens, states, slot_indices, skip_logit_scatter, pool, bufs)
             }
             _ => self.decode_batch_contiguous(tokens, states, slot_indices),
         }
