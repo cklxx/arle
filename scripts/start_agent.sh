@@ -5,11 +5,11 @@
 #   ./scripts/start_agent.sh [mode] [url]
 #
 # Modes:
-#   direct  - Connect directly to pegainfer (default)
+#   direct  - Connect directly to infer (default)
 #   dynamo  - Connect to Dynamo frontend
 #
 # Examples:
-#   ./scripts/start_agent.sh                                    # direct to pegainfer
+#   ./scripts/start_agent.sh                                    # direct to infer
 #   ./scripts/start_agent.sh dynamo http://localhost:8080        # via dynamo
 
 set -euo pipefail

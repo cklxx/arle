@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-request benchmark for pegainfer scheduler."""
+"""Multi-request benchmark for infer scheduler."""
 
 import asyncio
 import time

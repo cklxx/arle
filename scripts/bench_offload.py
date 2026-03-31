@@ -16,7 +16,7 @@ import re
 import sys
 import os
 
-MODEL_PATH = sys.argv[1] if len(sys.argv) > 1 else "pegainfer/models/Qwen3-4B"
+MODEL_PATH = sys.argv[1] if len(sys.argv) > 1 else "infer/models/Qwen3-4B"
 
 # Shared long system prompt (simulates agent tool definitions + context)
 SYSTEM_PREFIX = (
@@ -42,16 +42,16 @@ QUERIES = [
 
 def run_queries(label: str, max_gpu_kv: int | None, evict_between: bool) -> dict:
     """Run all queries sequentially, measuring time per query."""
-    # Start pegainfer HTTP server
+    # Start infer HTTP server
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = "/usr/lib64-nvidia:/usr/local/cuda/lib64"
 
     # Kill any existing server
-    subprocess.run(["pkill", "-9", "-f", "target/release/pegainfer"], capture_output=True)
+    subprocess.run(["pkill", "-9", "-f", "target/release/infer"], capture_output=True)
     time.sleep(1)
 
     server = subprocess.Popen(
-        ["./pegainfer/target/release/pegainfer",
+        ["./infer/target/release/infer",
          "--model-path", MODEL_PATH,
          "--port", "8100",
          "--cuda-graph=false"],

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use log::info;
 
-use pegainfer::sampler::SamplingParams;
-use pegainfer::server_engine::{CompleteRequest, ServerEngine};
+use infer::sampler::SamplingParams;
+use infer::server_engine::{CompleteRequest, ServerEngine};
 
 use crate::chat::{Message, format_prompt, parse_tool_calls};
 use crate::tools::{Tool, execute_tool};

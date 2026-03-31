@@ -1,6 +1,6 @@
 # agent-infer
 
-Pure Rust LLM inference engine with multi-turn agent tool-calling. Built on **Pegainfer** (Rust+CUDA inference) + **Dynamo** (distributed orchestration).
+Pure Rust LLM inference engine with multi-turn agent tool-calling. Built on **Infer** (Rust+CUDA inference) + **Dynamo** (distributed orchestration).
 
 **No Python glue** — GPU inference calls go directly from Rust to CUDA kernels.
 
@@ -22,7 +22,7 @@ CUDA_HOME=/usr/local/cuda cargo build --release
 ./target/release/agent-infer --model-path /path/to/Qwen3-8B
 
 # Run OpenAI-compatible HTTP server
-./target/release/pegainfer --model-path /path/to/Qwen3-8B --port 8000
+./target/release/infer --model-path /path/to/Qwen3-8B --port 8000
 ```
 
 ---
@@ -43,7 +43,7 @@ User
                            │  (linked library)
                            ▼
 ┌─────────────────────────────────────────────────────────┐
-│  pegainfer  (pegainfer/src/)                            │
+│  infer  (infer/src/)                            │
 │                                                         │
 │  HTTP layer          Scheduler          Sampler         │
 │  /v1/completions  ──▶ continuous  ──▶  top-k/p/temp    │
@@ -61,7 +61,7 @@ User
                            │  CUDA kernels
                            ▼
          FlashAttention-2 · RMSNorm · GEMM/GEMV · Sampling
-                    (Triton + CUDA C, pegainfer/csrc/)
+                    (Triton + CUDA C, infer/csrc/)
 ```
 
 ---
@@ -82,7 +82,7 @@ User
 
 ## API
 
-Pegainfer exposes an OpenAI-compatible REST API.
+Infer exposes an OpenAI-compatible REST API.
 
 ### POST /v1/completions
 
@@ -125,9 +125,9 @@ curl http://localhost:8000/v1/chat/completions \
 Prometheus text format. Compatible with any Prometheus scraper.
 
 ```
-pegainfer_requests_total{model="Qwen3-8B"} 42
-pegainfer_ttft_seconds_bucket{le="0.100"} 38
-pegainfer_kv_gpu_utilization{model="Qwen3-8B"} 0.7200
+infer_requests_total{model="Qwen3-8B"} 42
+infer_ttft_seconds_bucket{le="0.100"} 38
+infer_kv_gpu_utilization{model="Qwen3-8B"} 0.7200
 ...
 ```
 
@@ -171,7 +171,7 @@ requests=42 active=2 waiting=0 tokens_out=3891 kv_util=72.0% ttft_p50=85ms ttft_
 ## Server Options
 
 ```bash
-./target/release/pegainfer \
+./target/release/infer \
   --model-path /path/to/model  \  # Required
   --port 8000                  \  # Default: 8000
   --num-slots 4                \  # Concurrent request slots (each gets own KV cache)
@@ -257,7 +257,7 @@ agent-infer/
 │   ├── chat.rs                  # ChatML formatter + <tool_call> parser
 │   ├── tools.rs                 # shell / python tool execution
 │   └── dynamo_integration.rs    # Dynamo runtime bridge
-├── pegainfer/                   # Inference engine (Rust library)
+├── infer/                   # Inference engine (Rust library)
 │   ├── src/
 │   │   ├── model/               # Qwen3, Qwen3.5 implementations
 │   │   ├── ops/                 # GPU ops: attention, linear, norm, sampling
@@ -298,7 +298,7 @@ cargo build --release --features dynamo
 cargo test --no-default-features --features no-cuda --workspace
 
 # GPU integration tests (requires model weights)
-PEGAINFER_TEST_MODEL_PATH=pegainfer/models/Qwen3-4B \
+PEGAINFER_TEST_MODEL_PATH=infer/models/Qwen3-4B \
   cargo test --release --test e2e
 
 # Lint
@@ -310,10 +310,10 @@ cargo fmt --all -- --check
 
 ### Adding a New Model
 
-1. Create `pegainfer/src/model/<name>/` with `config.rs`, `weights.rs`, `forward.rs`
-2. Implement the `ModelForward` trait (see `pegainfer/src/model.rs`)
-3. Register the architecture string in `pegainfer/src/model_registry.rs`
-4. Add `ModelType` variant in `pegainfer/src/server_engine.rs`
+1. Create `infer/src/model/<name>/` with `config.rs`, `weights.rs`, `forward.rs`
+2. Implement the `ModelForward` trait (see `infer/src/model.rs`)
+3. Register the architecture string in `infer/src/model_registry.rs`
+4. Add `ModelType` variant in `infer/src/server_engine.rs`
 
 ---
 

@@ -27,15 +27,15 @@ use dynamo_runtime::{
 };
 use tokio::sync::mpsc;
 
-use pegainfer::sampler::SamplingParams;
-use pegainfer::scheduler::{IncomingRequest, SchedulerHandle};
+use infer::sampler::SamplingParams;
+use infer::scheduler::{IncomingRequest, SchedulerHandle};
 
 const NAMESPACE: &str = "dynamo";
 const COMPONENT: &str = "agent-infer";
 const ENDPOINT: &str = "generate";
 
 /// Request handler that wraps agent-infer's generate capability and exposes
-/// it as a Dynamo endpoint. Forwards requests to the pegainfer scheduler.
+/// it as a Dynamo endpoint. Forwards requests to the infer scheduler.
 struct AgentEndpoint {
     handle: SchedulerHandle,
 }

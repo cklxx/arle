@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Concurrent request test suite for pegainfer scheduler.
+"""Concurrent request test suite for infer scheduler.
 
 Tests multi-request concurrency, streaming, interleaved scheduling,
-stop sequences, and stress behavior against the pegainfer OpenAI-compatible
+stop sequences, and stress behavior against the infer OpenAI-compatible
 completions endpoint.
 
 Usage:

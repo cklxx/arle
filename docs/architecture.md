@@ -16,7 +16,7 @@
                                  │ ServerEngine trait (single-request)
                                  │
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│                       pegainfer HTTP Server (pegainfer/src/main.rs)          │
+│                       infer HTTP Server (infer/src/main.rs)          │
 │                                                                              │
 │   HTTP POST /v1/completions                                                  │
 │   HTTP POST /v1/chat/completions ──► axum handler (http_server.rs)          │
@@ -114,12 +114,12 @@
 
 ```
 agent-infer (src/)
-├── agent.rs         ← uses ServerEngine trait from pegainfer
-├── chat.rs          ← uses pegainfer::chat (ChatML formatting)
-├── tools.rs         ← pure Rust, no pegainfer dep
+├── agent.rs         ← uses ServerEngine trait from infer
+├── chat.rs          ← uses infer::chat (ChatML formatting)
+├── tools.rs         ← pure Rust, no infer dep
 └── dynamo_integration.rs  ← uses SchedulerHandle, Scheduler, model types
 
-pegainfer/src/
+infer/src/
 ├── lib.rs           ← re-exports all public modules
 │
 ├── [CUDA-gated — only compiled with feature = "cuda"]
@@ -476,7 +476,7 @@ Preemption (PreemptionMode):
 
 ## G. Module Responsibilities (One-Liner Each)
 
-### pegainfer/src/ — Core Inference Engine
+### infer/src/ — Core Inference Engine
 
 | Module | Responsibility |
 |--------|----------------|
@@ -537,7 +537,7 @@ Preemption (PreemptionMode):
 | `tools.rs` | Builtin tool definitions (functions the agent can call) |
 | `dynamo_integration.rs` | Register with Dynamo distributed runtime for service discovery + KV routing |
 
-### CUDA Kernels (pegainfer/csrc/)
+### CUDA Kernels (infer/csrc/)
 
 | File | Responsibility |
 |------|----------------|
@@ -553,7 +553,7 @@ Preemption (PreemptionMode):
 | `gated_delta_rule.cu` | Gated delta rule (Qwen3.5 linear attention mechanism) |
 | `sampling.cu` | Top-k, top-p, temperature GPU sampling |
 
-### Triton Kernels (pegainfer/tools/triton/)
+### Triton Kernels (infer/tools/triton/)
 
 | File | Responsibility |
 |------|----------------|

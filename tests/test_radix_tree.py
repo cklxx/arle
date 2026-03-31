@@ -1,7 +1,7 @@
 """
 Radix tree prefix cache tests — no GPU required.
 
-Pure Python port of pegainfer/src/prefix_cache.rs.
+Pure Python port of infer/src/prefix_cache.rs.
 Tests node insertion, longest-prefix matching, reference counting,
 LRU eviction, and edge cases.
 
@@ -44,7 +44,7 @@ class _Node:
 
 
 class RadixCache:
-    """Pure Python port of pegainfer::prefix_cache::RadixCache."""
+    """Pure Python port of infer::prefix_cache::RadixCache."""
 
     def __init__(self, block_size: int):
         assert block_size > 0, "block_size must be > 0"

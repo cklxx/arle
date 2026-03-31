@@ -1,7 +1,7 @@
 """
 KV cache metadata and management tests — no GPU required.
 
-Models the CPU-side metadata tracking of pegainfer/src/model/kv_cache.rs.
+Models the CPU-side metadata tracking of infer/src/model/kv_cache.rs.
 Tests sequence length tracking, CPU/GPU offload boundaries, prefix
 truncation, and block-aligned operations — all without actual GPU memory.
 
