@@ -279,6 +279,7 @@ impl ModelForward for Qwen3Model {
             }
             return Ok(());
         }
+        log::info!("forward_decode_batch: B={}, pool={}", tokens.len(), paged_kv_pool.as_ref().map_or(false, |p| !p.k_buffers.is_empty()));
         // FlashInfer token-pool path: use paged decode when pool has data.
         // Falls back to sequential contiguous decode when pool is stub-sized.
         match paged_kv_pool {
