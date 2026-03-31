@@ -13,16 +13,16 @@ Pure Rust LLM inference engine with multi-turn agent tool-calling. Built on **In
 | TTFT (C=1) | **17.9ms** | 40.5ms | **2.3x faster** |
 | Throughput C=1 | 119.5 tok/s | 121.0 tok/s | **0.99x** |
 | Throughput C=4 | 414.8 tok/s | 419.4 tok/s | **0.99x** |
-| Throughput C=8 | 417.2 tok/s | 814.8 tok/s | **0.51x** |
+| Throughput C=8 | 710.9 tok/s | 814.8 tok/s | **0.87x** |
 | ITL (decode step) | 8.3ms | 8.0ms | 1.04x |
 
-**Benchmark parameters**: 50 synthetic prompts, max_tokens=128, temperature=0 (greedy), same machine/GPU.
+**Benchmark parameters**: 50 synthetic prompts, max_tokens=128, temperature=0 (greedy), same A100-40GB GPU. agent-infer: `--num-slots 8`; SGLang: `--disable-radix-cache`.
 
 **TTFT lead**: Rust runtime eliminates Python dispatch overhead; CUDA Graph decode removes per-step CPU→GPU launches.
 
 **Single-request parity**: At C=1, agent-infer matches SGLang throughput (119.5 vs 121.0 tok/s) with 2.3x faster first-token latency.
 
-**Concurrent gap**: At C=8, agent-infer's 4-slot scheduler saturates at C=4 throughput. SGLang scales to higher concurrency with its mature batching system. This is the primary optimization target.
+**Concurrent throughput**: At C=8, agent-infer reaches **0.87x** of SGLang (711 vs 815 tok/s). Remaining gap is from prefill/decode interleaving overhead and batched attention scheduling efficiency.
 
 ---
 
@@ -272,7 +272,7 @@ python3 scripts/bench_multi_request.py --url http://localhost:8000
 |-------------|-------------------|--------------|-------------|---------------|
 | 1 | 119.5 | 121.0 | **17.9ms** | 40.5ms |
 | 4 | 414.8 | 419.4 | **53.1ms** | 137.0ms |
-| 8 | 417.2 | 814.8 | 1123ms | 78.1ms |
+| 8 | 710.9 | 814.8 | 68.7ms | 78.1ms |
 
 ### Agent Benchmark Results
 
@@ -286,7 +286,7 @@ python3 scripts/bench_multi_request.py --url http://localhost:8000
 - GPU: NVIDIA A100-SXM4-40GB
 - Driver: 580.82.07 / CUDA 13.0
 - SGLang: v0.5.9 (FlashInfer backend, `--disable-radix-cache`)
-- agent-infer: `--num-slots 4 --cuda-graph true`
+- agent-infer: `--num-slots 8 --cuda-graph true`
 - Benchmark: `bench_throughput.py --dataset synthetic --num-prompts 50 --max-tokens 128 --temperature 0 --seed 42`
 
 ---
