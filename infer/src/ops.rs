@@ -3,6 +3,7 @@
 mod attention;
 mod elementwise;
 mod embedding;
+mod kv_ops;
 mod linear;
 mod norm;
 mod recurrent;
@@ -18,6 +19,7 @@ pub use attention::{
     prefill_attention_batch, prefill_attention_hd256_batch,
     prefill_attention_hd256_batch_with_scratch,
 };
+pub use kv_ops::scatter_write_kv;
 pub use elementwise::{add_batch, silu_mul_batch};
 pub use embedding::{embedding_batch, embedding_decode_into};
 pub use linear::{fused_mlp_into, gemm, gemv};

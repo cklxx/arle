@@ -445,15 +445,25 @@ impl<M: ModelForward> Scheduler<M> {
             info!("Initialized state slot {}/{}", i + 1, num_slots);
         }
 
-        // Create the paged KV pool for batched decode.
-        // Query available GPU memory and allocate a budget for paged KV.
+        // Create the token-level KV pool for batched decode.
+        // Budget: query remaining GPU memory AFTER contiguous KV caches are accounted for.
+        // Contiguous caches are lazy-allocated (1024 tokens/slot max), so we subtract their
+        // expected cost and reserve 2 GB headroom for batch decode buffers + scratch.
         let paged_kv_pool = {
-            use crate::paged_kv::DEFAULT_PAGE_SIZE;
-            use crate::tensor::DeviceContext;
+            let contiguous_max = effective_max_seq_len.unwrap_or(1024);
+            let bytes_per_token = model.kv_cache_bytes_per_token();
+            let contiguous_cost = num_slots * contiguous_max * bytes_per_token;
+            let headroom: usize = 2 * 1024 * 1024 * 1024; // 2 GB
+            let budget_bytes = match crate::tensor::DeviceContext::gpu_memory_info() {
+                Ok((free, _)) => free.saturating_sub(contiguous_cost + headroom),
+                Err(_) => 4 * 1024 * 1024 * 1024, // 4 GB fallback
+            };
 
-            // Paged pool stub: 0 budget. FlashInfer decode path needs debugging
-            // before enabling (KV migration produces incorrect attention output).
-            let budget_bytes: usize = 0;
+            info!(
+                "TokenKVPool budget: {:.1} GB (contiguous KV={:.1} GB, headroom=2 GB)",
+                budget_bytes as f64 / 1e9,
+                (contiguous_cost) as f64 / 1e9,
+            );
 
             let ctx = model.device_context();
             PagedKVPool::new(
@@ -461,7 +471,6 @@ impl<M: ModelForward> Scheduler<M> {
                 model.num_kv_layers(),
                 model.num_kv_heads(),
                 model.head_dim(),
-                DEFAULT_PAGE_SIZE,
                 num_slots,
                 budget_bytes,
             )?
@@ -518,7 +527,9 @@ impl<M: ModelForward> Scheduler<M> {
     ) -> Option<usize> {
         use crate::tensor::DeviceContext;
 
-        const DEFAULT_MAX_SEQ: usize = 32768;
+        // Contiguous KV cache only needs to hold one prefill chunk — all decode
+        // reads come from the TokenKVPool. Keep this small to leave memory for the pool.
+        const DEFAULT_MAX_SEQ: usize = 1024; // = 2x PREFILL_CHUNK_SIZE headroom
         const RESERVED_BYTES: usize = 512 * 1024 * 1024;
         const MIN_SEQ_LEN: usize = 256;
 
@@ -637,9 +648,9 @@ impl<M: ModelForward> Scheduler<M> {
                 self.waiting.len()
             );
 
-            // Pre-allocate paged KV pages for the prompt (best-effort; pool is stub-sized).
-            let prompt_len = prompt_tokens.len();
-            let _ = self.paged_kv_pool.grow_slot(slot_idx, prompt_len); // non-fatal
+            // Pool token allocation is deferred to step_prefill_chunk / step_decode_batch.
+            // Each prefill chunk allocates its own pool tokens and scatter-writes K/V.
+            // Decode allocates 1 token per step.
 
             self.active.push(ActiveRequest {
                 id,
@@ -765,6 +776,21 @@ impl<M: ModelForward> Scheduler<M> {
             req.prompt_tokens.clone()
         };
 
+        // If prefix tokens were reused, allocate pool slots for them and migrate
+        // their KV from the contiguous cache so batched decode can read from the pool.
+        if prefix_len > 0 && !self.paged_kv_pool.k_buffers.is_empty() {
+            if let Err(e) = self.paged_kv_pool.alloc_tokens(si, prefix_len) {
+                error!("Request {}: pool alloc for prefix failed: {}", req.id, e);
+                // Non-fatal: batched decode will fall back to contiguous path.
+            } else {
+                let ctx = self.model.device_context();
+                if let Err(e) = state.migrate_kv_to_paged(ctx, &self.paged_kv_pool, si) {
+                    error!("Request {}: prefix KV migration to pool failed: {}", req.id, e);
+                    // Non-fatal: pool may have stale data for prefix, but we continue.
+                }
+            }
+        }
+
         info!(
             "Request {}: chunked prefill starting ({} effective tokens, chunk_size={})",
             req.id,
@@ -812,10 +838,47 @@ impl<M: ModelForward> Scheduler<M> {
         let chunk_end = (*progress + PREFILL_CHUNK_SIZE).min(total);
         let chunk = &effective_tokens[*progress..chunk_end];
 
-        let state = &mut states[req.slot_idx];
+        let slot_idx = req.slot_idx;
+        let state = &mut states[slot_idx];
 
-        // Run forward pass for this chunk
-        if let Err(e) = model.forward(chunk, state) {
+        // Run forward pass for this chunk, scatter-writing K/V to pool if available.
+        let forward_result = if !paged_kv_pool.k_buffers.is_empty() {
+            // Allocate pool token slots for this chunk.
+            let chunk_len = chunk.len();
+            match paged_kv_pool.alloc_tokens(slot_idx, chunk_len) {
+                Ok(new_indices) => {
+                    // Upload pool indices to GPU as i32.
+                    let indices_i32: Vec<i32> = new_indices.iter().map(|&i| i as i32).collect();
+                    let ctx = model.device_context();
+                    match ctx.stream.clone_htod(&indices_i32) {
+                        Ok(indices_gpu) => {
+                            model.forward_prefill_with_pool(
+                                chunk,
+                                state,
+                                paged_kv_pool,
+                                slot_idx,
+                                &indices_gpu,
+                            )
+                        }
+                        Err(e) => {
+                            error!("Request {}: H2D token indices failed: {}", req.id, e);
+                            // Fall back to non-pool path.
+                            model.forward(chunk, state)
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Request {}: pool alloc for chunk failed: {}", req.id, e);
+                    // Fall back to non-pool path.
+                    model.forward(chunk, state)
+                }
+            }
+        } else {
+            // No pool — use standard prefill path.
+            model.forward(chunk, state)
+        };
+
+        if let Err(e) = forward_result {
             error!("Request {}: prefill chunk failed: {}", req.id, e);
             req.phase = Phase::Finished;
             return;
@@ -921,9 +984,12 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let slot_indices: Vec<usize> = decode_indices.iter().map(|&i| active[i].slot_idx).collect();
 
-        // Grow paged KV (best-effort; pool is stub-sized until FlashInfer fully wired).
+        // Allocate one token slot per decode request for the new token.
         for &slot in &slot_indices {
-            let _ = paged_kv_pool.grow_slot(slot, 1); // non-fatal
+            if let Err(e) = paged_kv_pool.alloc_tokens(slot, 1) {
+                error!("Pool alloc for decode token (slot {}) failed: {}", slot, e);
+                // Non-fatal: decode_batch will fall back to contiguous path if pool is empty.
+            }
         }
 
         // Run forward pass
