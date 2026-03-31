@@ -2,6 +2,7 @@ mod openai_v1;
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -14,6 +15,10 @@ use axum::{
 use futures_util::{StreamExt, stream};
 use log::{error, info, warn};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+
+/// Maximum wall-clock time allowed for a non-streaming request to complete.
+/// Streaming responses have natural per-chunk flow control and are not capped here.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 use crate::metrics::ServerMetrics;
 use crate::sampler::sampling_params_from_request;
@@ -36,6 +41,49 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+// ============================================================================
+// SSE helpers — shared between /v1/completions and /v1/chat/completions
+// ============================================================================
+
+/// Returns the terminal `[DONE]` SSE event that ends every streaming response.
+fn sse_done_stream() -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
+    stream::once(async { Ok::<_, Infallible>(Event::default().data("[DONE]")) })
+}
+
+/// Build the SSE event(s) for a single [`StreamDelta`].
+///
+/// Always returns one event for the main chunk. If `include_usage` is true and
+/// this is the terminal delta (has a finish_reason), appends a second event with
+/// usage statistics.
+///
+/// `make_chunk` converts the delta into the serializable chunk type.
+/// `make_usage` converts [`Usage`] into the serializable usage-chunk type.
+fn delta_sse_events<C, U>(
+    delta: crate::server_engine::StreamDelta,
+    include_usage: bool,
+    make_chunk: impl FnOnce(crate::server_engine::StreamDelta) -> C,
+    make_usage: impl FnOnce(crate::server_engine::Usage) -> U,
+) -> Vec<Result<Event, Infallible>>
+where
+    C: serde::Serialize,
+    U: serde::Serialize,
+{
+    let usage = delta.usage;
+    let is_terminal = delta.finish_reason.is_some();
+    let chunk = make_chunk(delta);
+    let mut events = vec![Ok(Event::default()
+        .data(serde_json::to_string(&chunk).expect("chunk serialization")))];
+
+    if include_usage && is_terminal {
+        if let Some(u) = usage {
+            let usage_chunk = make_usage(u);
+            events.push(Ok(Event::default()
+                .data(serde_json::to_string(&usage_chunk).expect("usage chunk serialization"))));
+        }
+    }
+    events
 }
 
 async fn completions(
@@ -90,37 +138,18 @@ async fn completions(
         let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
         let created = now_secs();
 
-        let stream = UnboundedReceiverStream::new(delta_rx).flat_map(move |delta| {
-            let usage = delta.usage;
-            let is_terminal = delta.finish_reason.is_some();
-
-            let chunk = StreamChunk::from_delta(&request_id, created, &model_id, delta);
-            let mut events = vec![Ok::<_, Infallible>(
-                Event::default()
-                    .data(serde_json::to_string(&chunk).expect("StreamChunk serialization")),
-            )];
-
-            if include_usage
-                && is_terminal
-                && let Some(usage) = usage
-            {
-                let usage_chunk =
-                    StreamUsageChunk::from_usage(&request_id, created, &model_id, usage);
-                events.push(Ok(Event::default().data(
-                    serde_json::to_string(&usage_chunk).expect("StreamUsageChunk serialization"),
-                )));
-            }
-
-            stream::iter(events)
+        let sse_stream = UnboundedReceiverStream::new(delta_rx).flat_map(move |delta| {
+            stream::iter(delta_sse_events(
+                delta,
+                include_usage,
+                |d| StreamChunk::from_delta(&request_id, created, &model_id, d),
+                |u| StreamUsageChunk::from_usage(&request_id, created, &model_id, u),
+            ))
         });
 
-        let done_stream =
-            stream::once(async { Ok::<_, Infallible>(Event::default().data("[DONE]")) });
-
-        Ok(Sse::new(stream.chain(done_stream)).into_response())
+        Ok(Sse::new(sse_stream.chain(sse_done_stream())).into_response())
     } else {
         // Non-streaming: collect all deltas into a single response.
-        let mut rx = delta_rx;
         let mut text = String::new();
         let mut finish_reason = FinishReason::Length;
         let mut usage = Usage {
@@ -129,14 +158,25 @@ async fn completions(
             total_tokens: 0,
         };
 
-        while let Some(delta) = rx.recv().await {
-            text.push_str(&delta.text_delta);
-            if let Some(reason) = delta.finish_reason {
-                finish_reason = reason;
+        let collect = async {
+            let mut rx = delta_rx;
+            while let Some(delta) = rx.recv().await {
+                text.push_str(&delta.text_delta);
+                if let Some(reason) = delta.finish_reason {
+                    finish_reason = reason;
+                }
+                if let Some(u) = delta.usage {
+                    usage = u;
+                }
             }
-            if let Some(u) = delta.usage {
-                usage = u;
-            }
+        };
+
+        if tokio::time::timeout(RESPONSE_TIMEOUT, collect).await.is_err() {
+            error!(
+                "Non-streaming request timed out after {}s",
+                RESPONSE_TIMEOUT.as_secs()
+            );
+            return Err(StatusCode::GATEWAY_TIMEOUT);
         }
 
         info!(
@@ -213,48 +253,27 @@ async fn chat_completions(
         // First chunk carries the role field.
         let role_event = {
             let chunk = ChatStreamChunk::role_chunk(&request_id, created, &model_id);
-            Ok::<_, Infallible>(
-                Event::default()
-                    .data(serde_json::to_string(&chunk).expect("ChatStreamChunk serialization")),
-            )
+            Ok::<_, Infallible>(Event::default()
+                .data(serde_json::to_string(&chunk).expect("ChatStreamChunk serialization")))
         };
 
         let req_id = request_id;
         let mid = model_id.clone();
         let content_stream = UnboundedReceiverStream::new(delta_rx).flat_map(move |delta| {
-            let usage = delta.usage;
-            let is_terminal = delta.finish_reason.is_some();
-
-            let chunk = ChatStreamChunk::content_chunk(&req_id, created, &mid, delta);
-            let mut events = vec![Ok::<_, Infallible>(
-                Event::default()
-                    .data(serde_json::to_string(&chunk).expect("ChatStreamChunk serialization")),
-            )];
-
-            if include_usage
-                && is_terminal
-                && let Some(u) = usage
-            {
-                let usage_chunk = ChatStreamUsageChunk::from_usage(&req_id, created, &mid, u);
-                events.push(Ok(Event::default().data(
-                    serde_json::to_string(&usage_chunk)
-                        .expect("ChatStreamUsageChunk serialization"),
-                )));
-            }
-
-            stream::iter(events)
+            stream::iter(delta_sse_events(
+                delta,
+                include_usage,
+                |d| ChatStreamChunk::content_chunk(&req_id, created, &mid, d),
+                |u| ChatStreamUsageChunk::from_usage(&req_id, created, &mid, u),
+            ))
         });
-
-        let done_stream =
-            stream::once(async { Ok::<_, Infallible>(Event::default().data("[DONE]")) });
 
         let full_stream = stream::once(async move { role_event })
             .chain(content_stream)
-            .chain(done_stream);
+            .chain(sse_done_stream());
 
         Ok(Sse::new(full_stream).into_response())
     } else {
-        let mut rx = delta_rx;
         let mut text = String::new();
         let mut finish_reason = FinishReason::Length;
         let mut usage = Usage {
@@ -263,14 +282,25 @@ async fn chat_completions(
             total_tokens: 0,
         };
 
-        while let Some(delta) = rx.recv().await {
-            text.push_str(&delta.text_delta);
-            if let Some(r) = delta.finish_reason {
-                finish_reason = r;
+        let collect = async {
+            let mut rx = delta_rx;
+            while let Some(delta) = rx.recv().await {
+                text.push_str(&delta.text_delta);
+                if let Some(r) = delta.finish_reason {
+                    finish_reason = r;
+                }
+                if let Some(u) = delta.usage {
+                    usage = u;
+                }
             }
-            if let Some(u) = delta.usage {
-                usage = u;
-            }
+        };
+
+        if tokio::time::timeout(RESPONSE_TIMEOUT, collect).await.is_err() {
+            error!(
+                "Non-streaming chat request timed out after {}s",
+                RESPONSE_TIMEOUT.as_secs()
+            );
+            return Err(StatusCode::GATEWAY_TIMEOUT);
         }
 
         info!(
