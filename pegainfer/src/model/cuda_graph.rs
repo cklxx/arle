@@ -13,8 +13,18 @@ pub(crate) struct CudaGraphState {
     graph: Option<CudaGraph>,
 }
 
-// SAFETY: CudaGraph contains raw CUDA pointers that are not Send by default.
-// We only access the graph from the single inference thread that owns the model.
+// SAFETY: `CudaGraphState` wraps a `cudarc::driver::safe::CudaGraph` which holds
+// raw CUDA graph and instantiated-graph handles (`CUgraph`, `CUgraphExec`).
+// These are `!Send` because CUDA graphs must be used from the thread/context
+// that created them.
+//
+// Invariant upheld: `CudaGraphState` is stored inside model state structs
+// (e.g. `Qwen3State`) which are exclusively accessed from the single blocking
+// inference thread running `Scheduler::run()`.  Graph capture and replay both
+// occur on that same thread with the same CUDA stream.
+//
+// Violation would mean: replaying or destroying the graph from a different thread
+// would race with the owning thread's CUDA stream, causing undefined GPU behaviour.
 unsafe impl Send for CudaGraphState {}
 
 impl CudaGraphState {

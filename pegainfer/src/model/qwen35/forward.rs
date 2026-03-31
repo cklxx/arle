@@ -23,6 +23,19 @@ pub struct Qwen35State {
     pub(super) prefill_logits: Option<DeviceVec>,
 }
 
+// SAFETY: `Qwen35State` contains CUDA resources (`DeviceContext`, `CudaSlice` inside
+// `DecodeBuffers35`, `SingleTokenBuffers`, `KVCache`, `RecurrentState`,
+// `CudaGraphState`, `DeviceVec`) that hold raw CUDA device pointers.
+// These types are `!Send` by default because CUDA contexts and allocations
+// must be accessed from the thread that created them.
+//
+// Invariant upheld: every `Qwen35State` instance is exclusively owned by its
+// scheduler slot and only ever accessed from the single blocking inference
+// thread that runs `Scheduler::run()`.  No other thread holds a reference to
+// or borrows from this state while the inference thread is running.
+//
+// Violation would mean: concurrent access from multiple threads could cause
+// data races on GPU memory or corrupt the CUDA driver state.
 unsafe impl Send for Qwen35State {}
 
 impl GenerationState for Qwen35State {
