@@ -5,8 +5,14 @@
 //! paged KV cache: QK-norm + RoPE + paged KV write are done in a prep kernel,
 //! then FlashInfer's batch decode handles attention in a single launch.
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use cudarc::driver::safe::CudaGraph;
+use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
+use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+use log::{debug, info};
 
 use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
@@ -14,7 +20,7 @@ use crate::model::ModelForward;
 use crate::ops;
 use crate::ops::FlashInferWorkspace;
 use crate::paged_kv::PagedKVPool;
-use crate::tensor::{DeviceContext, HiddenStates};
+use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Pre-allocated buffers for batched decode, reused across steps.
 /// Allocated once for `max_batch_size`; smaller batches set `seq_len` on HiddenStates.
@@ -30,6 +36,13 @@ pub(crate) struct BatchDecodeBuffers {
     up_out: HiddenStates,
     act_out: HiddenStates,
 
+    /// Embedding output buffer [max_batch_size, hidden_dim] — avoids alloc in graph.
+    embedding_out: HiddenStates,
+    /// Batched logits buffer [max_batch_size, vocab_size] — avoids alloc in graph.
+    logits_batch: Option<HiddenStates>,
+    /// Per-slot logits extracted from batched logits.
+    logits_per_slot: Vec<DeviceVec>,
+
     // FlashInfer paged attention buffers
     positions: CudaSlice<i32>,
     kv_indices_gpu: CudaSlice<i32>,
@@ -41,7 +54,14 @@ pub(crate) struct BatchDecodeBuffers {
     max_batch_size: usize,
     /// Max total pages (for kv_indices_gpu sizing).
     max_total_pages: usize,
+
+    /// CUDA Graph cache: one graph per batch_size.
+    graph_cache: HashMap<usize, CudaGraph>,
 }
+
+// SAFETY: BatchDecodeBuffers contains CudaGraph (CUgraphExec) which is !Send.
+// Invariant: exclusively accessed from the single scheduler inference thread.
+unsafe impl Send for BatchDecodeBuffers {}
 
 impl BatchDecodeBuffers {
     /// Allocate buffers for up to `max_batch_size` requests.
@@ -69,6 +89,10 @@ impl BatchDecodeBuffers {
             up_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
             act_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
 
+            embedding_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
+            logits_batch: None, // lazy-allocated on first use (needs vocab_size)
+            logits_per_slot: Vec::new(),
+
             positions: ctx
                 .stream
                 .alloc_zeros(max_batch_size)
@@ -89,6 +113,7 @@ impl BatchDecodeBuffers {
 
             max_batch_size,
             max_total_pages,
+            graph_cache: HashMap::new(),
         })
     }
 
@@ -142,91 +167,107 @@ impl Qwen3Model {
         debug_assert!(batch_size <= bufs.max_batch_size);
 
         let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim;
         let eps = self.config.rms_norm_eps;
+        let page_size = 1;
 
-        // Set actual batch size on pre-allocated buffers
         bufs.set_batch_size(batch_size);
 
-        // Build FlashInfer metadata from paged KV pool
+        // ── Pre-graph: metadata H2D + FlashInfer plan + embedding ──
+
         let indptr_h = paged_kv_pool.build_indptr(slot_indices);
         let indices_h = paged_kv_pool.build_indices(slot_indices);
         let last_page_lens_h = paged_kv_pool.build_last_page_lens(slot_indices);
-
-        // Gather positions (current seq_len - 1 = position of the new token)
         let positions_h: Vec<i32> = slot_indices
             .iter()
             .map(|&si| (paged_kv_pool.seq_len(si) - 1) as i32)
             .collect();
 
-        // Upload metadata to GPU (reuse pre-allocated GPU buffers)
-        self.ctx
-            .stream
-            .memcpy_htod(&positions_h, &mut bufs.positions)
-            .map_err(|e| anyhow::anyhow!("H2D positions failed: {e}"))?;
-        self.ctx
-            .stream
-            .memcpy_htod(&indptr_h, &mut bufs.kv_indptr_gpu)
-            .map_err(|e| anyhow::anyhow!("H2D indptr failed: {e}"))?;
-
-        // kv_indices may exceed pre-allocated size if sequences grew — reallocate if needed
+        self.ctx.stream.memcpy_htod(&positions_h, &mut bufs.positions)
+            .map_err(|e| anyhow::anyhow!("H2D positions: {e}"))?;
+        self.ctx.stream.memcpy_htod(&indptr_h, &mut bufs.kv_indptr_gpu)
+            .map_err(|e| anyhow::anyhow!("H2D indptr: {e}"))?;
         if indices_h.len() > bufs.max_total_pages {
-            bufs.kv_indices_gpu = self.ctx
-                .stream
-                .alloc_zeros(indices_h.len())
-                .map_err(|e| anyhow::anyhow!("Realloc kv_indices failed: {e}"))?;
+            bufs.kv_indices_gpu = self.ctx.stream.alloc_zeros(indices_h.len())
+                .map_err(|e| anyhow::anyhow!("Realloc kv_indices: {e}"))?;
             bufs.max_total_pages = indices_h.len();
+            bufs.graph_cache.remove(&batch_size);
         }
-        self.ctx
-            .stream
-            .memcpy_htod(&indices_h, &mut bufs.kv_indices_gpu)
-            .map_err(|e| anyhow::anyhow!("H2D indices failed: {e}"))?;
-        self.ctx
-            .stream
-            .memcpy_htod(&last_page_lens_h, &mut bufs.kv_last_page_len_gpu)
-            .map_err(|e| anyhow::anyhow!("H2D last_page_len failed: {e}"))?;
+        self.ctx.stream.memcpy_htod(&indices_h, &mut bufs.kv_indices_gpu)
+            .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
+        self.ctx.stream.memcpy_htod(&last_page_lens_h, &mut bufs.kv_last_page_len_gpu)
+            .map_err(|e| anyhow::anyhow!("H2D last_page_len: {e}"))?;
 
-        // FlashInfer plan: call ONCE per decode step (not per layer).
-        // The plan result is valid for all layers since KV layout is identical.
-        let num_kv_heads = self.config.num_key_value_heads;
-        let head_dim = self.config.head_dim;
-        let page_size = 1;
         ops::flashinfer_plan(
-            &self.ctx,
-            &indptr_h,
-            &mut bufs.flashinfer_ws,
-            batch_size,
-            num_heads,
-            num_kv_heads,
-            page_size,
-            head_dim,
+            &self.ctx, &indptr_h, &mut bufs.flashinfer_ws,
+            batch_size, num_heads, num_kv_heads, page_size, head_dim,
         )?;
 
-        // 1. Batched embedding: [B, hidden_dim]
-        let mut hidden = self.get_embeddings_batch(tokens)?;
+        // Embedding (has H2D copy — must be outside graph)
+        bufs.embedding_out.seq_len = batch_size;
+        let token_ids_i32: Vec<i32> = tokens.iter().map(|&x| x as i32).collect();
+        let token_ids_gpu = self.ctx.stream.clone_htod(&token_ids_i32)
+            .map_err(|e| anyhow::anyhow!("H2D token_ids: {e}"))?;
+        ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut bufs.embedding_out)?;
 
-        // 2. Process all layers (using pre-computed plan)
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            self.decode_batch_layer(
-                layer_idx,
-                layer,
-                &mut hidden,
-                bufs,
-                paged_kv_pool,
-            )?;
+        // ── Graph body: layers + final norm + logits GEMM ──
+        // All use pre-allocated buffers with stable pointers.
+
+        // Lazy-init logits buffer
+        if bufs.logits_batch.is_none() {
+            let vocab_size = self.output_projection().rows;
+            bufs.logits_batch = Some(HiddenStates::zeros(&self.ctx, vocab_size, bufs.max_batch_size)?);
         }
 
-        // 3. Compute logits for all requests in one batched norm + one GEMM
-        ops::rms_norm_batch_into(&self.ctx, &hidden, &self.norm, eps, &mut bufs.normed);
-        let logits_batch = ops::gemm(&self.ctx, self.output_projection(), &bufs.normed)?;
+        // Run layers + norm + logits
+        self.decode_batch_graph_body(bufs, paged_kv_pool, batch_size)?;
+
+        // Extract per-slot logits
+        let logits = bufs.logits_batch.as_mut().unwrap();
+        logits.seq_len = batch_size;
         for (b, &si) in slot_indices.iter().enumerate() {
-            let logits = ops::extract_vec(&self.ctx, &logits_batch, b)?;
-            states[si].prefill_logits = Some(logits);
+            let slot_logits = ops::extract_vec(&self.ctx, logits, b)?;
+            states[si].prefill_logits = Some(slot_logits);
         }
 
         Ok(())
     }
 
-    fn decode_batch_layer(
+    /// Graph body: embedding_out → layers → final norm → logits.
+    /// All buffers are pre-allocated in `bufs`. No allocations, no H2D copies.
+    fn decode_batch_graph_body(
+        &self,
+        bufs: &mut BatchDecodeBuffers,
+        kv_pool: &PagedKVPool,
+        batch_size: usize,
+    ) -> Result<()> {
+        let eps = self.config.rms_norm_eps;
+
+        // Use embedding_out as the initial hidden state. The layer loop
+        // ping-pongs between embedding_out and hidden_out via swap.
+        // We use a raw pointer to avoid borrow conflicts with bufs.
+        let hidden_ptr = &mut bufs.embedding_out as *mut HiddenStates;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // SAFETY: hidden_ptr points to bufs.embedding_out. The layer
+            // function only accesses other fields of bufs (normed, q_batch, etc.)
+            // and swaps hidden_ptr's target with bufs.hidden_out. No aliasing.
+            let hidden = unsafe { &mut *hidden_ptr };
+            self.decode_batch_layer_inner(layer_idx, layer, hidden, bufs, kv_pool)?;
+        }
+
+        // Final norm + logits. hidden is whichever buffer was last written.
+        let hidden = unsafe { &*hidden_ptr };
+        ops::rms_norm_batch_into(&self.ctx, hidden, &self.norm, eps, &mut bufs.normed);
+        let logits_buf = bufs.logits_batch.as_mut().unwrap();
+        logits_buf.seq_len = batch_size;
+        ops::gemm_into(&self.ctx, self.output_projection(), &bufs.normed, logits_buf);
+
+        Ok(())
+    }
+
+    fn decode_batch_layer_inner(
         &self,
         layer_idx: usize,
         layer: &TransformerBlock,
