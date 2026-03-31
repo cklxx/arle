@@ -398,6 +398,9 @@ impl<M: ModelForward> Scheduler<M> {
     ///
     /// `num_slots` controls how many concurrent requests can be active (each gets
     /// its own KV cache). More slots = more GPU memory usage.
+    ///
+    /// `max_seq_len_override` — if `Some(n)`, each slot's KV cache is capped at `n`
+    /// tokens. If `None`, the scheduler auto-sizes based on available GPU memory.
     pub fn new(
         model: M,
         tokenizer: Tokenizer,
@@ -405,19 +408,46 @@ impl<M: ModelForward> Scheduler<M> {
         num_slots: usize,
         seed: u64,
     ) -> Result<(Self, SchedulerHandle)> {
+        Self::with_max_seq_len(model, tokenizer, model_id, num_slots, seed, None)
+    }
+
+    /// Create a new scheduler with an explicit max sequence length override.
+    pub fn with_max_seq_len(
+        model: M,
+        tokenizer: Tokenizer,
+        model_id: &str,
+        num_slots: usize,
+        seed: u64,
+        max_seq_len_override: Option<usize>,
+    ) -> Result<(Self, SchedulerHandle)> {
         let (tx, rx) = mpsc::unbounded_channel();
+
+        // Compute the effective max_seq_len for KV cache allocation.
+        let effective_max_seq_len = Self::compute_max_seq_len(
+            &model,
+            num_slots,
+            max_seq_len_override,
+        );
 
         let mut states = Vec::with_capacity(num_slots);
         let mut cached_prompts = Vec::with_capacity(num_slots);
         for i in 0..num_slots {
-            states.push(model.create_state()?);
+            let mut state = model.create_state()?;
+            if let Some(max_seq) = effective_max_seq_len {
+                state.set_max_seq_len(max_seq);
+            }
+            states.push(state);
             cached_prompts.push(Vec::new());
             info!("Initialized state slot {}/{}", i + 1, num_slots);
         }
 
         info!(
-            "Scheduler ready: model={}, slots={}, seed={}",
-            model_id, num_slots, seed
+            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}",
+            model_id,
+            num_slots,
+            seed,
+            effective_max_seq_len
+                .map_or_else(|| "32768 (default)".to_string(), |n| n.to_string()),
         );
 
         let waiting_count = Arc::new(AtomicUsize::new(0));
@@ -446,6 +476,74 @@ impl<M: ModelForward> Scheduler<M> {
         };
 
         Ok((scheduler, handle))
+    }
+
+    /// Compute the effective max_seq_len per slot based on available GPU memory.
+    ///
+    /// If `override_val` is `Some(n)`, returns `Some(n)` directly.
+    /// If `None`, queries free GPU memory and computes the largest affordable
+    /// sequence length per slot, capped at 32768 (the model's native max).
+    /// Returns `None` if the query fails (falls back to KVCache's default).
+    fn compute_max_seq_len(
+        model: &M,
+        num_slots: usize,
+        override_val: Option<usize>,
+    ) -> Option<usize> {
+        use crate::tensor::DeviceContext;
+
+        const DEFAULT_MAX_SEQ: usize = 32768;
+        // Reserve 512 MB for activations, scratch buffers, CUDA overhead, etc.
+        const RESERVED_BYTES: usize = 512 * 1024 * 1024;
+        // Minimum useful sequence length (don't go below 256 tokens).
+        const MIN_SEQ_LEN: usize = 256;
+
+        if let Some(val) = override_val {
+            info!("KV cache: using explicit --max-seq-len={}", val);
+            return Some(val);
+        }
+
+        let (free_bytes, total_bytes) = match DeviceContext::gpu_memory_info() {
+            Ok(info) => info,
+            Err(e) => {
+                info!(
+                    "KV cache: could not query GPU memory ({}), using default max_seq_len={}",
+                    e, DEFAULT_MAX_SEQ
+                );
+                return None;
+            }
+        };
+
+        let available = free_bytes.saturating_sub(RESERVED_BYTES);
+        let bytes_per_token = model.kv_cache_bytes_per_token();
+        let total_kv_budget = available; // split across all slots
+        let per_slot_budget = total_kv_budget / num_slots.max(1);
+        let affordable_seq_len = per_slot_budget / bytes_per_token.max(1);
+
+        // Clamp to [MIN_SEQ_LEN, DEFAULT_MAX_SEQ].
+        let effective = affordable_seq_len.clamp(MIN_SEQ_LEN, DEFAULT_MAX_SEQ);
+
+        info!(
+            "KV cache auto-sizing: gpu_free={:.1} GB, gpu_total={:.1} GB, \
+             reserved={:.1} GB, bytes_per_token={}, num_slots={}, \
+             affordable_seq_len={}, effective_max_seq_len={}",
+            free_bytes as f64 / 1e9,
+            total_bytes as f64 / 1e9,
+            RESERVED_BYTES as f64 / 1e9,
+            bytes_per_token,
+            num_slots,
+            affordable_seq_len,
+            effective,
+        );
+
+        if affordable_seq_len < MIN_SEQ_LEN {
+            error!(
+                "KV cache: only {} tokens affordable per slot (need at least {}). \
+                 Reduce --num-slots or free GPU memory.",
+                affordable_seq_len, MIN_SEQ_LEN,
+            );
+        }
+
+        Some(effective)
     }
 
     /// Run the scheduler loop. Blocks until all handles are dropped.

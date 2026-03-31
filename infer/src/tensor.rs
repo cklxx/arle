@@ -15,6 +15,13 @@ pub struct DeviceContext {
 }
 
 impl DeviceContext {
+    /// Query available (free) GPU memory in bytes.
+    /// Returns `(free_bytes, total_bytes)`.
+    pub fn gpu_memory_info() -> Result<(usize, usize)> {
+        cudarc::driver::result::mem_get_info()
+            .map_err(|e| anyhow!("Failed to query GPU memory: {}", e))
+    }
+
     pub fn new() -> Result<Self> {
         let ctx =
             CudaContext::new(0).map_err(|e| anyhow!("Failed to create CUDA context: {}", e))?;

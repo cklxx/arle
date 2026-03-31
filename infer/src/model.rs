@@ -27,6 +27,9 @@ pub trait GenerationState {
     fn truncate_to(&mut self, len: usize) -> Result<()>;
     /// Set max KV tokens on GPU. Excess offloads to CPU.
     fn set_max_gpu_kv(&mut self, max_tokens: usize);
+    /// Set the maximum sequence length (total, GPU + CPU) for the KV cache.
+    /// Must be called before the KV cache is first initialized.
+    fn set_max_seq_len(&mut self, max_seq: usize);
     /// Offload excess KV to CPU if over GPU budget. Called between requests.
     fn offload_kv_if_needed(&mut self) -> Result<()>;
 }
@@ -37,6 +40,13 @@ pub trait ModelForward: Send {
     type State: GenerationState + Send;
 
     fn create_state(&self) -> Result<Self::State>;
+
+    /// KV cache memory cost per token in bytes (across all layers, K+V, bf16).
+    /// Used by the scheduler to compute the dynamic max_seq_len based on
+    /// available GPU memory.
+    /// Formula: 2 (K+V) * num_kv_layers * num_kv_heads * head_dim * 2 (bf16 bytes)
+    fn kv_cache_bytes_per_token(&self) -> usize;
+
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()>;
     fn select_token(
         &self,
