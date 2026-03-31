@@ -33,12 +33,22 @@ Goal: match SGLang's concurrent throughput on A100-40GB with Qwen3-4B. Starting 
 
 ## Remaining Gap
 
+### Phase 4: Embedding + Logits Pre-allocation (690 -> 700 tok/s)
+
+Moved embedding output into `BatchDecodeBuffers` (eliminating `get_embeddings_batch` allocation) and lazy-allocated logits buffer. Small gain — these allocations were only ~40KB.
+
+### Phase 5: CUDA Graph (attempted, not yet landed)
+
+CUDA Graph capture for the layer loop would eliminate ~360 kernel launches (~1.8ms per step). However, FlashInfer's `batch_decode_run` does CPU `memcpy` of `plan_info` inside the function — this CPU code doesn't run during graph replay, which means kernel parameters from the first capture are baked in. This works only when FlashInfer's plan produces the same scheduling layout across steps (true for fixed batch_size with similar KV lengths, but needs validation).
+
+Implementation prepared (graph_cache HashMap per batch_size, decode_batch_graph_body method) but disabled pending correctness validation.
+
 | Metric | infer | SGLang | Gap |
 |--------|-------|--------|-----|
-| 8-concurrent throughput | 690 tok/s | 886 tok/s | 1.28x |
-| ITL (decode latency) | 10.1ms | 8.2ms | 1.23x |
+| 8-concurrent throughput | 700 tok/s | 886 tok/s | 1.27x |
+| ITL (decode latency) | 9.6ms | 8.2ms | 1.17x |
 
-Root cause of remaining ~2ms ITL gap: **CUDA Graph**. SGLang pre-records CUDA Graphs for batch sizes [1,2,4,8,12,16,24,32], eliminating ~360 kernel launches per step (~1.8ms overhead). This is the last major optimization needed.
+Remaining ~1.4ms ITL gap: CUDA Graph (~1.0ms kernel launch overhead) + misc overhead.
 
 ## Rule
 
