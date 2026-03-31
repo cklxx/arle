@@ -8,3 +8,5 @@ build/
 /target/
 .claude/
 release/
+.gstack/
+models/
