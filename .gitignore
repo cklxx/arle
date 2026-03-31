@@ -6,3 +6,4 @@ build/
 *.egg
 .eggs/
 /target/
+.claude/
