@@ -794,6 +794,20 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
+        // Flush deferred emit_delta from the previous decode step.
+        // Running this before step_decode_batch() hides tokenization latency
+        // behind batch-preparation work (index collection, slot lookup).
+        {
+            let Self { active, tokenizer, .. } = self;
+            for req in active.iter_mut() {
+                if matches!(req.phase, Phase::Decoding)
+                    && req.decoded_token_count < req.generated_tokens.len()
+                {
+                    req.emit_delta(tokenizer);
+                }
+            }
+        }
+
         let has_decode = self
             .active
             .iter()
@@ -1168,7 +1182,7 @@ impl<M: ModelForward> Scheduler<M> {
                         continue;
                     }
                     req.generated_tokens.push(token);
-                    req.emit_delta(tokenizer);
+                    // emit_delta is deferred to the start of the next step() call.
                     if matches!(req.phase, Phase::Finished) {
                         continue;
                     }
