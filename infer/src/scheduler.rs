@@ -389,6 +389,8 @@ pub struct Scheduler<M: ModelForward> {
     rng: StdRng,
     /// Paged KV cache pool shared across all slots (for batched decode).
     paged_kv_pool: PagedKVPool,
+    /// Pre-allocated buffers for batched decode (reused across steps).
+    decode_bufs: Option<Box<dyn std::any::Any + Send>>,
     /// Round-robin index for fair decode scheduling.
     last_served: usize,
     /// Lifetime stats.
@@ -499,6 +501,7 @@ impl<M: ModelForward> Scheduler<M> {
             next_id: 0,
             rng: StdRng::seed_from_u64(seed),
             paged_kv_pool,
+            decode_bufs: None,
             last_served: 0,
             total_completed: 0,
             total_generated_tokens: 0,
@@ -918,6 +921,7 @@ impl<M: ModelForward> Scheduler<M> {
             active,
             rng,
             paged_kv_pool,
+            decode_bufs,
             ..
         } = self;
 
@@ -980,7 +984,7 @@ impl<M: ModelForward> Scheduler<M> {
             model.forward(&[token_ids[0]], &mut states[slot_indices[0]])
         } else {
             // Multiple requests: batched decode (GEMM for projections)
-            model.forward_decode_batch(&token_ids, states, &slot_indices, Some(paged_kv_pool))
+            model.forward_decode_batch(&token_ids, states, &slot_indices, Some(paged_kv_pool), decode_bufs)
         };
 
         if let Err(e) = forward_result {

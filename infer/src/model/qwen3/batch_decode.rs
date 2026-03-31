@@ -16,8 +16,9 @@ use crate::ops::FlashInferWorkspace;
 use crate::paged_kv::PagedKVPool;
 use crate::tensor::{DeviceContext, HiddenStates};
 
-/// Temporary buffers for batched decode, analogous to PrefillBuffers.
-struct BatchDecodeBuffers {
+/// Pre-allocated buffers for batched decode, reused across steps.
+/// Allocated once for `max_batch_size`; smaller batches set `seq_len` on HiddenStates.
+pub(crate) struct BatchDecodeBuffers {
     hidden_out: HiddenStates,
     normed: HiddenStates,
     q_batch: HiddenStates,
@@ -30,61 +31,80 @@ struct BatchDecodeBuffers {
     act_out: HiddenStates,
 
     // FlashInfer paged attention buffers
-    /// Per-request positions on GPU: [B] i32
     positions: CudaSlice<i32>,
-    /// Flattened page indices on GPU (concatenated page tables)
     kv_indices_gpu: CudaSlice<i32>,
-    /// Page indptr on GPU: [B+1] i32
     kv_indptr_gpu: CudaSlice<i32>,
-    /// Last page lengths on GPU: [B] i32
     kv_last_page_len_gpu: CudaSlice<i32>,
-    /// FlashInfer workspace (plan scratch, split-KV temps, etc.)
     flashinfer_ws: FlashInferWorkspace,
+
+    /// Max batch size this buffer set was allocated for.
+    max_batch_size: usize,
+    /// Max total pages (for kv_indices_gpu sizing).
+    max_total_pages: usize,
 }
 
 impl BatchDecodeBuffers {
+    /// Allocate buffers for up to `max_batch_size` requests.
+    /// `max_total_pages` should be large enough for the worst-case total KV pages.
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub(crate) fn new(
         ctx: &DeviceContext,
         hidden_dim: usize,
         q_dim: usize,
         kv_dim: usize,
         inter_dim: usize,
-        batch_size: usize,
+        max_batch_size: usize,
         num_qheads: usize,
-        _head_dim: usize,
         max_total_pages: usize,
     ) -> Result<Self> {
         Ok(Self {
-            hidden_out: HiddenStates::zeros(ctx, hidden_dim, batch_size)?,
-            normed: HiddenStates::zeros(ctx, hidden_dim, batch_size)?,
-            q_batch: HiddenStates::zeros(ctx, q_dim, batch_size)?,
-            k_batch: HiddenStates::zeros(ctx, kv_dim, batch_size)?,
-            v_batch: HiddenStates::zeros(ctx, kv_dim, batch_size)?,
-            attn_output: HiddenStates::zeros(ctx, q_dim, batch_size)?,
-            o_buf: HiddenStates::zeros(ctx, hidden_dim, batch_size)?,
-            gate_out: HiddenStates::zeros(ctx, inter_dim, batch_size)?,
-            up_out: HiddenStates::zeros(ctx, inter_dim, batch_size)?,
-            act_out: HiddenStates::zeros(ctx, inter_dim, batch_size)?,
+            hidden_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
+            normed: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
+            q_batch: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
+            k_batch: HiddenStates::zeros(ctx, kv_dim, max_batch_size)?,
+            v_batch: HiddenStates::zeros(ctx, kv_dim, max_batch_size)?,
+            attn_output: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
+            o_buf: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
+            gate_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
+            up_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
+            act_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
 
             positions: ctx
                 .stream
-                .alloc_zeros(batch_size)
+                .alloc_zeros(max_batch_size)
                 .map_err(|e| anyhow::anyhow!("Alloc positions failed: {e}"))?,
             kv_indices_gpu: ctx
                 .stream
-                .alloc_zeros(max_total_pages)
+                .alloc_zeros(max_total_pages.max(1))
                 .map_err(|e| anyhow::anyhow!("Alloc kv_indices failed: {e}"))?,
             kv_indptr_gpu: ctx
                 .stream
-                .alloc_zeros(batch_size + 1)
+                .alloc_zeros(max_batch_size + 1)
                 .map_err(|e| anyhow::anyhow!("Alloc kv_indptr failed: {e}"))?,
             kv_last_page_len_gpu: ctx
                 .stream
-                .alloc_zeros(batch_size)
+                .alloc_zeros(max_batch_size)
                 .map_err(|e| anyhow::anyhow!("Alloc kv_last_page_len failed: {e}"))?,
-            flashinfer_ws: FlashInferWorkspace::new(ctx, batch_size, num_qheads)?,
+            flashinfer_ws: FlashInferWorkspace::new(ctx, max_batch_size, num_qheads)?,
+
+            max_batch_size,
+            max_total_pages,
         })
+    }
+
+    /// Set the actual batch size for this step (must be <= max_batch_size).
+    fn set_batch_size(&mut self, batch_size: usize) {
+        debug_assert!(batch_size <= self.max_batch_size);
+        self.hidden_out.seq_len = batch_size;
+        self.normed.seq_len = batch_size;
+        self.q_batch.seq_len = batch_size;
+        self.k_batch.seq_len = batch_size;
+        self.v_batch.seq_len = batch_size;
+        self.attn_output.seq_len = batch_size;
+        self.o_buf.seq_len = batch_size;
+        self.gate_out.seq_len = batch_size;
+        self.up_out.seq_len = batch_size;
+        self.act_out.seq_len = batch_size;
     }
 }
 
@@ -114,27 +134,23 @@ impl Qwen3Model {
         states: &mut [Qwen3State],
         slot_indices: &[usize],
         paged_kv_pool: &mut PagedKVPool,
+        bufs: &mut BatchDecodeBuffers,
     ) -> Result<()> {
         let batch_size = tokens.len();
         debug_assert_eq!(batch_size, slot_indices.len());
         debug_assert!(batch_size > 1);
+        debug_assert!(batch_size <= bufs.max_batch_size);
 
         let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
-        let head_dim = self.config.head_dim;
-        let q_dim = num_heads * head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-        let inter_dim = self.config.intermediate_size;
         let eps = self.config.rms_norm_eps;
 
-        // NOTE: Token allocation is done by the scheduler (step_decode_batch)
-        // before calling this function. Do NOT allocate here to avoid double allocation.
+        // Set actual batch size on pre-allocated buffers
+        bufs.set_batch_size(batch_size);
 
         // Build FlashInfer metadata from paged KV pool
         let indptr_h = paged_kv_pool.build_indptr(slot_indices);
         let indices_h = paged_kv_pool.build_indices(slot_indices);
         let last_page_lens_h = paged_kv_pool.build_last_page_lens(slot_indices);
-        let max_total_pages = indices_h.len().max(1);
 
         // Gather positions (current seq_len - 1 = position of the new token)
         let positions_h: Vec<i32> = slot_indices
@@ -142,20 +158,7 @@ impl Qwen3Model {
             .map(|&si| (paged_kv_pool.seq_len(si) - 1) as i32)
             .collect();
 
-        // Allocate batch buffers
-        let mut bufs = BatchDecodeBuffers::new(
-            &self.ctx,
-            self.config.hidden_size,
-            q_dim,
-            kv_dim,
-            inter_dim,
-            batch_size,
-            num_heads,
-            head_dim,
-            max_total_pages,
-        )?;
-
-        // Upload metadata to GPU
+        // Upload metadata to GPU (reuse pre-allocated GPU buffers)
         self.ctx
             .stream
             .memcpy_htod(&positions_h, &mut bufs.positions)
@@ -164,6 +167,15 @@ impl Qwen3Model {
             .stream
             .memcpy_htod(&indptr_h, &mut bufs.kv_indptr_gpu)
             .map_err(|e| anyhow::anyhow!("H2D indptr failed: {e}"))?;
+
+        // kv_indices may exceed pre-allocated size if sequences grew — reallocate if needed
+        if indices_h.len() > bufs.max_total_pages {
+            bufs.kv_indices_gpu = self.ctx
+                .stream
+                .alloc_zeros(indices_h.len())
+                .map_err(|e| anyhow::anyhow!("Realloc kv_indices failed: {e}"))?;
+            bufs.max_total_pages = indices_h.len();
+        }
         self.ctx
             .stream
             .memcpy_htod(&indices_h, &mut bufs.kv_indices_gpu)
@@ -182,15 +194,13 @@ impl Qwen3Model {
                 layer_idx,
                 layer,
                 &mut hidden,
-                &mut bufs,
+                bufs,
                 paged_kv_pool,
                 &indptr_h,
             )?;
         }
 
-        // 3. (No need to increment KV cache seq_len — paged pool already updated by grow_slot)
-
-        // 4. Compute logits for all requests in one batched norm + one GEMM
+        // 3. Compute logits for all requests in one batched norm + one GEMM
         ops::rms_norm_batch_into(&self.ctx, &hidden, &self.norm, eps, &mut bufs.normed);
         let logits_batch = ops::gemm(&self.ctx, self.output_projection(), &bufs.normed)?;
         for (b, &si) in slot_indices.iter().enumerate() {

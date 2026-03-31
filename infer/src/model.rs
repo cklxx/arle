@@ -129,6 +129,7 @@ pub trait ModelForward: Send {
         states: &mut [Self::State],
         slot_indices: &[usize],
         _paged_kv_pool: Option<&mut PagedKVPool>,
+        _decode_bufs_cache: &mut Option<Box<dyn std::any::Any + Send>>,
     ) -> Result<()> {
         for (i, &token) in tokens.iter().enumerate() {
             self.forward(&[token], &mut states[slot_indices[i]])?;
