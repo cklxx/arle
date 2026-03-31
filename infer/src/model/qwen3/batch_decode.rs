@@ -12,7 +12,7 @@ use cudarc::driver::CudaSlice;
 use cudarc::driver::safe::CudaGraph;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
-use log::{debug, info};
+use log::info;
 
 use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
@@ -169,16 +169,9 @@ impl Qwen3Model {
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
-        let eps = self.config.rms_norm_eps;
         let page_size = 1;
 
         bufs.set_batch_size(batch_size);
-
-        static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 5 || n % 50 == 0 {
-            info!("decode_batch step={} B={}", n, batch_size);
-        }
 
         // ── Pre-graph: metadata H2D + FlashInfer plan + embedding ──
 

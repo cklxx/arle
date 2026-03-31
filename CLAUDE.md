@@ -243,13 +243,16 @@ FFI bindings are declared in `infer/src/ffi.rs`.
 | Model architecture registry (9 architectures) | ✅ |
 | Quantization format detection (GPTQ/AWQ/FP8/INT8/GGUF) | ✅ (detection only) |
 | Radix tree prefix cache (data structure) | ✅ (CPU, not yet GPU-wired) |
-| Paged KV block manager (accounting) | ✅ (CPU, not yet GPU-wired) |
+| Token-level KV pool (SGLang-style) | ✅ |
 | Speculative decoding framework | ✅ (CPU stubs, GPU pending) |
 | Tensor parallel config + sharding math | ✅ (CPU, NCCL stubs) |
 | Rust agent binary (tool calling) | ✅ |
 | Python agent (async HTTP) | ✅ |
 | Dynamo distributed runtime integration | ✅ (optional feature) |
-| PagedAttention CUDA kernel | ❌ |
+| FlashInfer batched decode attention | ✅ |
+| Batched GEMM decode (multi-request) | ✅ |
+| CUDA Graph for batched decode | ✅ |
+| Batched sampling (single sync) | ✅ |
 | Llama / DeepSeek / Mistral / Gemma / Phi models | ❌ |
 | FlashAttention-3 | ❌ |
 | MLA attention (DeepSeek) | ❌ |
