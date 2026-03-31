@@ -617,7 +617,9 @@ impl<M: ModelForward> Scheduler<M> {
                 Some(&mut self.paged_kv_pool),
                 &mut self.decode_bufs,
             ) {
-                error!("Warmup: graph capture for B={} failed: {}", bs, e);
+                // OOM during graph capture is non-fatal — just skip larger batch sizes
+                info!("Warmup: graph capture for B={} failed ({}), skipping larger sizes", bs, e);
+                break;
             }
             let _ = self.model.device_context().sync();
         }
