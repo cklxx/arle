@@ -597,7 +597,7 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        info!("Warming up CUDA Graphs for batch sizes 2..{}...", num_slots);
+        info!("Warming up CUDA Graphs for batch sizes 1..{}...", num_slots);
         let t0 = std::time::Instant::now();
 
         // Each dummy slot needs at least 1 pool token so FlashInfer metadata is valid.
@@ -609,9 +609,10 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         // Run dummy forward for each batch_size to trigger graph capture.
+        // Includes B=1: all decode steps use the FlashInfer paged path.
         let dummy_tokens: Vec<u32> = vec![0; num_slots];
         let slot_indices: Vec<usize> = (0..num_slots).collect();
-        for bs in 2..=num_slots {
+        for bs in 1..=num_slots {
             let tokens = &dummy_tokens[..bs];
             let si = &slot_indices[..bs];
             if let Err(e) = self.model.forward_decode_batch(
@@ -635,7 +636,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         info!(
-            "CUDA Graph warmup done in {:.0}ms (batch sizes 2..{})",
+            "CUDA Graph warmup done in {:.0}ms (batch sizes 1..{})",
             t0.elapsed().as_secs_f64() * 1e3,
             num_slots,
         );

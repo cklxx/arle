@@ -273,14 +273,15 @@ impl ModelForward for Qwen3Model {
         paged_kv_pool: Option<&mut crate::paged_kv::PagedKVPool>,
         decode_bufs_cache: &mut Option<Box<dyn std::any::Any + Send>>,
     ) -> Result<()> {
-        if tokens.len() <= 1 {
-            if tokens.len() == 1 {
-                return self.forward(&[tokens[0]], &mut states[slot_indices[0]]);
-            }
+        if tokens.is_empty() {
             return Ok(());
         }
-        // FlashInfer token-pool path: use paged decode when pool has data.
-        // Falls back to sequential contiguous decode when pool is stub-sized.
+        // Always use the FlashInfer paged path when the pool is active, even for
+        // batch_size=1. Routing B=1 through the contiguous/Triton decode path
+        // causes greedy output divergence: (1) K/V is written only to the
+        // contiguous cache, not the pool, so later batches read stale pool data;
+        // (2) Triton and FlashInfer attention produce numerically different bf16
+        // results, making greedy (argmax) output depend on batch composition.
         match paged_kv_pool {
             Some(pool) if !pool.k_buffers.is_empty() => {
                 use super::batch_decode::BatchDecodeBuffers;

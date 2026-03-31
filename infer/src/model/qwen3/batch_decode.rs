@@ -163,7 +163,7 @@ impl Qwen3Model {
     ) -> Result<()> {
         let batch_size = tokens.len();
         debug_assert_eq!(batch_size, slot_indices.len());
-        debug_assert!(batch_size > 1);
+        debug_assert!(batch_size >= 1);
         debug_assert!(batch_size <= bufs.max_batch_size);
 
         let num_heads = self.config.num_attention_heads;
