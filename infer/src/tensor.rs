@@ -3,6 +3,7 @@
 use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use half::bf16;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::ffi;
@@ -284,6 +285,48 @@ impl HiddenStates {
             hidden_dim,
             seq_len,
         })
+    }
+}
+
+/// Cached raw CUDA device pointer for a pre-allocated buffer.
+///
+/// Avoids per-call overhead of cudarc's `device_ptr()` / `device_ptr_mut()`
+/// which perform atomic loads + SyncOnDrop bookkeeping even when event tracking
+/// is disabled.
+///
+/// # Safety invariants
+/// - The originating CudaSlice must outlive all uses of this pointer.
+/// - The originating CudaSlice must not be reallocated.
+/// - Only used from the single inference thread (single CUDA stream).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RawDevicePtr<T> {
+    ptr: u64,
+    _marker: PhantomData<*const T>,
+}
+
+// SAFETY: RawDevicePtr is only used from the single inference thread.
+unsafe impl<T> Send for RawDevicePtr<T> {}
+
+impl<T> RawDevicePtr<T> {
+    /// Get as const pointer for kernel read parameters.
+    pub(crate) fn as_ptr(self) -> *const T {
+        self.ptr as *const T
+    }
+
+    /// Get as mut pointer for kernel write parameters.
+    pub(crate) fn as_mut_ptr(self) -> *mut T {
+        self.ptr as *mut T
+    }
+}
+
+/// Extract and cache a raw device pointer from a CudaSlice.
+/// Calls device_ptr() once -- amortized over thousands of decode steps.
+pub(crate) fn cache_ptr<T>(slice: &CudaSlice<T>, ctx: &DeviceContext) -> RawDevicePtr<T> {
+    use cudarc::driver::DevicePtr;
+    let (ptr, _sync) = slice.device_ptr(&ctx.stream);
+    RawDevicePtr {
+        ptr,
+        _marker: PhantomData,
     }
 }
 

@@ -7,6 +7,14 @@ use cudarc::driver::CudaSlice;
 use super::config::Config;
 use crate::tensor::{DeviceContext, DeviceVec};
 
+/// Cached raw pointers for hot-path sampling ops (avoids cudarc device_ptr overhead).
+pub(crate) struct DecodeBufferPtrs {
+    pub logits_ptr: crate::tensor::RawDevicePtr<half::bf16>,
+    pub logits_len: usize,
+    pub sample_probs_ptr: crate::tensor::RawDevicePtr<f32>,
+    pub sample_out_ptr: crate::tensor::RawDevicePtr<i32>,
+}
+
 /// Pre-allocated temporary buffers for the single-token decode path.
 ///
 /// All buffer dimensions are determined by the model config and remain fixed
@@ -45,6 +53,8 @@ pub(crate) struct DecodeBuffers {
     pub(crate) partial_m: CudaSlice<f32>,
     /// Split-KV partial sum: [num_qheads * NUM_KV_SPLITS] f32
     pub(crate) partial_l: CudaSlice<f32>,
+    /// Cached raw device pointers for hot-path sampling ops.
+    pub(crate) ptrs: DecodeBufferPtrs,
 }
 
 impl DecodeBuffers {
@@ -57,6 +67,23 @@ impl DecodeBuffers {
         let kv_dim = config.num_key_value_heads * config.head_dim;
         let num_qheads = config.num_attention_heads;
 
+        let logits = DeviceVec::zeros(ctx, config.vocab_size)?;
+        let sample_probs: CudaSlice<f32> = ctx
+            .stream
+            .alloc_zeros(config.vocab_size)
+            .map_err(|e| anyhow::anyhow!("Alloc sample_probs failed: {}", e))?;
+        let sample_out: CudaSlice<i32> = ctx
+            .stream
+            .alloc_zeros(1)
+            .map_err(|e| anyhow::anyhow!("Alloc sample_out failed: {}", e))?;
+
+        let ptrs = DecodeBufferPtrs {
+            logits_ptr: crate::tensor::cache_ptr(&logits.data, ctx),
+            logits_len: config.vocab_size,
+            sample_probs_ptr: crate::tensor::cache_ptr(&sample_probs, ctx),
+            sample_out_ptr: crate::tensor::cache_ptr(&sample_out, ctx),
+        };
+
         Ok(Self {
             normed: DeviceVec::zeros(ctx, h)?,
             q: DeviceVec::zeros(ctx, q_dim)?,
@@ -67,19 +94,13 @@ impl DecodeBuffers {
             mlp_act: DeviceVec::zeros(ctx, config.intermediate_size)?,
             mlp_out: DeviceVec::zeros(ctx, h)?,
             hidden: DeviceVec::zeros(ctx, h)?,
-            logits: DeviceVec::zeros(ctx, config.vocab_size)?,
+            logits,
             decode_meta: ctx
                 .stream
                 .alloc_zeros(3)
                 .map_err(|e| anyhow::anyhow!("Alloc decode_meta failed: {}", e))?,
-            sample_probs: ctx
-                .stream
-                .alloc_zeros(config.vocab_size)
-                .map_err(|e| anyhow::anyhow!("Alloc sample_probs failed: {}", e))?,
-            sample_out: ctx
-                .stream
-                .alloc_zeros(1)
-                .map_err(|e| anyhow::anyhow!("Alloc sample_out failed: {}", e))?,
+            sample_probs,
+            sample_out,
             partial_out: ctx
                 .stream
                 .alloc_zeros(num_qheads * Self::NUM_KV_SPLITS * config.head_dim)
@@ -92,6 +113,7 @@ impl DecodeBuffers {
                 .stream
                 .alloc_zeros(num_qheads * Self::NUM_KV_SPLITS)
                 .map_err(|e| anyhow::anyhow!("Alloc partial_l failed: {}", e))?,
+            ptrs,
         })
     }
 }

@@ -81,6 +81,43 @@ pub fn argmax_batch(
     Ok(result.iter().map(|&x| x as u32).collect())
 }
 
+/// Launch batched argmax on a HiddenStates [B, vocab] buffer. No sync, no readback.
+pub(crate) fn argmax_batch_launch(
+    ctx: &DeviceContext,
+    logits: &crate::tensor::HiddenStates,
+    out: &mut CudaSlice<i32>,
+    batch_size: usize,
+) -> Result<()> {
+    let vocab_size = logits.hidden_dim;
+    let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::argmax_batch_cuda(
+            l_ptr as *const ffi::Half,
+            o_ptr as *mut i32,
+            batch_size as i32,
+            vocab_size as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+    Ok(())
+}
+
+/// Read back B argmax results into a pre-allocated host slice. Call after sync.
+pub(crate) fn argmax_batch_readback_into(
+    ctx: &DeviceContext,
+    out: &CudaSlice<i32>,
+    dst: &mut [i32],
+    batch_size: usize,
+) -> Result<()> {
+    let tmp = ctx
+        .stream
+        .clone_dtoh(&out.slice(0..batch_size))
+        .map_err(|e| anyhow!("D2H batch argmax readback: {e}"))?;
+    dst[..batch_size].copy_from_slice(&tmp);
+    Ok(())
+}
+
 /// GPU sampling: temperature → softmax → top-k → top-p → multinomial.
 /// Allocates a temporary output buffer — use `gpu_sample_into` for the decode loop.
 pub fn gpu_sample(
@@ -162,6 +199,44 @@ pub fn gpu_sample_launch(
                 p_ptr as *mut f32,
                 o_ptr as *mut i32,
                 logits.len as i32,
+                1.0 / params.temperature,
+                params.top_k,
+                params.top_p,
+                random_val,
+                ctx.stream.cu_stream(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Launch sampling kernel using pre-cached raw device pointers.
+/// Eliminates device_ptr() overhead on every call.
+pub(crate) fn gpu_sample_launch_raw(
+    ctx: &DeviceContext,
+    logits_ptr: crate::tensor::RawDevicePtr<half::bf16>,
+    logits_len: usize,
+    probs_ptr: crate::tensor::RawDevicePtr<f32>,
+    out_ptr: crate::tensor::RawDevicePtr<i32>,
+    params: &crate::sampler::SamplingParams,
+    random_val: f32,
+) -> Result<()> {
+    if params.is_greedy() {
+        unsafe {
+            ffi::argmax_cuda(
+                logits_ptr.as_ptr() as *const ffi::Half,
+                out_ptr.as_mut_ptr(),
+                logits_len as i32,
+                ctx.stream.cu_stream(),
+            );
+        }
+    } else {
+        unsafe {
+            ffi::gpu_sample_cuda(
+                logits_ptr.as_ptr() as *const ffi::Half,
+                probs_ptr.as_mut_ptr(),
+                out_ptr.as_mut_ptr(),
+                logits_len as i32,
                 1.0 / params.temperature,
                 params.top_k,
                 params.top_p,

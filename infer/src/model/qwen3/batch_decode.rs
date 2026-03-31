@@ -39,11 +39,13 @@ pub(crate) struct BatchDecodeBuffers {
     /// Embedding output buffer [max_batch_size, hidden_dim] — avoids alloc in graph.
     embedding_out: HiddenStates,
     /// Batched logits buffer [max_batch_size, vocab_size] — avoids alloc in graph.
-    logits_batch: Option<HiddenStates>,
+    pub(super) logits_batch: Option<HiddenStates>,
     /// Pre-allocated per-slot logits buffers (unused, kept for future non-greedy).
     logits_per_slot: Vec<DeviceVec>,
     /// Pre-allocated batch argmax output [max_batch_size] i32.
-    argmax_out: CudaSlice<i32>,
+    pub(super) argmax_out: CudaSlice<i32>,
+    /// Pre-allocated host buffer for batched argmax readback.
+    pub(super) argmax_host: Vec<i32>,
 
     /// Pre-allocated token_ids buffer — avoids clone_htod alloc every step.
     token_ids_gpu: CudaSlice<i32>,
@@ -105,6 +107,7 @@ impl BatchDecodeBuffers {
                 .stream
                 .alloc_zeros(max_batch_size)
                 .map_err(|e| anyhow::anyhow!("Alloc argmax_out failed: {e}"))?,
+            argmax_host: vec![0i32; max_batch_size],
 
             token_ids_gpu: ctx
                 .stream

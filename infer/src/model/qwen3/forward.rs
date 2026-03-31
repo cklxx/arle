@@ -229,25 +229,35 @@ impl ModelForward for Qwen3Model {
         params: &[&crate::sampler::SamplingParams],
         rng: &mut rand::rngs::StdRng,
     ) -> anyhow::Result<Vec<u32>> {
-        use rand::Rng;
         let b = slot_indices.len();
 
-        // Phase 1: Launch all sampling kernels (no sync between them)
+        // Phase 1: Launch all sampling kernels using cached pointers
         for i in 0..b {
             let si = slot_indices[i];
             let random_val: f32 = rng.random();
-            let logits = states[si]
-                .prefill_logits
-                .as_ref()
-                .unwrap_or(&states[si].decode_bufs.logits);
-            crate::ops::gpu_sample_launch(
-                &self.ctx,
-                logits,
-                &mut states[si].decode_bufs.sample_probs,
-                &mut states[si].decode_bufs.sample_out,
-                params[i],
-                random_val,
-            )?;
+            // When prefill_logits is set, fall back to the non-cached path
+            if states[si].prefill_logits.is_some() {
+                let logits = states[si].prefill_logits.as_ref().unwrap();
+                crate::ops::gpu_sample_launch(
+                    &self.ctx,
+                    logits,
+                    &mut states[si].decode_bufs.sample_probs,
+                    &mut states[si].decode_bufs.sample_out,
+                    params[i],
+                    random_val,
+                )?;
+            } else {
+                let ptrs = &states[si].decode_bufs.ptrs;
+                crate::ops::gpu_sample_launch_raw(
+                    &self.ctx,
+                    ptrs.logits_ptr,
+                    ptrs.logits_len,
+                    ptrs.sample_probs_ptr,
+                    ptrs.sample_out_ptr,
+                    params[i],
+                    random_val,
+                )?;
+            }
         }
 
         // Phase 2: Single sync
@@ -263,6 +273,40 @@ impl ModelForward for Qwen3Model {
             )?);
         }
         Ok(tokens)
+    }
+
+    fn sample_batch_greedy(
+        &self,
+        slot_indices: &[usize],
+        decode_bufs_cache: &mut Option<Box<dyn std::any::Any + Send>>,
+    ) -> Result<Option<Vec<u32>>> {
+        use super::batch_decode::BatchDecodeBuffers;
+        let bufs = match decode_bufs_cache {
+            Some(cache) => match cache.downcast_mut::<BatchDecodeBuffers>() {
+                Some(b) => b,
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+        let logits = match bufs.logits_batch.as_ref() {
+            Some(l) if l.seq_len > 0 => l,
+            _ => return Ok(None),
+        };
+        let batch_size = slot_indices.len();
+        crate::ops::argmax_batch_launch(&self.ctx, logits, &mut bufs.argmax_out, batch_size)?;
+        self.ctx.sync()?;
+        crate::ops::argmax_batch_readback_into(
+            &self.ctx,
+            &bufs.argmax_out,
+            &mut bufs.argmax_host,
+            batch_size,
+        )?;
+        Ok(Some(
+            bufs.argmax_host[..batch_size]
+                .iter()
+                .map(|&x| x as u32)
+                .collect(),
+        ))
     }
 
     fn forward_decode_batch(
