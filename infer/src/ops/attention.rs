@@ -232,6 +232,10 @@ pub fn prefill_attention_hd256_batch_with_scratch(
     assert_eq!(output.seq_len, seq_len);
     assert_eq!(q_prepped.hidden_dim, q_dim);
 
+    // Derive max_seq_len from the K cache buffer size.
+    let head_dim = 256;
+    let max_seq_len = k_cache.len / (num_kv_heads * head_dim);
+
     unsafe {
         let (qf_ptr, _gqf) = q_full_batch.data.device_ptr(&ctx.stream);
         let (k_ptr, _gk) = k_batch.data.device_ptr(&ctx.stream);
@@ -262,6 +266,7 @@ pub fn prefill_attention_hd256_batch_with_scratch(
             sp_ptr as *const i32,
             rotary_dim as i32,
             rms_eps,
+            max_seq_len as i32,
             ctx.stream.cu_stream(),
         );
     }
