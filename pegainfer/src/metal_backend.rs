@@ -3,12 +3,13 @@
 //! Uses [`mlx-rs`](https://crates.io/crates/mlx-rs) (Rust bindings to Apple's
 //! MLX framework) for Metal-accelerated tensor operations.
 //!
-//! # Status
+//! # Architecture
 //!
-//! The load path (model ID → local cache → config + tokenizer) is fully
-//! implemented.  The actual forward pass is stubbed with `todo!()` — MLX
-//! tensor construction is laid out but the full transformer implementation
-//! requires `mlx-rs` to stabilise its higher-level ops API.
+//! Implements a full Qwen2.5 transformer forward pass:
+//! - safetensors weight loading into MLX unified memory
+//! - RMSNorm, RoPE, GQA attention, SwiGLU MLP
+//! - Simple append-based KV cache (one buffer per generate call)
+//! - Greedy / temperature + top-p sampling
 //!
 //! # Feature flag
 //!
@@ -25,6 +26,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 
@@ -51,7 +53,7 @@ pub struct MetalBackend {
     /// Loaded model configuration.
     config: Option<MetalModelConfig>,
     /// Weight tensors — resident in Metal unified memory.
-    /// GPU required: populated in `load()` via mlx-rs.
+    // GPU required: populated in `load()` via mlx-rs.
     #[cfg(feature = "metal")]
     weights: Option<MetalWeights>,
     #[cfg(not(feature = "metal"))]
@@ -70,6 +72,8 @@ pub struct MetalModelConfig {
     pub max_position_embeddings: usize,
     pub rms_norm_eps: f64,
     pub rope_theta: f64,
+    /// Token ID that signals end-of-generation. Defaults to 151645 (Qwen2.5 `<|im_end|>`).
+    pub eos_token_id: u32,
 }
 
 /// Weight tensors loaded from safetensors shards into Metal unified memory.
@@ -136,11 +140,8 @@ impl InferenceBackend for MetalBackend {
     /// `model_path` may be:
     /// - An existing local directory (e.g. `/path/to/Qwen2.5-0.5B-Instruct`)
     /// - A HuggingFace model ID (e.g. `"Qwen/Qwen2.5-0.5B-Instruct"`)
-    ///
-    /// If the model ID is not found locally it is automatically downloaded to
-    /// `~/.cache/huggingface/hub/` via [`hf_hub::resolve_model_path`].
     fn load(&mut self, model_path: &Path) -> Result<()> {
-        // ── 1. Resolve model path (local or HF Hub download) ────────────────
+        // ── 1. Resolve model path ────────────────────────────────────────────
         let path_str = model_path.to_string_lossy();
         let local_dir = hf_hub::resolve_model_path(&path_str)
             .with_context(|| format!("failed to resolve model '{path_str}'"))?;
@@ -148,21 +149,20 @@ impl InferenceBackend for MetalBackend {
         log::info!("MetalBackend: loading model from {}", local_dir.display());
 
         // ── 2. Load tokenizer ────────────────────────────────────────────────
-        // Tokenizer::from_file expects the model directory (it appends /tokenizer.json).
         let tokenizer = Tokenizer::from_file(local_dir.to_str().unwrap_or("."))
             .with_context(|| format!("failed to load tokenizer from {}", local_dir.display()))?;
 
         // ── 3. Parse config.json ─────────────────────────────────────────────
-        let config = load_metal_config(&local_dir)
-            .with_context(|| "failed to parse config.json")?;
+        let config = load_metal_config(&local_dir)?;
 
         log::info!(
-            "  arch: {} layers, hidden={}, heads={}/{}(kv), vocab={}",
+            "  arch: {} layers, hidden={}, heads={}/{}(kv), vocab={}, eos={}",
             config.num_hidden_layers,
             config.hidden_size,
             config.num_attention_heads,
             config.num_key_value_heads,
             config.vocab_size,
+            config.eos_token_id,
         );
 
         // ── 4. Load weights into Metal memory ───────────────────────────────
@@ -171,6 +171,7 @@ impl InferenceBackend for MetalBackend {
             let weights = load_metal_weights(&local_dir, &config)
                 .with_context(|| "failed to load weights into Metal memory")?;
             self.weights = Some(weights);
+            log::info!("  weights loaded into Metal unified memory");
         }
         #[cfg(not(feature = "metal"))]
         {
@@ -200,19 +201,22 @@ impl InferenceBackend for MetalBackend {
         // ── Forward pass + sampling (Metal GPU required) ─────────────────────
         #[cfg(feature = "metal")]
         {
-            let weights = self
-                .weights
-                .as_ref()
-                .context("weights not loaded")?;
+            let weights = self.weights.as_ref().context("weights not loaded")?;
 
-            let max_new_tokens = 256usize; // TODO: surface through SamplingParams or a wrapper
+            let max_new_tokens = 512usize;
+            let t0 = Instant::now();
+
             let generated = metal_generate(
                 &input_ids,
                 weights,
                 config,
                 params,
                 max_new_tokens,
+                t0,
             )?;
+
+            let elapsed = t0.elapsed().as_secs_f64();
+            let gen_tps = generated.len() as f64 / elapsed.max(1e-9);
 
             let text = tokenizer.decode(&generated)?;
             return Ok(GenerateResult {
@@ -221,7 +225,7 @@ impl InferenceBackend for MetalBackend {
                 completion_tokens: generated.len(),
                 finish_reason: "stop".to_string(),
                 prompt_tps: 0.0,
-                generation_tps: 0.0,
+                generation_tps: gen_tps,
             });
         }
 
@@ -239,49 +243,290 @@ impl InferenceBackend for MetalBackend {
 
 // ── Metal forward pass (GPU required) ────────────────────────────────────────
 
-/// Autoregressive generation loop using MLX Metal kernels.
+/// Autoregressive generation using MLX Metal kernels.
 ///
-/// ## Skeleton (to be completed)
-///
+/// Forward pass per step:
 /// ```text
-/// input_ids → embed → [transformer layer × N] → lm_head → logits
-///                                                              ↓
-///                                                    sample next token
-///                                                              ↓
-///                                              append to kv_cache, repeat
+/// input_ids → embed → [transformer layer × N] → norm → lm_head → logits → sample
 /// ```
 ///
-/// Each transformer layer:
-/// 1. `x = input_layernorm(x)`
-/// 2. `q,k,v = x @ q_proj, k_proj, v_proj`
-/// 3. Apply RoPE to q, k
-/// 4. Grouped-query attention → `attn_out`
-/// 5. `x = x + o_proj(attn_out)`
-/// 6. `x = post_attention_layernorm(x)`
-/// 7. `gate = silu(x @ gate_proj) * (x @ up_proj)`
-/// 8. `x = x + gate @ down_proj`
-///
+/// Transformer layer (Qwen2.5):
+/// 1. `residual = x`
+/// 2. `x = rms_norm(x, input_layernorm)`
+/// 3. `q = rms_norm(x @ q_proj.T, q_norm)`, `k = rms_norm(x @ k_proj.T, k_norm)`
+/// 4. `v = x @ v_proj.T`
+/// 5. Reshape, apply RoPE to q/k, append to KV cache
+/// 6. GQA via `fast::scaled_dot_product_attention`
+/// 7. `x = residual + attn_out @ o_proj.T`
+/// 8. `x = x + silu(x_norm @ gate.T) * (x_norm @ up.T) @ down.T`
 // GPU required: all tensor operations use mlx-rs Arrays on Metal unified memory.
 #[cfg(feature = "metal")]
 fn metal_generate(
-    _input_ids: &[u32],
-    _weights: &MetalWeights,
-    _config: &MetalModelConfig,
-    _params: &SamplingParams,
-    _max_new_tokens: usize,
+    input_ids: &[u32],
+    weights: &MetalWeights,
+    config: &MetalModelConfig,
+    params: &SamplingParams,
+    max_new_tokens: usize,
+    t0: Instant,
 ) -> Result<Vec<u32>> {
-    // GPU required: implement transformer forward pass + sampling with mlx-rs ops.
-    // Key ops needed:
-    //   mlx_rs::ops::take()         — token embedding lookup
-    //   mlx_rs::ops::matmul()       — Q/K/V projections, MLP
-    //   mlx_rs::ops::fast::rope()   — rotary position embeddings
-    //   mlx_rs::ops::fast::rms_norm() — layer normalisation
-    //   mlx_rs::ops::softmax()      — attention weights
-    //   mlx_rs::ops::silu()         — SwiGLU activation
-    todo!(
-        "GPU required: Metal transformer forward pass not yet implemented. \
-         Implement using mlx_rs::ops — see function doc for layer structure."
-    )
+    use mlx_rs::{
+        fast,
+        nn::silu,
+        ops::{self, concatenate_axis, reshape, transpose_axes},
+        ops::indexing::{argmax, take_axis},
+        transforms::eval,
+    };
+
+    let n_layers = config.num_hidden_layers;
+    let n_heads = config.num_attention_heads as i32;
+    let n_kv_heads = config.num_key_value_heads as i32;
+    let head_dim = (config.hidden_size / config.num_attention_heads) as i32;
+    let eps = config.rms_norm_eps as f32;
+    let rope_base = config.rope_theta as f32;
+    let eos_id = config.eos_token_id;
+    let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    // Per-layer KV cache: None until first use, then [1, n_kv_heads, kv_len, head_dim]
+    let mut kv_cache: Vec<Option<(Array, Array)>> = vec![None; n_layers];
+
+    let mut generated: Vec<u32> = Vec::new();
+    let mut first_token_logged = false;
+    let mut cache_len: i32 = 0;
+
+    // Prefill on first step, then single-token decode
+    let mut current_ids: Vec<u32> = input_ids.to_vec();
+
+    loop {
+        let seq = current_ids.len() as i32;
+
+        // ── Embedding lookup ─────────────────────────────────────────────────
+        // Wrap token IDs into a 1-D int32 Array and do a row-gather on the table.
+        let idx_i32: Vec<i32> = current_ids.iter().map(|&t| t as i32).collect();
+        let idx_arr = Array::from_slice(&idx_i32, &[seq]);
+        // embed: [seq, hidden]
+        let mut x = take_axis(&weights.embed_tokens, &idx_arr, 0)
+            .context("embedding take_axis")?;
+
+        // ── Transformer layers ────────────────────────────────────────────────
+        for (li, layer) in weights.layers.iter().enumerate() {
+            // 1. Input norm + residual
+            let residual = x.clone();
+            x = fast::rms_norm(&x, &layer.input_layernorm, eps)
+                .context("input_layernorm")?;
+
+            // 2. QKV projections  [seq, n_heads*head_dim], [seq, n_kv_heads*head_dim]
+            let q_raw = linear(&x, &layer.q_proj)?;
+            let k_raw = linear(&x, &layer.k_proj)?;
+            let v_raw = linear(&x, &layer.v_proj)?;
+
+            // 3. Per-head QK norm (Qwen2.5): reshape → rms_norm → reshape
+            let q_raw = apply_head_norm(&q_raw, seq, n_heads, head_dim, &layer.q_norm, eps)?;
+            let k_raw = apply_head_norm(&k_raw, seq, n_kv_heads, head_dim, &layer.k_norm, eps)?;
+
+            // 4. Reshape to [1, seq, n_heads, head_dim] for RoPE
+            let q = reshape(&q_raw, &[1, seq, n_heads, head_dim])
+                .context("reshape q")?;
+            let k = reshape(&k_raw, &[1, seq, n_kv_heads, head_dim])
+                .context("reshape k")?;
+            let v = reshape(&v_raw, &[1, seq, n_kv_heads, head_dim])
+                .context("reshape v")?;
+
+            // 5. RoPE (input: [1, seq, n_heads, head_dim], traditional=false)
+            let q = fast::rope(&q, head_dim, false, rope_base, 1.0f32, cache_len, None)
+                .context("rope q")?;
+            let k = fast::rope(&k, head_dim, false, rope_base, 1.0f32, cache_len, None)
+                .context("rope k")?;
+
+            // 6. Transpose to [1, n_heads, seq, head_dim] for attention
+            let q = transpose_axes(&q, &[0, 2, 1, 3]).context("transpose q")?;
+            let k = transpose_axes(&k, &[0, 2, 1, 3]).context("transpose k")?;
+            let v = transpose_axes(&v, &[0, 2, 1, 3]).context("transpose v")?;
+
+            // 7. KV cache: concatenate along seq axis (axis=2)
+            let (k_full, v_full) = match kv_cache[li].take() {
+                None => (k, v),
+                Some((k_prev, v_prev)) => {
+                    let kk = concatenate_axis(&[&k_prev, &k], 2)
+                        .context("concat k_cache")?;
+                    let vv = concatenate_axis(&[&v_prev, &v], 2)
+                        .context("concat v_cache")?;
+                    (kk, vv)
+                }
+            };
+
+            // 8. Grouped-query attention (Metal-optimised for seq_len=1 decode)
+            // q: [1, n_heads, seq, head_dim]
+            // k/v: [1, n_kv_heads, total_kv_len, head_dim]
+            let use_causal = cache_len == 0 && seq > 1;
+            let mask_arg = if use_causal {
+                Some(fast::ScaledDotProductAttentionMask::Causal)
+            } else {
+                None
+            };
+            let attn_out =
+                fast::scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, mask_arg)
+                    .context("scaled_dot_product_attention")?;
+            // attn_out: [1, n_heads, seq, head_dim]
+
+            kv_cache[li] = Some((k_full, v_full));
+
+            // 9. Reshape back to [seq, hidden] and project
+            let attn_out = transpose_axes(&attn_out, &[0, 2, 1, 3])
+                .context("transpose attn_out")?;
+            let attn_out = reshape(&attn_out, &[seq, n_heads * head_dim])
+                .context("reshape attn_out")?;
+            let attn_out = linear(&attn_out, &layer.o_proj)?;
+            x = ops::add(&residual, &attn_out).context("residual + attn")?;
+
+            // 10. Post-attention norm + SwiGLU MLP
+            let residual2 = x.clone();
+            let xn = fast::rms_norm(&x, &layer.post_attention_layernorm, eps)
+                .context("post_attn_layernorm")?;
+
+            let gate = silu(&linear(&xn, &layer.gate_proj)?).context("silu gate")?;
+            let up   = linear(&xn, &layer.up_proj)?;
+            let mlp  = linear(&ops::multiply(&gate, &up).context("gate*up")?, &layer.down_proj)?;
+            x = ops::add(&residual2, &mlp).context("residual + mlp")?;
+        }
+
+        // ── Final norm + lm_head ─────────────────────────────────────────────
+        // Take the last token's hidden state for the logit projection.
+        let last_idx = Array::from_slice(&[seq - 1], &[1]);
+        let last_x = take_axis(&x, &last_idx, 0).context("take last hidden")?;
+        let last_x = fast::rms_norm(&last_x, &weights.norm, eps).context("final norm")?;
+        let logits = linear(&last_x, &weights.lm_head)?; // [1, vocab]
+
+        // Materialise logits on CPU for sampling
+        eval(&[&logits]).context("eval logits")?;
+
+        // ── Sampling ─────────────────────────────────────────────────────────
+        let next_token = sample_token(&logits, params)?;
+
+        if !first_token_logged {
+            let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            log::info!("  TTFT: {ttft_ms:.1}ms (including prefill of {} tokens)", input_ids.len());
+            first_token_logged = true;
+        }
+
+        let stop = next_token == eos_id || params.stop_token_ids.contains(&next_token);
+        generated.push(next_token);
+        cache_len += seq;
+
+        if stop || generated.len() >= max_new_tokens {
+            break;
+        }
+
+        // Next step: single new token
+        current_ids = vec![next_token];
+    }
+
+    let elapsed = t0.elapsed().as_secs_f64();
+    let tps = generated.len() as f64 / elapsed.max(1e-9);
+    log::info!("  generated {} tokens  ({tps:.1} tok/s)", generated.len());
+
+    Ok(generated)
+}
+
+/// `x @ weight.T` — no bias, weight stored as [out, in].
+#[cfg(feature = "metal")]
+#[inline]
+fn linear(x: &Array, weight: &Array) -> Result<Array> {
+    use mlx_rs::ops::transpose;
+    let w_t = transpose(weight).context("weight transpose")?;
+    mlx_rs::ops::matmul(x, &w_t).context("matmul")
+}
+
+/// Reshape `x` to [seq, n_heads, head_dim], apply RMS-norm, reshape back.
+#[cfg(feature = "metal")]
+fn apply_head_norm(
+    x: &Array,
+    seq: i32,
+    n_heads: i32,
+    head_dim: i32,
+    norm_weight: &Array,
+    eps: f32,
+) -> Result<Array> {
+    use mlx_rs::{fast, ops::reshape};
+    let x3 = reshape(x, &[seq, n_heads, head_dim]).context("reshape for head_norm")?;
+    let x3 = fast::rms_norm(&x3, norm_weight, eps).context("head rms_norm")?;
+    reshape(&x3, &[seq, n_heads * head_dim]).context("reshape after head_norm")
+}
+
+/// Sample the next token from `logits` with shape [1, vocab].
+#[cfg(feature = "metal")]
+fn sample_token(logits: &Array, params: &SamplingParams) -> Result<u32> {
+    use mlx_rs::{ops::{multiply, softmax_axis}, ops::indexing::argmax, transforms::eval};
+
+    let temp = params.temperature;
+
+    // Greedy
+    if temp <= 1e-6 {
+        let best = argmax(logits, None).context("argmax")?;
+        eval(&[&best])?;
+        return Ok(best.item::<i32>() as u32);
+    }
+
+    // Temperature scaling → softmax → float32 probs
+    let inv_t: Array = (1.0f32 / temp).into();
+    let scaled = multiply(logits, &inv_t).context("temp scale")?;
+    let probs = softmax_axis(&scaled, -1).context("softmax")?;
+    // Cast to f32 for CPU-side sampling (weights may be bf16)
+    let probs_f32 = probs.as_type::<f32>().context("probs cast to f32")?;
+    eval(&[&probs_f32])?;
+    let probs_slice: &[f32] = probs_f32.as_slice();
+
+    if params.top_p >= 1.0 - 1e-6 || params.top_p <= 0.0 {
+        return sample_multinomial(probs_slice);
+    }
+
+    // Top-p (nucleus) sampling
+    let mut indexed: Vec<(f32, usize)> = probs_slice
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, p)| (p, i))
+        .collect();
+    indexed.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let top_p = params.top_p;
+    let mut cum = 0.0f32;
+    let mut cutoff = indexed.len();
+    for (i, (p, _)) in indexed.iter().enumerate() {
+        cum += p;
+        if cum >= top_p {
+            cutoff = i + 1;
+            break;
+        }
+    }
+    let nucleus = &indexed[..cutoff];
+    let sum: f32 = nucleus.iter().map(|(p, _)| p).sum();
+    if sum <= 0.0 {
+        return Ok(indexed[0].1 as u32);
+    }
+
+    let r: f32 = rand::random::<f32>() * sum;
+    let mut acc = 0.0f32;
+    for (p, idx) in nucleus {
+        acc += p;
+        if acc >= r {
+            return Ok(*idx as u32);
+        }
+    }
+    Ok(nucleus.last().map_or(0, |(_, i)| *i) as u32)
+}
+
+/// Multinomial sampling from a flat probability distribution.
+#[cfg(feature = "metal")]
+fn sample_multinomial(probs: &[f32]) -> Result<u32> {
+    let r: f32 = rand::random::<f32>();
+    let mut acc = 0.0f32;
+    for (i, &p) in probs.iter().enumerate() {
+        acc += p;
+        if acc >= r {
+            return Ok(i as u32);
+        }
+    }
+    Ok((probs.len().saturating_sub(1)) as u32)
 }
 
 // ── Config loading ─────────────────────────────────────────────────────────────
@@ -290,66 +535,126 @@ fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
     let path = model_dir.join("config.json");
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read {}", path.display()))?;
-    let v: serde_json::Value =
-        serde_json::from_str(&raw).context("config.json is not valid JSON")?;
+    let v: serde_json::Value = serde_json::from_str(&raw).context("config.json parse")?;
 
     fn get_usize(v: &serde_json::Value, key: &str, default: usize) -> usize {
-        v.get(key)
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or(default)
+        v.get(key).and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(default)
     }
     fn get_f64(v: &serde_json::Value, key: &str, default: f64) -> f64 {
-        v.get(key)
-            .and_then(|x| x.as_f64())
-            .unwrap_or(default)
+        v.get(key).and_then(|x| x.as_f64()).unwrap_or(default)
     }
 
+    // eos_token_id may be a scalar or a list; take the first value.
+    let eos_token_id: u32 = v
+        .get("eos_token_id")
+        .and_then(|e| {
+            e.as_u64().map(|n| n as u32).or_else(|| {
+                e.as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|x| x.as_u64())
+                    .map(|n| n as u32)
+            })
+        })
+        .unwrap_or(151645); // Qwen2.5 <|im_end|>
+
     Ok(MetalModelConfig {
-        hidden_size:              get_usize(&v, "hidden_size",              2048),
-        num_attention_heads:      get_usize(&v, "num_attention_heads",      16),
-        num_key_value_heads:      get_usize(&v, "num_key_value_heads",      8),
-        num_hidden_layers:        get_usize(&v, "num_hidden_layers",        24),
-        intermediate_size:        get_usize(&v, "intermediate_size",        11008),
-        vocab_size:               get_usize(&v, "vocab_size",               151936),
-        max_position_embeddings:  get_usize(&v, "max_position_embeddings",  32768),
-        rms_norm_eps:             get_f64(&v,   "rms_norm_eps",             1e-6),
-        rope_theta:               get_f64(&v,   "rope_theta",               10000.0),
+        hidden_size:             get_usize(&v, "hidden_size",             2048),
+        num_attention_heads:     get_usize(&v, "num_attention_heads",     16),
+        num_key_value_heads:     get_usize(&v, "num_key_value_heads",     8),
+        num_hidden_layers:       get_usize(&v, "num_hidden_layers",       24),
+        intermediate_size:       get_usize(&v, "intermediate_size",       11008),
+        vocab_size:              get_usize(&v, "vocab_size",              151936),
+        max_position_embeddings: get_usize(&v, "max_position_embeddings", 32768),
+        rms_norm_eps:            get_f64(&v, "rms_norm_eps",             1e-6),
+        rope_theta:              get_f64(&v, "rope_theta",               1_000_000.0),
+        eos_token_id,
     })
 }
 
 // ── Weight loading (Metal GPU required) ───────────────────────────────────────
 
-/// Load all safetensors shards from `model_dir` into Metal unified memory.
-// GPU required: mlx-rs Array backed by Metal buffers.
+/// Load safetensors shards into Metal unified memory via mlx-rs.
+// GPU required: Array is backed by Metal buffers.
 #[cfg(feature = "metal")]
 fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<MetalWeights> {
-    use mlx_rs::Array;
+    use std::collections::HashMap;
+    use mlx_rs::Dtype;
 
-    // Collect shard files (model.safetensors or model-00001-of-00002.safetensors …)
     let shards = collect_safetensors_shards(model_dir)?;
     if shards.is_empty() {
-        anyhow::bail!("no .safetensors files found in {}", model_dir.display());
+        anyhow::bail!("no .safetensors files in {}", model_dir.display());
+    }
+    log::info!("  loading {} shard(s) …", shards.len());
+
+    let mut tensors: HashMap<String, Array> = HashMap::new();
+
+    for shard_path in &shards {
+        let bytes = std::fs::read(shard_path)
+            .with_context(|| format!("read shard {}", shard_path.display()))?;
+        let st = safetensors::SafeTensors::deserialize(&bytes)
+            .with_context(|| format!("parse safetensors {}", shard_path.display()))?;
+
+        for (name, view) in st.tensors() {
+            let shape: Vec<i32> = view.shape().iter().map(|&d| d as i32).collect();
+            let dtype = match view.dtype() {
+                safetensors::Dtype::F32  => Dtype::Float32,
+                safetensors::Dtype::F16  => Dtype::Float16,
+                safetensors::Dtype::BF16 => Dtype::Bfloat16,
+                safetensors::Dtype::I32  => Dtype::Int32,
+                other => anyhow::bail!("unsupported dtype {:?} for '{}'", other, name),
+            };
+            // SAFETY: `bytes` is alive for this scope; from_raw_data copies into Metal memory.
+            let arr = unsafe {
+                Array::from_raw_data(view.data().as_ptr().cast(), &shape, dtype)
+            };
+            tensors.insert(name.to_string(), arr);
+        }
     }
 
-    log::info!("  loading {} weight shard(s) into Metal memory", shards.len());
+    log::info!("  parsed {} tensors", tensors.len());
 
-    // TODO(metal): use mlx_rs::load_safetensors() once that API stabilises.
-    // For now, fall back to the safetensors crate to mmap the files, then copy
-    // each tensor's raw bytes into an mlx_rs::Array via from_slice().
-    //
-    // GPU required: the Array constructor transfers data to Metal unified memory.
-    todo!(
-        "GPU required: safetensors → mlx-rs Array loading not yet implemented. \
-         Tracking: https://github.com/oxideai/mlx-rs/issues"
-    )
+    let get = |name: &str| -> Result<Array> {
+        tensors
+            .get(name)
+            .cloned()
+            .with_context(|| format!("missing weight '{name}'"))
+    };
+
+    let embed_tokens = get("model.embed_tokens.weight")?;
+    let norm = get("model.norm.weight")?;
+    // lm_head may be weight-tied to embed_tokens
+    let lm_head = tensors
+        .get("lm_head.weight")
+        .cloned()
+        .unwrap_or_else(|| embed_tokens.clone());
+
+    let n = config.num_hidden_layers;
+    let mut layers = Vec::with_capacity(n);
+    for i in 0..n {
+        let p = |s: &str| format!("model.layers.{i}.{s}");
+        layers.push(MetalLayerWeights {
+            q_proj:                   get(&p("self_attn.q_proj.weight"))?,
+            k_proj:                   get(&p("self_attn.k_proj.weight"))?,
+            v_proj:                   get(&p("self_attn.v_proj.weight"))?,
+            o_proj:                   get(&p("self_attn.o_proj.weight"))?,
+            q_norm:                   get(&p("self_attn.q_norm.weight"))?,
+            k_norm:                   get(&p("self_attn.k_norm.weight"))?,
+            gate_proj:                get(&p("mlp.gate_proj.weight"))?,
+            up_proj:                  get(&p("mlp.up_proj.weight"))?,
+            down_proj:                get(&p("mlp.down_proj.weight"))?,
+            input_layernorm:          get(&p("input_layernorm.weight"))?,
+            post_attention_layernorm: get(&p("post_attention_layernorm.weight"))?,
+        });
+    }
+
+    Ok(MetalWeights { embed_tokens, layers, norm, lm_head })
 }
 
-/// Return all `.safetensors` shard paths sorted by filename.
+/// Sorted list of `.safetensors` shards in `model_dir`.
 #[cfg(feature = "metal")]
-fn collect_safetensors_shards(model_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
-    let mut shards: Vec<_> = std::fs::read_dir(model_dir)
-        .with_context(|| format!("cannot read dir {}", model_dir.display()))?
+fn collect_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut shards: Vec<PathBuf> = std::fs::read_dir(model_dir)
+        .with_context(|| format!("read_dir {}", model_dir.display()))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
