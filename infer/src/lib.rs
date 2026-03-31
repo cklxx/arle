@@ -2,6 +2,8 @@
 #[cfg(feature = "cuda")]
 mod ffi;
 #[cfg(feature = "cuda")]
+pub(crate) mod flashinfer_metadata;
+#[cfg(feature = "cuda")]
 pub mod model;
 #[cfg(feature = "cuda")]
 pub mod ops;

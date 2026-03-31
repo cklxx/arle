@@ -6,8 +6,7 @@ use super::decode_buffers::DecodeBuffers35;
 use super::recurrent_state::RecurrentState;
 use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::Qwen35Model;
-use crate::model::cuda_graph::CudaGraphState;
-use crate::model::kv_cache::KVCache;
+use crate::model::generation_state::GenerationStateBase;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
 use crate::sampler::SamplingParams;
@@ -17,17 +16,15 @@ pub struct Qwen35State {
     pub(super) ctx: DeviceContext,
     pub(super) decode_bufs: DecodeBuffers35,
     pub(super) single_token_bufs: SingleTokenBuffers,
-    pub(super) kv_cache: KVCache,
+    pub(crate) base: GenerationStateBase,
     pub(super) recurrent_state: RecurrentState,
-    pub(super) graph_state: CudaGraphState,
-    pub(super) prefill_logits: Option<DeviceVec>,
 }
 
 // SAFETY: `Qwen35State` contains CUDA resources (`DeviceContext`, `CudaSlice` inside
-// `DecodeBuffers35`, `SingleTokenBuffers`, `KVCache`, `RecurrentState`,
-// `CudaGraphState`, `DeviceVec`) that hold raw CUDA device pointers.
-// These types are `!Send` by default because CUDA contexts and allocations
-// must be accessed from the thread that created them.
+// `DecodeBuffers35`, `SingleTokenBuffers`, `GenerationStateBase` wrapping `KVCache`,
+// `CudaGraphState`, `DeviceVec`, plus `RecurrentState`) that hold raw CUDA device
+// pointers.  These types are `!Send` by default because CUDA contexts and
+// allocations must be accessed from the thread that created them.
 //
 // Invariant upheld: every `Qwen35State` instance is exclusively owned by its
 // scheduler slot and only ever accessed from the single blocking inference
@@ -40,37 +37,31 @@ unsafe impl Send for Qwen35State {}
 
 impl GenerationState for Qwen35State {
     fn logits(&self) -> &DeviceVec {
-        self.prefill_logits
-            .as_ref()
-            .unwrap_or(&self.single_token_bufs.logits)
+        self.base.logits_or(&self.single_token_bufs.logits)
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.kv_cache.reset();
+        self.base.reset()?;
         self.recurrent_state.reset(&self.ctx)?;
-        self.graph_state = CudaGraphState::new();
-        self.prefill_logits = None;
         Ok(())
     }
 
     fn truncate_to(&mut self, len: usize) -> Result<()> {
-        self.kv_cache.truncate_to(len);
-        self.graph_state = CudaGraphState::new();
-        self.prefill_logits = None;
+        self.base.truncate_to(len)?;
         self.recurrent_state.reset(&self.ctx)?;
         Ok(())
     }
 
     fn set_max_gpu_kv(&mut self, max_tokens: usize) {
-        self.kv_cache.set_max_gpu_seq_len(max_tokens);
+        self.base.set_max_gpu_kv(max_tokens);
     }
 
     fn set_max_seq_len(&mut self, max_seq: usize) {
-        self.kv_cache.set_max_seq_len(max_seq);
+        self.base.set_max_seq_len(max_seq);
     }
 
     fn offload_kv_if_needed(&mut self) -> Result<()> {
-        self.kv_cache.offload_if_needed(&self.ctx)
+        self.base.offload_kv_if_needed(&self.ctx)
     }
 
     fn migrate_kv_to_paged(
@@ -79,13 +70,7 @@ impl GenerationState for Qwen35State {
         pool: &crate::paged_kv::PagedKVPool,
         slot: usize,
     ) -> Result<()> {
-        pool.migrate_from_contiguous(
-            ctx,
-            slot,
-            &self.kv_cache.k_caches(),
-            &self.kv_cache.v_caches(),
-            self.kv_cache.max_seq_len(),
-        )
+        self.base.migrate_kv_to_paged(ctx, pool, slot)
     }
 }
 
@@ -97,13 +82,11 @@ impl ModelForward for Qwen35Model {
             ctx: self.ctx.clone(),
             decode_bufs: DecodeBuffers35::new(&self.ctx, &self.config)?,
             single_token_bufs: SingleTokenBuffers::new(&self.ctx, &self.config)?,
-            kv_cache: KVCache::new(
+            base: GenerationStateBase::new(
                 self.config.num_full_attention_layers(),
                 self.config.num_key_value_heads,
             ),
             recurrent_state: RecurrentState::new(&self.ctx, &self.config)?,
-            graph_state: CudaGraphState::new(),
-            prefill_logits: None,
         })
     }
 
@@ -130,23 +113,23 @@ impl ModelForward for Qwen35Model {
 
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
         // Prefetch offloaded KV before PREFILL only.
-        if tokens.len() > 1 && state.kv_cache.has_offloaded() {
-            state.kv_cache.prefetch_to_gpu(&self.ctx)?;
+        if tokens.len() > 1 && state.base.kv_cache.has_offloaded() {
+            state.base.kv_cache.prefetch_to_gpu(&self.ctx)?;
         }
 
         if tokens.len() == 1 {
             self.prefill_forward_single_token(
                 tokens[0],
-                &mut state.kv_cache,
+                &mut state.base.kv_cache,
                 &mut state.recurrent_state,
                 &mut state.single_token_bufs,
-                &mut state.graph_state,
+                &mut state.base.graph_state,
             )?;
-            state.prefill_logits = None;
+            state.base.prefill_logits = None;
         } else {
             let logits =
-                self.prefill_forward(tokens, &mut state.kv_cache, &mut state.recurrent_state)?;
-            state.prefill_logits = Some(logits);
+                self.prefill_forward(tokens, &mut state.base.kv_cache, &mut state.recurrent_state)?;
+            state.base.prefill_logits = Some(logits);
         }
 
         Ok(())
@@ -159,10 +142,7 @@ impl ModelForward for Qwen35Model {
         rng: &mut StdRng,
     ) -> Result<u32> {
         let random_val: f32 = rng.random();
-        let logits = state
-            .prefill_logits
-            .as_ref()
-            .unwrap_or(&state.single_token_bufs.logits);
+        let logits = state.base.logits_or(&state.single_token_bufs.logits);
         ops::gpu_sample_into(
             &self.ctx,
             logits,

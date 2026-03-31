@@ -8,6 +8,7 @@ use crate::sampler::SamplingParams;
 use crate::tensor::{DeviceContext, DeviceVec};
 
 pub(crate) mod cuda_graph;
+pub(crate) mod generation_state;
 mod kv_cache;
 
 pub mod qwen3;

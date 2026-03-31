@@ -4,8 +4,7 @@ use rand::rngs::StdRng;
 
 use super::decode_buffers::DecodeBuffers;
 use super::weights::Qwen3Model;
-use crate::model::cuda_graph::CudaGraphState;
-use crate::model::kv_cache::KVCache;
+use crate::model::generation_state::GenerationStateBase;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
 use crate::sampler::SamplingParams;
@@ -15,16 +14,14 @@ use crate::tensor::DeviceVec;
 pub struct Qwen3State {
     pub(super) ctx: crate::tensor::DeviceContext,
     pub(crate) decode_bufs: DecodeBuffers,
-    pub(super) kv_cache: KVCache,
-    pub(super) graph_state: CudaGraphState,
-    /// Logits from multi-token prefill (None after decode path — logits are in decode_bufs).
-    pub(crate) prefill_logits: Option<DeviceVec>,
+    pub(crate) base: GenerationStateBase,
 }
 
 // SAFETY: `Qwen3State` contains CUDA resources (`DeviceContext`, `CudaSlice` inside
-// `DecodeBuffers`, `KVCache`, `CudaGraphState`, `DeviceVec`) that hold raw CUDA
-// device pointers.  These types are `!Send` by default because CUDA contexts and
-// allocations must be accessed from the thread that created them.
+// `DecodeBuffers`, `GenerationStateBase` wrapping `KVCache`, `CudaGraphState`,
+// `DeviceVec`) that hold raw CUDA device pointers.  These types are `!Send` by
+// default because CUDA contexts and allocations must be accessed from the thread
+// that created them.
 //
 // Invariant upheld: every `Qwen3State` instance is exclusively owned by its
 // scheduler slot and only ever accessed from the single blocking inference
@@ -37,35 +34,27 @@ unsafe impl Send for Qwen3State {}
 
 impl GenerationState for Qwen3State {
     fn logits(&self) -> &DeviceVec {
-        self.prefill_logits
-            .as_ref()
-            .unwrap_or(&self.decode_bufs.logits)
+        self.base.logits_or(&self.decode_bufs.logits)
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.kv_cache.reset();
-        self.prefill_logits = None;
-        self.graph_state = CudaGraphState::new(); // Invalidate CUDA graph
-        Ok(())
+        self.base.reset()
     }
 
     fn truncate_to(&mut self, len: usize) -> Result<()> {
-        self.kv_cache.truncate_to(len);
-        self.prefill_logits = None;
-        self.graph_state = CudaGraphState::new();
-        Ok(())
+        self.base.truncate_to(len)
     }
 
     fn set_max_gpu_kv(&mut self, max_tokens: usize) {
-        self.kv_cache.set_max_gpu_seq_len(max_tokens);
+        self.base.set_max_gpu_kv(max_tokens);
     }
 
     fn set_max_seq_len(&mut self, max_seq: usize) {
-        self.kv_cache.set_max_seq_len(max_seq);
+        self.base.set_max_seq_len(max_seq);
     }
 
     fn offload_kv_if_needed(&mut self) -> Result<()> {
-        self.kv_cache.offload_if_needed(&self.ctx)
+        self.base.offload_kv_if_needed(&self.ctx)
     }
 
     fn migrate_kv_to_paged(
@@ -74,13 +63,7 @@ impl GenerationState for Qwen3State {
         pool: &crate::paged_kv::PagedKVPool,
         slot: usize,
     ) -> Result<()> {
-        pool.migrate_from_contiguous(
-            ctx,
-            slot,
-            &self.kv_cache.k_caches(),
-            &self.kv_cache.v_caches(),
-            self.kv_cache.max_seq_len(),
-        )
+        self.base.migrate_kv_to_paged(ctx, pool, slot)
     }
 }
 
@@ -91,12 +74,10 @@ impl ModelForward for Qwen3Model {
         Ok(Qwen3State {
             ctx: self.ctx.clone(),
             decode_bufs: DecodeBuffers::new(&self.ctx, &self.config)?,
-            kv_cache: KVCache::new(
+            base: GenerationStateBase::new(
                 self.config.num_hidden_layers,
                 self.config.num_key_value_heads,
             ),
-            graph_state: CudaGraphState::new(),
-            prefill_logits: None,
         })
     }
 
@@ -123,24 +104,25 @@ impl ModelForward for Qwen3Model {
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
         // Prefetch offloaded KV before PREFILL only (not every decode step).
         // During decode of a single request, all KV stays on GPU.
-        if tokens.len() > 1 && state.kv_cache.has_offloaded() {
-            state.kv_cache.prefetch_to_gpu(&self.ctx)?;
+        if tokens.len() > 1 && state.base.kv_cache.has_offloaded() {
+            state.base.kv_cache.prefetch_to_gpu(&self.ctx)?;
         }
 
         if tokens.len() == 1 {
             self.decode_one_token(
                 tokens[0],
-                &mut state.kv_cache,
+                &mut state.base.kv_cache,
                 &mut state.decode_bufs,
-                &mut state.graph_state,
+                &mut state.base.graph_state,
             )?;
-            state.prefill_logits = None;
+            state.base.prefill_logits = None;
         } else {
-            let start_pos = state.kv_cache.len();
+            let start_pos = state.base.kv_cache.len();
             let hidden = self.get_embeddings_batch(tokens)?;
-            let hidden = self.process_all_layers_batch(hidden, start_pos, &mut state.kv_cache)?;
+            let hidden =
+                self.process_all_layers_batch(hidden, start_pos, &mut state.base.kv_cache)?;
             let logits = self.compute_logits_batch(&hidden)?;
-            state.prefill_logits = Some(logits);
+            state.base.prefill_logits = Some(logits);
         }
 
         // NOTE: offload_if_needed is NOT called here. It is called between
@@ -160,8 +142,8 @@ impl ModelForward for Qwen3Model {
         new_token_indices: &cudarc::driver::CudaSlice<i32>,
     ) -> Result<()> {
         // Prefetch offloaded KV before PREFILL only.
-        if tokens.len() > 1 && state.kv_cache.has_offloaded() {
-            state.kv_cache.prefetch_to_gpu(&self.ctx)?;
+        if tokens.len() > 1 && state.base.kv_cache.has_offloaded() {
+            state.base.kv_cache.prefetch_to_gpu(&self.ctx)?;
         }
 
         if tokens.len() == 1 {
@@ -170,24 +152,24 @@ impl ModelForward for Qwen3Model {
             // decode_prep_paged kernel.
             self.decode_one_token(
                 tokens[0],
-                &mut state.kv_cache,
+                &mut state.base.kv_cache,
                 &mut state.decode_bufs,
-                &mut state.graph_state,
+                &mut state.base.graph_state,
             )?;
-            state.prefill_logits = None;
+            state.base.prefill_logits = None;
         } else {
-            let start_pos = state.kv_cache.len();
+            let start_pos = state.base.kv_cache.len();
             let hidden = self.get_embeddings_batch(tokens)?;
             // Dual-write: writes K/V to both contiguous cache AND token pool.
             let hidden = self.process_all_layers_batch_with_pool(
                 hidden,
                 start_pos,
-                &mut state.kv_cache,
+                &mut state.base.kv_cache,
                 pool,
                 new_token_indices,
             )?;
             let logits = self.compute_logits_batch(&hidden)?;
-            state.prefill_logits = Some(logits);
+            state.base.prefill_logits = Some(logits);
         }
 
         Ok(())
@@ -200,10 +182,7 @@ impl ModelForward for Qwen3Model {
         rng: &mut StdRng,
     ) -> Result<u32> {
         let random_val: f32 = rng.random();
-        let logits = state
-            .prefill_logits
-            .as_ref()
-            .unwrap_or(&state.decode_bufs.logits);
+        let logits = state.base.logits_or(&state.decode_bufs.logits);
         ops::gpu_sample_into(
             &self.ctx,
             logits,
@@ -236,8 +215,8 @@ impl ModelForward for Qwen3Model {
             let si = slot_indices[i];
             let random_val: f32 = rng.random();
             // When prefill_logits is set, fall back to the non-cached path
-            if states[si].prefill_logits.is_some() {
-                let logits = states[si].prefill_logits.as_ref().unwrap();
+            if states[si].base.prefill_logits.is_some() {
+                let logits = states[si].base.prefill_logits.as_ref().unwrap();
                 crate::ops::gpu_sample_launch(
                     &self.ctx,
                     logits,
