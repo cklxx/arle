@@ -101,3 +101,18 @@ pub(crate) fn extract_vec(
 
     Ok(out)
 }
+
+/// Extract into a pre-allocated DeviceVec (zero-alloc D2D copy).
+pub(crate) fn extract_vec_into(
+    ctx: &DeviceContext,
+    batch: &HiddenStates,
+    token_idx: usize,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    let offset = token_idx * batch.hidden_dim;
+    let src_view = batch.data.slice(offset..offset + batch.hidden_dim);
+    ctx.stream
+        .memcpy_dtod(&src_view, &mut out.data)
+        .map_err(|e| anyhow!("Device copy failed: {}", e))?;
+    Ok(())
+}

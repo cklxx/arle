@@ -40,8 +40,11 @@ pub(crate) struct BatchDecodeBuffers {
     embedding_out: HiddenStates,
     /// Batched logits buffer [max_batch_size, vocab_size] — avoids alloc in graph.
     logits_batch: Option<HiddenStates>,
-    /// Per-slot logits extracted from batched logits.
+    /// Pre-allocated per-slot logits buffers — avoids GPU alloc in extract loop.
     logits_per_slot: Vec<DeviceVec>,
+
+    /// Pre-allocated token_ids buffer — avoids clone_htod alloc every step.
+    token_ids_gpu: CudaSlice<i32>,
 
     // FlashInfer paged attention buffers
     positions: CudaSlice<i32>,
@@ -91,7 +94,12 @@ impl BatchDecodeBuffers {
 
             embedding_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
             logits_batch: None, // lazy-allocated on first use (needs vocab_size)
-            logits_per_slot: Vec::new(),
+            logits_per_slot: Vec::new(), // lazy-allocated on first use (needs vocab_size)
+
+            token_ids_gpu: ctx
+                .stream
+                .alloc_zeros(max_batch_size)
+                .map_err(|e| anyhow::anyhow!("Alloc token_ids_gpu failed: {e}"))?,
 
             positions: ctx
                 .stream
@@ -223,15 +231,14 @@ impl Qwen3Model {
         // Embedding (has H2D copy — must be outside graph)
         bufs.embedding_out.seq_len = batch_size;
         let token_ids_i32: Vec<i32> = tokens.iter().map(|&x| x as i32).collect();
-        let token_ids_gpu = self
-            .ctx
+        self.ctx
             .stream
-            .clone_htod(&token_ids_i32)
+            .memcpy_htod(&token_ids_i32, &mut bufs.token_ids_gpu)
             .map_err(|e| anyhow::anyhow!("H2D token_ids: {e}"))?;
         ops::embedding_batch(
             &self.ctx,
             &self.embed_tokens,
-            &token_ids_gpu,
+            &bufs.token_ids_gpu,
             &mut bufs.embedding_out,
         )?;
 
@@ -286,12 +293,14 @@ impl Qwen3Model {
             }
         }
 
-        // Extract per-slot logits
-        let logits = bufs.logits_batch.as_mut().unwrap();
-        logits.seq_len = batch_size;
+        // Extract per-slot logits directly into each state's pre-allocated decode_bufs.logits.
+        // This avoids GPU memory allocation on every step (the previous path allocated
+        // a new DeviceVec per request per step via extract_vec).
+        let logits = bufs.logits_batch.as_ref().unwrap();
         for (b, &si) in slot_indices.iter().enumerate() {
-            let slot_logits = ops::extract_vec(&self.ctx, logits, b)?;
-            states[si].prefill_logits = Some(slot_logits);
+            ops::extract_vec_into(&self.ctx, logits, b, &mut states[si].decode_bufs.logits)?;
+            // Clear prefill_logits so select_tokens_batch reads from decode_bufs.logits.
+            states[si].prefill_logits = None;
         }
 
         Ok(())
