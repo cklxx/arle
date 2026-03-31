@@ -585,8 +585,59 @@ impl<M: ModelForward> Scheduler<M> {
         Some(effective)
     }
 
+    /// Pre-capture CUDA Graphs for batched decode at common batch sizes.
+    /// Eliminates p99 latency spikes from runtime graph capture during serving.
+    fn warmup_cuda_graphs(&mut self) {
+        let num_slots = self.states.len();
+        if num_slots < 2 || self.paged_kv_pool.k_buffers.is_empty() {
+            return;
+        }
+
+        info!("Warming up CUDA Graphs for batch sizes 2..{}...", num_slots);
+        let t0 = std::time::Instant::now();
+
+        // Each dummy slot needs at least 1 pool token so FlashInfer metadata is valid.
+        for slot in 0..num_slots {
+            if let Err(e) = self.paged_kv_pool.alloc_tokens(slot, 1) {
+                error!("Warmup: pool alloc for slot {} failed: {}", slot, e);
+                return;
+            }
+        }
+
+        // Run dummy forward for each batch_size to trigger graph capture.
+        let dummy_tokens: Vec<u32> = vec![0; num_slots];
+        let slot_indices: Vec<usize> = (0..num_slots).collect();
+        for bs in 2..=num_slots {
+            let tokens = &dummy_tokens[..bs];
+            let si = &slot_indices[..bs];
+            if let Err(e) = self.model.forward_decode_batch(
+                tokens,
+                &mut self.states,
+                si,
+                Some(&mut self.paged_kv_pool),
+                &mut self.decode_bufs,
+            ) {
+                error!("Warmup: graph capture for B={} failed: {}", bs, e);
+            }
+            let _ = self.model.device_context().sync();
+        }
+
+        // Clean up: free dummy tokens, reset states
+        for slot in 0..num_slots {
+            self.paged_kv_pool.free_slot(slot);
+            let _ = self.states[slot].reset();
+        }
+
+        info!(
+            "CUDA Graph warmup done in {:.0}ms (batch sizes 2..{})",
+            t0.elapsed().as_secs_f64() * 1e3,
+            num_slots,
+        );
+    }
+
     /// Run the scheduler loop. Blocks until all handles are dropped.
     pub fn run(mut self) {
+        self.warmup_cuda_graphs();
         info!("Scheduler run loop started");
         loop {
             // 1. Drain incoming requests

@@ -40,10 +40,11 @@ E2E tests compare against JSON baselines in `test_data/`. Regenerate baselines a
 ```
 HTTP Request → SchedulerHandle.submit() → channel → Scheduler.run() (dedicated thread)
                                                         │
-                                              ┌─── State Pool (N slots, each with KV cache) ───┐
+                                              ┌─── Token-level KV Pool (SGLang-style paged) ───┐
                                               │         │                                       │
                                               │   Decode priority round-robin                   │
                                               │   Chunked prefill (512 tok/chunk)               │
+                                              │   Batched decode (FlashInfer + CUDA Graph)      │
                                               │         │                                       │
                                               └─── model.forward(tokens, &mut slot.state) ──────┘
                                                         │
