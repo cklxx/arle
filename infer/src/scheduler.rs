@@ -306,36 +306,30 @@ impl ActiveRequest {
 
         // Emit delta
         if let Some(ref stops) = self.stop {
-            // Check stop sequences
-            for stop in stops {
-                if stop.is_empty() {
-                    continue;
-                }
-                if let Some(pos) = self.full_decoded.find(stop.as_str()) {
-                    if pos > self.sent_len {
+            match check_stop_sequences(&self.full_decoded, stops) {
+                StopCheckResult::StopFound { stop_pos } => {
+                    if stop_pos > self.sent_len {
                         let _ = self.delta_tx.send(StreamDelta {
-                            text_delta: self.full_decoded[self.sent_len..pos].to_string(),
+                            text_delta: self.full_decoded[self.sent_len..stop_pos].to_string(),
                             finish_reason: None,
                             usage: None,
                         });
                     }
-                    self.sent_len = pos;
+                    self.sent_len = stop_pos;
                     self.phase = Phase::Finished;
                     self.send_finish(FinishReason::Stop);
                     return;
                 }
-            }
-
-            // Hold back max_stop_len characters
-            let max_stop_len = stops.iter().map(|s| s.len()).max().unwrap_or(0);
-            let safe_len = self.full_decoded.len().saturating_sub(max_stop_len);
-            if safe_len > self.sent_len {
-                let _ = self.delta_tx.send(StreamDelta {
-                    text_delta: self.full_decoded[self.sent_len..safe_len].to_string(),
-                    finish_reason: None,
-                    usage: None,
-                });
-                self.sent_len = safe_len;
+                StopCheckResult::NoStop { safe_len } => {
+                    if safe_len > self.sent_len {
+                        let _ = self.delta_tx.send(StreamDelta {
+                            text_delta: self.full_decoded[self.sent_len..safe_len].to_string(),
+                            finish_reason: None,
+                            usage: None,
+                        });
+                        self.sent_len = safe_len;
+                    }
+                }
             }
         } else if self.full_decoded.len() > self.sent_len {
             let _ = self.delta_tx.send(StreamDelta {
@@ -357,15 +351,14 @@ impl ActiveRequest {
         // Flush remaining text
         if !self.generated_tokens.is_empty() {
             if let Ok(full_text) = tokenizer.decode(&self.generated_tokens) {
-                let mut end = full_text.len();
-                // Truncate at stop sequence if present
-                if let Some(ref stops) = self.stop {
-                    for stop in stops {
-                        if let Some(pos) = full_text.find(stop.as_str()) {
-                            end = end.min(pos);
-                        }
+                let end = if let Some(ref stops) = self.stop {
+                    match check_stop_sequences(&full_text, stops) {
+                        StopCheckResult::StopFound { stop_pos } => stop_pos,
+                        StopCheckResult::NoStop { .. } => full_text.len(),
                     }
-                }
+                } else {
+                    full_text.len()
+                };
                 if end > self.sent_len {
                     let _ = self.delta_tx.send(StreamDelta {
                         text_delta: full_text[self.sent_len..end].to_string(),
@@ -390,6 +383,41 @@ impl ActiveRequest {
             }),
         });
     }
+}
+
+// ============================================================================
+// Stop-sequence helpers
+// ============================================================================
+
+/// Result of scanning decoded text for stop sequences.
+#[cfg(feature = "cuda")]
+enum StopCheckResult {
+    /// No stop found. Safe to emit text up to `safe_len` (holds back
+    /// `max_stop_len` bytes to avoid splitting a partially-matched stop).
+    NoStop { safe_len: usize },
+    /// Stop sequence found; text up to `stop_pos` should be emitted, then
+    /// the request should finish.
+    StopFound { stop_pos: usize },
+}
+
+/// Scan `text` for any of the given stop sequences.
+///
+/// When no stop is found, returns `NoStop` with a safe emit length that
+/// withholds `max_stop_len` bytes from the tail (in case a stop sequence
+/// straddles the boundary of text decoded so far).
+#[cfg(feature = "cuda")]
+fn check_stop_sequences(text: &str, stops: &[String]) -> StopCheckResult {
+    for stop in stops {
+        if stop.is_empty() {
+            continue;
+        }
+        if let Some(pos) = text.find(stop.as_str()) {
+            return StopCheckResult::StopFound { stop_pos: pos };
+        }
+    }
+    let max_stop_len = stops.iter().map(|s| s.len()).max().unwrap_or(0);
+    let safe_len = text.len().saturating_sub(max_stop_len);
+    StopCheckResult::NoStop { safe_len }
 }
 
 // ============================================================================

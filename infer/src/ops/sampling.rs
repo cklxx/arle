@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use cudarc::driver::sys::CUstream;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
@@ -36,49 +37,6 @@ pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
         .map_err(|e| anyhow!("D2H copy failed: {}", e))?;
 
     Ok(result[0] as u32)
-}
-
-/// Batched argmax — returns the index of the maximum element for each of B rows.
-///
-/// Input: `logits` is a contiguous [B, vocab_size] bf16 tensor.
-/// Output: `out` is a pre-allocated [B] i32 buffer on device.
-/// Launches B blocks of 1024 threads in a single kernel.
-pub fn argmax_batch(
-    ctx: &DeviceContext,
-    logits: &DeviceVec,
-    out: &mut CudaSlice<i32>,
-    batch_size: usize,
-    vocab_size: usize,
-) -> Result<Vec<u32>> {
-    assert_eq!(
-        logits.len,
-        batch_size * vocab_size,
-        "logits length must equal batch_size * vocab_size"
-    );
-
-    {
-        let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
-        let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
-
-        unsafe {
-            ffi::argmax_batch_cuda(
-                l_ptr as *const ffi::Half,
-                o_ptr as *mut i32,
-                batch_size as i32,
-                vocab_size as i32,
-                ctx.stream.cu_stream(),
-            );
-        }
-    }
-
-    ctx.sync()?;
-
-    let result = ctx
-        .stream
-        .clone_dtoh(out)
-        .map_err(|e| anyhow!("D2H batch argmax read failed: {}", e))?;
-
-    Ok(result.iter().map(|&x| x as u32).collect())
 }
 
 /// Launch batched argmax on a HiddenStates [B, vocab] buffer. No sync, no readback.
@@ -169,6 +127,39 @@ fn gpu_sample_core(
     Ok(result[0] as u32)
 }
 
+/// Core sampling kernel dispatch -- used by all public launch variants.
+///
+/// Greedy (temperature=0): launches argmax kernel.
+/// Non-greedy: launches full sampling kernel (temperature + softmax + top-k/p).
+///
+/// # Safety
+/// All pointers must be valid device pointers on the given stream.
+unsafe fn launch_sample_kernel_inner(
+    logits_ptr: *const ffi::Half,
+    logits_len: i32,
+    probs_ptr: *mut f32,
+    out_ptr: *mut i32,
+    params: &crate::sampler::SamplingParams,
+    random_val: f32,
+    stream: CUstream,
+) {
+    if params.is_greedy() {
+        ffi::argmax_cuda(logits_ptr, out_ptr, logits_len, stream);
+    } else {
+        ffi::gpu_sample_cuda(
+            logits_ptr,
+            probs_ptr,
+            out_ptr,
+            logits_len,
+            1.0 / params.temperature,
+            params.top_k,
+            params.top_p,
+            random_val,
+            stream,
+        );
+    }
+}
+
 /// Launch the sampling kernel without syncing. Call `ctx.sync()` separately.
 pub fn gpu_sample_launch(
     ctx: &DeviceContext,
@@ -178,34 +169,19 @@ pub fn gpu_sample_launch(
     params: &crate::sampler::SamplingParams,
     random_val: f32,
 ) -> Result<()> {
-    if params.is_greedy() {
-        let (x_ptr, _gx) = logits.data.device_ptr(&ctx.stream);
-        let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
-        unsafe {
-            ffi::argmax_cuda(
-                x_ptr as *const ffi::Half,
-                o_ptr as *mut i32,
-                logits.len as i32,
-                ctx.stream.cu_stream(),
-            );
-        }
-    } else {
-        let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
-        let (p_ptr, _gp) = probs_scratch.device_ptr_mut(&ctx.stream);
-        let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
-        unsafe {
-            ffi::gpu_sample_cuda(
-                l_ptr as *const ffi::Half,
-                p_ptr as *mut f32,
-                o_ptr as *mut i32,
-                logits.len as i32,
-                1.0 / params.temperature,
-                params.top_k,
-                params.top_p,
-                random_val,
-                ctx.stream.cu_stream(),
-            );
-        }
+    let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+    let (p_ptr, _gp) = probs_scratch.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    unsafe {
+        launch_sample_kernel_inner(
+            l_ptr as *const ffi::Half,
+            logits.len as i32,
+            p_ptr as *mut f32,
+            o_ptr as *mut i32,
+            params,
+            random_val,
+            ctx.stream.cu_stream(),
+        );
     }
     Ok(())
 }
@@ -221,29 +197,16 @@ pub(crate) fn gpu_sample_launch_raw(
     params: &crate::sampler::SamplingParams,
     random_val: f32,
 ) -> Result<()> {
-    if params.is_greedy() {
-        unsafe {
-            ffi::argmax_cuda(
-                logits_ptr.as_ptr() as *const ffi::Half,
-                out_ptr.as_mut_ptr(),
-                logits_len as i32,
-                ctx.stream.cu_stream(),
-            );
-        }
-    } else {
-        unsafe {
-            ffi::gpu_sample_cuda(
-                logits_ptr.as_ptr() as *const ffi::Half,
-                probs_ptr.as_mut_ptr(),
-                out_ptr.as_mut_ptr(),
-                logits_len as i32,
-                1.0 / params.temperature,
-                params.top_k,
-                params.top_p,
-                random_val,
-                ctx.stream.cu_stream(),
-            );
-        }
+    unsafe {
+        launch_sample_kernel_inner(
+            logits_ptr.as_ptr() as *const ffi::Half,
+            logits_len as i32,
+            probs_ptr.as_mut_ptr(),
+            out_ptr.as_mut_ptr(),
+            params,
+            random_val,
+            ctx.stream.cu_stream(),
+        );
     }
     Ok(())
 }
