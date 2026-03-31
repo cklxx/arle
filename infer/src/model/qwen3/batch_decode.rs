@@ -254,16 +254,10 @@ impl Qwen3Model {
             head_dim,
         )?;
 
-        // Embedding (token_ids already on GPU from the batch H2D above)
         bufs.embedding_out.seq_len = batch_size;
-        ops::embedding_batch(
-            &self.ctx,
-            &self.embed_tokens,
-            &bufs.token_ids_gpu,
-            &mut bufs.embedding_out,
-        )?;
 
-        // ── Graph body: layers + final norm + logits GEMM ──
+        // ── Graph body: embedding + layers + final norm + logits GEMM ──
+        // Embedding reads from token_ids_gpu (H2D done above, pointer is stable).
         // All use pre-allocated buffers with stable pointers.
 
         // Lazy-init logits buffer (allocation — must be before any graph capture)
@@ -327,8 +321,9 @@ impl Qwen3Model {
         Ok(())
     }
 
-    /// Graph body: embedding_out → layers → final norm → logits.
+    /// Graph body: embedding → layers → final norm → logits.
     /// All buffers are pre-allocated in `bufs`. No allocations, no H2D copies.
+    /// Embedding reads from token_ids_gpu (H2D done before graph, pointer stable).
     fn decode_batch_graph_body(
         &self,
         bufs: &mut BatchDecodeBuffers,
@@ -336,6 +331,14 @@ impl Qwen3Model {
         batch_size: usize,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
+
+        // Embedding (reads from pre-allocated token_ids_gpu, written by H2D before graph)
+        ops::embedding_batch(
+            &self.ctx,
+            &self.embed_tokens,
+            &bufs.token_ids_gpu,
+            &mut bufs.embedding_out,
+        )?;
 
         // Use embedding_out as the initial hidden state. The layer loop
         // ping-pongs between embedding_out and hidden_out via swap.
