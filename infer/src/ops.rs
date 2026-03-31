@@ -37,6 +37,8 @@ pub use sampling::{
 pub(crate) use attention::flash_attention_prefill_hd256_into;
 pub(crate) use elementwise::{add_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into};
 pub(crate) use linear::{gemm_into, linear};
-pub(crate) use norm::{rms_norm, rms_norm_batch_into, rms_norm_gated_batch_into};
+pub(crate) use norm::{
+    fused_add_rms_norm_batch_into, rms_norm, rms_norm_batch_into, rms_norm_gated_batch_into,
+};
 pub(crate) use recurrent::{conv1d_prefill_batch_into, gated_delta_rule_decode_into};
 pub(crate) use sampling::{argmax_batch_launch, argmax_batch_readback_into, gpu_sample_launch_raw};
