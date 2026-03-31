@@ -8,6 +8,8 @@ pub mod ops;
 #[cfg(feature = "cuda")]
 pub mod tensor;
 #[cfg(feature = "cuda")]
+pub mod paged_kv;
+#[cfg(feature = "cuda")]
 pub mod weight_loader;
 
 // Always-available modules (pure Rust, no GPU dependency).
