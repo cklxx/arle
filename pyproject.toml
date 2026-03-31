@@ -21,9 +21,3 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
 ]
-
-[project.scripts]
-agent-infer = "agent_infer.__main__:main"
-
-[tool.setuptools.packages.find]
-include = ["agent_infer*"]
