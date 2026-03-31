@@ -61,6 +61,13 @@ pub struct MetalBackend {
     _weights: (),
 }
 
+/// MLX affine quantization parameters (from `config.json → "quantization"`).
+#[derive(Debug, Clone, Copy)]
+pub struct QuantConfig {
+    pub group_size: i32,
+    pub bits: i32,
+}
+
 /// Parsed fields from config.json that the Metal forward pass needs.
 #[derive(Debug, Clone)]
 pub struct MetalModelConfig {
@@ -73,40 +80,65 @@ pub struct MetalModelConfig {
     pub max_position_embeddings: usize,
     pub rms_norm_eps: f64,
     pub rope_theta: f64,
+    /// Per-head dimension. Qwen3 models set this explicitly in config.json; for
+    /// others it falls back to `hidden_size / num_attention_heads`.
+    pub head_dim: usize,
     /// Token ID that signals end-of-generation. Defaults to 151645 (Qwen2.5 `<|im_end|>`).
     pub eos_token_id: u32,
+    /// MLX 4-bit quantization config, or `None` for full-precision (BF16/F16).
+    pub quantization: Option<QuantConfig>,
+}
+
+/// A weight matrix that is either full-precision BF16 or MLX affine 4-bit quantized.
+///
+/// MLX quantization format (affine per-group):
+/// - `w`: packed uint32 — shape `[out, in / (32/bits)]`
+/// - `scales`: f16/bf16 — shape `[out, in / group_size]`
+/// - `biases`: f16/bf16 — shape `[out, in / group_size]`
+// GPU required: Array is backed by Metal buffers.
+#[cfg(feature = "metal")]
+pub enum WeightTensor {
+    Dense(Array),
+    Quantized {
+        w: Array,
+        scales: Array,
+        biases: Array,
+        group_size: i32,
+        bits: i32,
+    },
 }
 
 /// Weight tensors loaded from safetensors shards into Metal unified memory.
 // GPU required: all fields are mlx-rs Arrays backed by Metal buffers.
 #[cfg(feature = "metal")]
 pub struct MetalWeights {
-    /// Token embedding table — shape [vocab_size, hidden_size].
+    /// Token embedding table — shape [vocab_size, hidden_size] (dequantized to float at load).
     pub embed_tokens: Array,
     /// Per-layer attention + MLP weights.
     pub layers: Vec<MetalLayerWeights>,
     /// Final layer-norm scale — shape [hidden_size].
     pub norm: Array,
-    /// Output projection (lm_head) — shape [vocab_size, hidden_size].
-    pub lm_head: Array,
+    /// Output projection (lm_head) — dense or quantized.
+    pub lm_head: WeightTensor,
 }
 
 /// Weights for a single transformer layer.
-// GPU required: all fields are mlx-rs Arrays.
+// GPU required: all fields are mlx-rs Arrays or WeightTensors.
 #[cfg(feature = "metal")]
 pub struct MetalLayerWeights {
-    // Self-attention
-    pub q_proj: Array,
-    pub k_proj: Array,
-    pub v_proj: Array,
-    pub o_proj: Array,
+    // Self-attention projections (possibly quantized)
+    pub q_proj: WeightTensor,
+    pub k_proj: WeightTensor,
+    pub v_proj: WeightTensor,
+    pub o_proj: WeightTensor,
+    // MLP projections (possibly quantized)
+    pub gate_proj: WeightTensor,
+    pub up_proj: WeightTensor,
+    pub down_proj: WeightTensor,
+    // Per-head QK norms (always float)
     pub q_norm: Array,
     pub k_norm: Array,
-    // MLP
-    pub gate_proj: Array,
-    pub up_proj: Array,
-    pub down_proj: Array,
-    // Layer norms
+    // Layer norms (always float)
     pub input_layernorm: Array,
     pub post_attention_layernorm: Array,
 }
@@ -285,7 +317,7 @@ fn metal_generate(
     let n_layers = config.num_hidden_layers;
     let n_heads = config.num_attention_heads as i32;
     let n_kv_heads = config.num_key_value_heads as i32;
-    let head_dim = (config.hidden_size / config.num_attention_heads) as i32;
+    let head_dim = config.head_dim as i32;
     let eps = config.rms_norm_eps as f32;
     let rope_base = config.rope_theta as f32;
     let eos_id = config.eos_token_id;
@@ -448,13 +480,30 @@ fn metal_generate(
     Ok(generated)
 }
 
-/// `x @ weight.T` — no bias, weight stored as [out, in].
+/// `x @ weight.T` — no bias, dispatches to dense matmul or quantized matmul.
 #[cfg(feature = "metal")]
 #[inline]
-fn linear(x: &Array, weight: &Array) -> Result<Array> {
-    use mlx_rs::ops::transpose;
-    let w_t = transpose(weight).context("weight transpose")?;
-    mlx_rs::ops::matmul(x, &w_t).context("matmul")
+fn linear(x: &Array, weight: &WeightTensor) -> Result<Array> {
+    match weight {
+        WeightTensor::Dense(w) => {
+            use mlx_rs::ops::transpose;
+            let w_t = transpose(w).context("weight transpose")?;
+            mlx_rs::ops::matmul(x, &w_t).context("matmul")
+        }
+        WeightTensor::Quantized { w, scales, biases, group_size, bits } => {
+            // w stored as [out, in] packed uint32; transpose=true → x @ w.T
+            mlx_rs::ops::quantized_matmul(
+                x,
+                w,
+                scales,
+                biases,
+                Some(true),
+                Some(*group_size),
+                Some(*bits),
+            )
+            .context("quantized_matmul")
+        }
+    }
 }
 
 /// Reshape `x` to [seq, n_heads, head_dim], apply RMS-norm, reshape back.
@@ -586,9 +635,33 @@ fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         })
         .unwrap_or(151_645); // Qwen2.5 <|im_end|>
 
+    // MLX-LM 4-bit quantization config lives under "quantization" key.
+    let quantization = v.get("quantization").map(|q| QuantConfig {
+        group_size: q
+            .get("group_size")
+            .and_then(serde_json::Value::as_i64)
+            .map(|n| n as i32)
+            .unwrap_or(64),
+        bits: q
+            .get("bits")
+            .and_then(serde_json::Value::as_i64)
+            .map(|n| n as i32)
+            .unwrap_or(4),
+    });
+
+    if let Some(qc) = quantization {
+        log::info!("  quantization: {} bits, group_size={}", qc.bits, qc.group_size);
+    }
+
+    let hidden_size = get_usize("hidden_size", 2048);
+    let num_attention_heads = get_usize("num_attention_heads", 16);
+    // Use explicit `head_dim` from config when present (Qwen3 sets it independently
+    // of hidden_size); fall back to hidden_size / n_heads for Qwen2.5 style models.
+    let head_dim = get_usize("head_dim", hidden_size / num_attention_heads);
+
     Ok(MetalModelConfig {
-        hidden_size: get_usize("hidden_size", 2048),
-        num_attention_heads: get_usize("num_attention_heads", 16),
+        hidden_size,
+        num_attention_heads,
         num_key_value_heads: get_usize("num_key_value_heads", 8),
         num_hidden_layers: get_usize("num_hidden_layers", 24),
         intermediate_size: get_usize("intermediate_size", 11_008),
@@ -596,7 +669,9 @@ fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         max_position_embeddings: get_usize("max_position_embeddings", 32_768),
         rms_norm_eps: get_f64("rms_norm_eps", 1e-6),
         rope_theta: get_f64("rope_theta", 1_000_000.0),
+        head_dim,
         eos_token_id,
+        quantization,
     })
 }
 
@@ -630,6 +705,8 @@ fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<Met
                 safetensors::Dtype::F16 => Dtype::Float16,
                 safetensors::Dtype::BF16 => Dtype::Bfloat16,
                 safetensors::Dtype::I32 => Dtype::Int32,
+                // Packed 4-bit weights stored as uint32 in MLX-LM format
+                safetensors::Dtype::U32 => Dtype::Uint32,
                 other => anyhow::bail!("unsupported dtype {:?} for '{}'", other, name),
             };
             // SAFETY: `bytes` is alive for this scope; from_raw_data copies into Metal memory.
@@ -647,28 +724,76 @@ fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<Met
             .with_context(|| format!("missing weight '{name}'"))
     };
 
-    let embed_tokens = get("model.embed_tokens.weight")?;
+    // Load a possibly-quantized projection weight.
+    // Tries `<base>.scales` to detect MLX-LM 4-bit format.
+    let load_proj = |base: &str| -> Result<WeightTensor> {
+        if let Some(qc) = config.quantization {
+            let scales_key = format!("{base}.scales");
+            if let Some(scales) = tensors.get(&scales_key).cloned() {
+                let w = tensors
+                    .get(&format!("{base}.weight"))
+                    .cloned()
+                    .with_context(|| format!("missing quantized weight '{base}.weight'"))?;
+                let biases = tensors
+                    .get(&format!("{base}.biases"))
+                    .cloned()
+                    .with_context(|| format!("missing quantized biases '{base}.biases'"))?;
+                return Ok(WeightTensor::Quantized {
+                    w,
+                    scales,
+                    biases,
+                    group_size: qc.group_size,
+                    bits: qc.bits,
+                });
+            }
+        }
+        Ok(WeightTensor::Dense(get(&format!("{base}.weight"))?))
+    };
+
+    // embed_tokens: dequantize at load time if quantized (needed for embedding lookup via take_axis).
+    let embed_tokens = {
+        let w = get("model.embed_tokens.weight")?;
+        if let Some(qc) = config.quantization {
+            if let Some(scales) = tensors.get("model.embed_tokens.scales").cloned() {
+                let biases = tensors
+                    .get("model.embed_tokens.biases")
+                    .cloned()
+                    .context("missing model.embed_tokens.biases")?;
+                log::info!("  dequantizing embed_tokens at load time");
+                mlx_rs::ops::dequantize(&w, &scales, &biases, Some(qc.group_size), Some(qc.bits))
+                    .context("dequantize embed_tokens")?
+            } else {
+                w
+            }
+        } else {
+            w
+        }
+    };
+
     let norm = get("model.norm.weight")?;
-    // lm_head may be weight-tied to embed_tokens
-    let lm_head = tensors
-        .get("lm_head.weight")
-        .cloned()
-        .unwrap_or_else(|| embed_tokens.clone());
+
+    // lm_head may be weight-tied to embed_tokens; handle both dense and quantized.
+    let lm_head = if tensors.contains_key("lm_head.weight") || tensors.contains_key("lm_head.scales") {
+        load_proj("lm_head")?
+    } else {
+        // Weight-tied: share the (already-dequantized) embed_tokens matrix
+        WeightTensor::Dense(embed_tokens.clone())
+    };
 
     let n = config.num_hidden_layers;
     let mut layers = Vec::with_capacity(n);
     for i in 0..n {
         let p = |s: &str| format!("model.layers.{i}.{s}");
         layers.push(MetalLayerWeights {
-            q_proj: get(&p("self_attn.q_proj.weight"))?,
-            k_proj: get(&p("self_attn.k_proj.weight"))?,
-            v_proj: get(&p("self_attn.v_proj.weight"))?,
-            o_proj: get(&p("self_attn.o_proj.weight"))?,
+            q_proj: load_proj(&p("self_attn.q_proj"))?,
+            k_proj: load_proj(&p("self_attn.k_proj"))?,
+            v_proj: load_proj(&p("self_attn.v_proj"))?,
+            o_proj: load_proj(&p("self_attn.o_proj"))?,
+            gate_proj: load_proj(&p("mlp.gate_proj"))?,
+            up_proj: load_proj(&p("mlp.up_proj"))?,
+            down_proj: load_proj(&p("mlp.down_proj"))?,
             q_norm: get(&p("self_attn.q_norm.weight"))?,
             k_norm: get(&p("self_attn.k_norm.weight"))?,
-            gate_proj: get(&p("mlp.gate_proj.weight"))?,
-            up_proj: get(&p("mlp.up_proj.weight"))?,
-            down_proj: get(&p("mlp.down_proj.weight"))?,
             input_layernorm: get(&p("input_layernorm.weight"))?,
             post_attention_layernorm: get(&p("post_attention_layernorm.weight"))?,
         });
@@ -698,4 +823,73 @@ fn collect_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>> {
         .collect();
     shards.sort();
     Ok(shards)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "metal"))]
+mod tests {
+    use super::*;
+    use crate::backend::InferenceBackend;
+    use crate::sampler::SamplingParams;
+
+    fn run_bench(model_dir: &std::path::Path, label: &str) {
+        if !model_dir.exists() {
+            eprintln!("SKIP: model not found at {}", model_dir.display());
+            return;
+        }
+
+        let mut backend = MetalBackend::new();
+        backend.load(model_dir).expect("load model");
+
+        let prompt = "<|im_start|>user\nWrite a short poem about systems programming.\
+                      <|im_end|>\n<|im_start|>assistant\n";
+        let params = SamplingParams { temperature: 0.0, ..Default::default() };
+
+        // Warm-up pass (fills KV cache, JIT compiles Metal kernels)
+        let _ = backend.generate(prompt, &params).expect("warmup");
+
+        // Timed pass
+        let t0 = std::time::Instant::now();
+        let result = backend.generate(prompt, &params).expect("generate");
+        let elapsed = t0.elapsed().as_secs_f64();
+
+        println!("\n=== Metal Benchmark: {label} ===");
+        println!("Model:      {}", model_dir.display());
+        println!("Tokens out: {}", result.completion_tokens);
+        println!("Elapsed:    {elapsed:.2}s");
+        println!("Throughput: {:.1} tok/s", result.generation_tps);
+        println!("Output:     {:?}", &result.text[..result.text.len().min(200)]);
+        println!("=================={}===\n", "=".repeat(label.len()));
+
+        assert!(result.completion_tokens > 0, "should generate at least one token");
+    }
+
+    /// Throughput benchmark for a 4-bit quantized MLX model.
+    ///
+    /// ```bash
+    /// cargo test --no-default-features --features metal,no-cuda --release \
+    ///     --lib -- bench_4bit --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires Metal GPU + model weights at models/Qwen3-0.6B-4bit"]
+    fn bench_4bit() {
+        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("models/Qwen3-0.6B-4bit");
+        run_bench(&model_dir, "Qwen3-0.6B 4-bit");
+    }
+
+    /// Throughput benchmark for a BF16 MLX model (comparison baseline).
+    ///
+    /// ```bash
+    /// cargo test --no-default-features --features metal,no-cuda --release \
+    ///     --lib -- bench_bf16 --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires Metal GPU + model weights at models/Qwen3-0.6B-bf16"]
+    fn bench_bf16() {
+        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("models/Qwen3-0.6B-bf16");
+        run_bench(&model_dir, "Qwen3-0.6B BF16");
+    }
 }
