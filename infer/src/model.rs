@@ -3,7 +3,7 @@
 use anyhow::Result;
 use rand::rngs::StdRng;
 
-use crate::paged_kv::PagedKVPool;
+use crate::paged_kv::{PagedKVPool, TokenKVPool};
 use crate::sampler::SamplingParams;
 use crate::tensor::{DeviceContext, DeviceVec};
 
@@ -91,6 +91,27 @@ pub trait ModelForward: Send {
             tokens.push(self.select_token(&mut states[si], params[i], rng)?);
         }
         Ok(tokens)
+    }
+
+    /// Prefill forward pass that also scatter-writes K/V to the token pool.
+    ///
+    /// Called by the scheduler instead of `forward()` when a paged KV pool is
+    /// active. The default implementation just calls `forward()` (no pool write).
+    /// Override in model implementations that support scatter-writing K/V to the
+    /// pool during prefill (e.g., Qwen3).
+    ///
+    /// `new_token_indices` are the physical pool indices (on GPU) allocated for
+    /// this chunk's tokens. The slice has length `tokens.len()`.
+    fn forward_prefill_with_pool(
+        &self,
+        tokens: &[u32],
+        state: &mut Self::State,
+        _pool: &TokenKVPool,
+        _slot: usize,
+        _new_token_indices: &cudarc::driver::CudaSlice<i32>,
+    ) -> Result<()> {
+        // Default: just call forward() (no pool write)
+        self.forward(tokens, state)
     }
 
     /// Batched decode: process B tokens from B requests in one forward pass.

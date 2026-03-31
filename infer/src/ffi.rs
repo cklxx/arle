@@ -522,6 +522,20 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // ─── Scatter-write prefill K/V to token pool ───
+
+    pub(crate) fn scatter_write_kv_cuda(
+        k_batch: *const Half,
+        v_batch: *const Half,
+        k_pool: *mut Half,
+        v_pool: *mut Half,
+        token_indices: *const i32,
+        seq_len: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        stream: CUstream,
+    );
+
     // ─── FlashInfer batch decode with paged KV cache ───
 
     pub(crate) fn flashinfer_batch_decode_plan(

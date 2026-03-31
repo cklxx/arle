@@ -1,8 +1,10 @@
 use anyhow::Result;
+use cudarc::driver::CudaSlice;
 
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::kv_cache::KVCache;
 use crate::ops;
+use crate::paged_kv::TokenKVPool;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
@@ -112,6 +114,187 @@ impl Qwen3Model {
         }
 
         Ok(hidden)
+    }
+
+    /// Like `process_all_layers_batch`, but also scatter-writes K/V to the
+    /// token pool after each layer's QKV GEMM. The Triton prefill attention
+    /// kernel still reads from the contiguous cache (dual-write approach).
+    #[fastrace::trace(name = "process_all_layers_batch_with_pool")]
+    pub(super) fn process_all_layers_batch_with_pool(
+        &self,
+        mut hidden: HiddenStates,
+        start_pos: usize,
+        kv_cache: &mut KVCache,
+        pool: &TokenKVPool,
+        new_token_indices: &CudaSlice<i32>,
+    ) -> Result<HiddenStates> {
+        let seq_len = hidden.seq_len;
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim;
+        let inter_dim = self.config.intermediate_size;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        let mut bufs = PrefillBuffers::new(
+            &self.ctx,
+            self.config.hidden_size,
+            q_dim,
+            kv_dim,
+            inter_dim,
+            seq_len,
+        )?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            self.forward_layer_batch_with_pool(
+                layer_idx,
+                layer,
+                &mut hidden,
+                start_pos,
+                kv_cache,
+                &mut bufs,
+                pool,
+                new_token_indices,
+            )?;
+        }
+
+        // Increment sequence length AFTER all layers processed
+        for _ in 0..seq_len {
+            kv_cache.increment_seq_len();
+        }
+
+        Ok(hidden)
+    }
+
+    /// Like `forward_layer_batch`, but scatter-writes K/V to the token pool
+    /// after QKV GEMM (before Triton attention). The contiguous cache write
+    /// still happens inside the Triton attention kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_batch_with_pool(
+        &self,
+        layer_idx: usize,
+        layer: &TransformerBlock,
+        hidden: &mut HiddenStates,
+        start_pos: usize,
+        kv_cache: &mut KVCache,
+        bufs: &mut PrefillBuffers,
+        pool: &TokenKVPool,
+        new_token_indices: &CudaSlice<i32>,
+    ) -> Result<()> {
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim;
+
+        kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
+
+        // 1. RMSNorm
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            hidden,
+            &layer.input_layernorm,
+            self.config.rms_norm_eps,
+            &mut bufs.normed,
+        );
+
+        // 2. QKV projections
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.q_proj,
+            &bufs.normed,
+            &mut bufs.q_batch,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.k_proj,
+            &bufs.normed,
+            &mut bufs.k_batch,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.v_proj,
+            &bufs.normed,
+            &mut bufs.v_batch,
+        );
+
+        // 2b. Scatter-write K/V to token pool (NEW — dual-write path).
+        // The Triton attention kernel below will also write to contiguous cache.
+        if !pool.k_buffers.is_empty() {
+            ops::scatter_write_kv(
+                &self.ctx,
+                &bufs.k_batch,
+                &bufs.v_batch,
+                pool.k_ptr(layer_idx, &self.ctx.stream),
+                pool.v_ptr(layer_idx, &self.ctx.stream),
+                new_token_indices,
+                num_kv_heads,
+                head_dim,
+            )?;
+        }
+
+        // 3. FlashAttention-2 (Triton) — also writes to contiguous cache
+        let (k_cache_layer, v_cache_layer) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
+        ops::prefill_attention_batch(
+            &self.ctx,
+            &mut bufs.q_batch,
+            &mut bufs.k_batch,
+            &bufs.v_batch,
+            &layer.attention.q_norm,
+            &layer.attention.k_norm,
+            &self.cos_cache,
+            &self.sin_cache,
+            k_cache_layer,
+            v_cache_layer,
+            &mut bufs.attn_output,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            start_pos,
+            self.config.rms_norm_eps,
+        )?;
+
+        // 4-8: Same as forward_layer_batch (O proj, residual, MLP)
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.o_proj,
+            &bufs.attn_output,
+            &mut bufs.o_buf,
+        );
+
+        ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
+        std::mem::swap(hidden, &mut bufs.hidden_out);
+
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            hidden,
+            &layer.post_attention_layernorm,
+            self.config.rms_norm_eps,
+            &mut bufs.normed,
+        );
+
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.gate_proj,
+            &bufs.normed,
+            &mut bufs.gate_out,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.up_proj,
+            &bufs.normed,
+            &mut bufs.up_out,
+        );
+        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.down_proj,
+            &bufs.act_out,
+            &mut bufs.o_buf,
+        );
+
+        ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
+        std::mem::swap(hidden, &mut bufs.hidden_out);
+
+        Ok(())
     }
 
     pub(super) fn compute_logits_batch(&self, hidden: &HiddenStates) -> Result<DeviceVec> {

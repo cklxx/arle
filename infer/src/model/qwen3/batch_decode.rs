@@ -126,9 +126,9 @@ impl Qwen3Model {
         let kv_dim = num_kv_heads * head_dim;
         let inter_dim = self.config.intermediate_size;
         let eps = self.config.rms_norm_eps;
-        // Grow paged KV slots for the new tokens (1 per request)
+        // Allocate token slots for the new tokens (1 per request)
         for &si in slot_indices {
-            paged_kv_pool.grow_slot(si, 1)?;
+            paged_kv_pool.alloc_tokens(si, 1)?;
         }
 
         // Build FlashInfer metadata from paged KV pool
@@ -215,7 +215,7 @@ impl Qwen3Model {
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
-        let page_size = kv_pool.page_size;
+        let page_size = 1; // token-level pool: page_size is always 1
 
         // 1. Batched RMSNorm → bufs.normed [B, hidden_dim]
         ops::rms_norm_batch_into(

@@ -151,6 +151,48 @@ impl ModelForward for Qwen3Model {
         Ok(())
     }
 
+    fn forward_prefill_with_pool(
+        &self,
+        tokens: &[u32],
+        state: &mut Self::State,
+        pool: &crate::paged_kv::TokenKVPool,
+        _slot: usize,
+        new_token_indices: &cudarc::driver::CudaSlice<i32>,
+    ) -> Result<()> {
+        // Prefetch offloaded KV before PREFILL only.
+        if tokens.len() > 1 && state.kv_cache.has_offloaded() {
+            state.kv_cache.prefetch_to_gpu(&self.ctx)?;
+        }
+
+        if tokens.len() == 1 {
+            // Single-token: use standard decode path (CUDA Graph).
+            // No pool scatter-write needed — decode path writes to pool via
+            // decode_prep_paged kernel.
+            self.decode_one_token(
+                tokens[0],
+                &mut state.kv_cache,
+                &mut state.decode_bufs,
+                &mut state.graph_state,
+            )?;
+            state.prefill_logits = None;
+        } else {
+            let start_pos = state.kv_cache.len();
+            let hidden = self.get_embeddings_batch(tokens)?;
+            // Dual-write: writes K/V to both contiguous cache AND token pool.
+            let hidden = self.process_all_layers_batch_with_pool(
+                hidden,
+                start_pos,
+                &mut state.kv_cache,
+                pool,
+                new_token_indices,
+            )?;
+            let logits = self.compute_logits_batch(&hidden)?;
+            state.prefill_logits = Some(logits);
+        }
+
+        Ok(())
+    }
+
     fn select_token(
         &self,
         state: &mut Self::State,
@@ -236,15 +278,13 @@ impl ModelForward for Qwen3Model {
             }
             return Ok(());
         }
-        // TODO: Enable FlashInfer paged path once KV migration is debugged.
-        // For now, use sequential decode with contiguous KV cache (correct).
-        // match paged_kv_pool {
-        //     Some(pool) if !pool.k_pools.is_empty() => {
-        //         self.decode_batch(tokens, states, slot_indices, pool)
-        //     }
-        //     _ => self.decode_batch_contiguous(tokens, states, slot_indices),
-        // }
-        let _ = paged_kv_pool; // suppress warning
-        self.decode_batch_contiguous(tokens, states, slot_indices)
+        // FlashInfer token-pool path: use paged decode when pool has data.
+        // Falls back to sequential contiguous decode when pool is stub-sized.
+        match paged_kv_pool {
+            Some(pool) if !pool.k_buffers.is_empty() => {
+                self.decode_batch(tokens, states, slot_indices, pool)
+            }
+            _ => self.decode_batch_contiguous(tokens, states, slot_indices),
+        }
     }
 }

@@ -600,7 +600,7 @@ pub fn decode_prep_paged(
     rms_eps: f32,
 ) -> Result<()> {
     let batch_size = q_batch.seq_len;
-    let stride_page = kv_pool.stride_page;
+    let stride_page = kv_pool.kv_dim;
 
     let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
     let (k_ptr, _gk) = k_batch.data.device_ptr(&ctx.stream);
@@ -614,8 +614,8 @@ pub fn decode_prep_paged(
     let (pi_ptr, _gpi) = page_indptr_gpu.device_ptr(&ctx.stream);
     let (lp_ptr, _glp) = last_page_len_gpu.device_ptr(&ctx.stream);
 
-    let k_pool_ptr = kv_pool.k_pool_ptr(layer_idx, &ctx.stream);
-    let v_pool_ptr = kv_pool.v_pool_ptr(layer_idx, &ctx.stream);
+    let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
+    let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
 
     unsafe {
         ffi::decode_prep_paged_cuda(
@@ -719,8 +719,8 @@ pub fn flashinfer_batch_decode(
         let (lp_ptr, _glp) = kv_last_page_len_gpu.device_ptr(&ctx.stream);
         let (lse_ptr, _glse) = workspace.lse.device_ptr_mut(&ctx.stream);
 
-        let k_pool_ptr = kv_pool.k_pool_ptr(layer_idx, &ctx.stream);
-        let v_pool_ptr = kv_pool.v_pool_ptr(layer_idx, &ctx.stream);
+        let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
+        let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
 
         let ret = unsafe {
             ffi::flashinfer_batch_decode_run(
