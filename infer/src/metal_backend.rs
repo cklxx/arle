@@ -26,6 +26,8 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "metal")]
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 
@@ -128,6 +130,15 @@ impl Default for MetalBackend {
         Self::new()
     }
 }
+
+// mlx_rs::Array wraps a *mut c_void (Metal buffer handle). MLX manages its own
+// internal locking, so it is safe to send the backend across threads.
+// SAFETY: MetalBackend is used from a single inference thread at a time (the
+// scheduler ensures exclusive access). No concurrent mutation occurs.
+#[cfg(feature = "metal")]
+unsafe impl Send for MetalBackend {}
+#[cfg(feature = "metal")]
+unsafe impl Sync for MetalBackend {}
 
 impl InferenceBackend for MetalBackend {
     fn name(&self) -> &'static str {
@@ -265,7 +276,7 @@ fn metal_generate(
     use mlx_rs::{
         fast,
         nn::silu,
-        ops::indexing::{argmax, take_axis},
+        ops::indexing::take_axis,
         ops::{self, concatenate_axis, reshape, transpose_axes},
         transforms::eval,
     };
@@ -386,7 +397,7 @@ fn metal_generate(
         let logits = linear(&last_x, &weights.lm_head)?; // [1, vocab]
 
         // Materialise logits on CPU for sampling
-        eval(&[&logits]).context("eval logits")?;
+        eval([&logits]).context("eval logits")?;
 
         // ── Sampling ─────────────────────────────────────────────────────────
         let next_token = sample_token(&logits, params)?;
@@ -458,17 +469,17 @@ fn sample_token(logits: &Array, params: &SamplingParams) -> Result<u32> {
     // Greedy
     if temp <= 1e-6 {
         let best = argmax(logits, None).context("argmax")?;
-        eval(&[&best])?;
+        eval([&best])?;
         return Ok(best.item::<i32>() as u32);
     }
 
     // Temperature scaling → softmax → float32 probs
     let inv_t: Array = (1.0f32 / temp).into();
     let scaled = multiply(logits, &inv_t).context("temp scale")?;
-    let probs = softmax_axis(&scaled, -1).context("softmax")?;
+    let probs = softmax_axis(&scaled, -1, false).context("softmax")?;
     // Cast to f32 for CPU-side sampling (weights may be bf16)
     let probs_f32 = probs.as_type::<f32>().context("probs cast to f32")?;
-    eval(&[&probs_f32])?;
+    eval([&probs_f32])?;
     let probs_slice: &[f32] = probs_f32.as_slice();
 
     if params.top_p >= 1.0 - 1e-6 || params.top_p <= 0.0 {
