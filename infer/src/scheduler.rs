@@ -954,7 +954,6 @@ impl<M: ModelForward> Scheduler<M> {
         // This copies the processed K/V (with QK-norm + RoPE) from the contiguous
         // cache into the token pool so FlashInfer batched decode can read from it.
         if !paged_kv_pool.k_buffers.is_empty() {
-            // `total` is the number of effective tokens processed during prefill.
             if let Err(e) = paged_kv_pool.alloc_tokens(slot_idx, total) {
                 error!("Request {}: pool alloc for migration failed: {}", req.id, e);
             } else {
