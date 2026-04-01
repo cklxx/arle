@@ -27,6 +27,8 @@ pub(super) struct Attention {
     pub(super) q_proj: DeviceMatrix,
     pub(super) k_proj: DeviceMatrix,
     pub(super) v_proj: DeviceMatrix,
+    /// Merged QKV projection: [q_dim + 2*kv_dim, hidden_dim]
+    pub(super) qkv_proj: DeviceMatrix,
     pub(super) o_proj: DeviceMatrix,
     pub(super) q_norm: DeviceVec,
     pub(super) k_norm: DeviceVec,
@@ -37,6 +39,8 @@ pub(super) struct Attention {
 pub(super) struct MLP {
     pub(super) gate_proj: DeviceMatrix,
     pub(super) up_proj: DeviceMatrix,
+    /// Merged gate+up projection: [2*inter_dim, hidden_dim]
+    pub(super) gate_up_proj: DeviceMatrix,
     pub(super) down_proj: DeviceMatrix,
 }
 
@@ -114,43 +118,40 @@ impl Qwen3Model {
                     &weight_map,
                     &format!("{}.input_layernorm.weight", prefix),
                 )?,
-                attention: Attention {
-                    q_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
+                attention: {
+                    let q_proj = load_tensor_2d(
+                        &ctx, &shards, &weight_map,
                         &format!("{}.self_attn.q_proj.weight", prefix),
-                    )?,
-                    k_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
+                    )?;
+                    let k_proj = load_tensor_2d(
+                        &ctx, &shards, &weight_map,
                         &format!("{}.self_attn.k_proj.weight", prefix),
-                    )?,
-                    v_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
+                    )?;
+                    let v_proj = load_tensor_2d(
+                        &ctx, &shards, &weight_map,
                         &format!("{}.self_attn.v_proj.weight", prefix),
-                    )?,
-                    o_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.self_attn.o_proj.weight", prefix),
-                    )?,
-                    q_norm: load_tensor_1d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.self_attn.q_norm.weight", prefix),
-                    )?,
-                    k_norm: load_tensor_1d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.self_attn.k_norm.weight", prefix),
-                    )?,
+                    )?;
+                    let qkv_proj = DeviceMatrix::concat_rows(
+                        &ctx, &[&q_proj, &k_proj, &v_proj],
+                    )?;
+                    Attention {
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                        qkv_proj,
+                        o_proj: load_tensor_2d(
+                            &ctx, &shards, &weight_map,
+                            &format!("{}.self_attn.o_proj.weight", prefix),
+                        )?,
+                        q_norm: load_tensor_1d(
+                            &ctx, &shards, &weight_map,
+                            &format!("{}.self_attn.q_norm.weight", prefix),
+                        )?,
+                        k_norm: load_tensor_1d(
+                            &ctx, &shards, &weight_map,
+                            &format!("{}.self_attn.k_norm.weight", prefix),
+                        )?,
+                    }
                 },
                 post_attention_layernorm: load_tensor_1d(
                     &ctx,
@@ -158,25 +159,27 @@ impl Qwen3Model {
                     &weight_map,
                     &format!("{}.post_attention_layernorm.weight", prefix),
                 )?,
-                mlp: MLP {
-                    gate_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
+                mlp: {
+                    let gate_proj = load_tensor_2d(
+                        &ctx, &shards, &weight_map,
                         &format!("{}.mlp.gate_proj.weight", prefix),
-                    )?,
-                    up_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
+                    )?;
+                    let up_proj = load_tensor_2d(
+                        &ctx, &shards, &weight_map,
                         &format!("{}.mlp.up_proj.weight", prefix),
-                    )?,
-                    down_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.mlp.down_proj.weight", prefix),
-                    )?,
+                    )?;
+                    let gate_up_proj = DeviceMatrix::concat_rows(
+                        &ctx, &[&gate_proj, &up_proj],
+                    )?;
+                    MLP {
+                        gate_proj,
+                        up_proj,
+                        gate_up_proj,
+                        down_proj: load_tensor_2d(
+                            &ctx, &shards, &weight_map,
+                            &format!("{}.mlp.down_proj.weight", prefix),
+                        )?,
+                    }
                 },
             };
             layers.push(block);

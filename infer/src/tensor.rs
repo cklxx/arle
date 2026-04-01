@@ -262,6 +262,39 @@ impl DeviceMatrix {
             cols,
         })
     }
+
+    /// Concatenate multiple matrices vertically (stacking rows).
+    /// All matrices must have the same number of columns.
+    /// Result has rows = sum of all input rows, cols = shared cols.
+    pub fn concat_rows(ctx: &DeviceContext, matrices: &[&DeviceMatrix]) -> Result<Self> {
+        assert!(!matrices.is_empty(), "concat_rows: empty input");
+        let cols = matrices[0].cols;
+        for m in matrices {
+            assert_eq!(m.cols, cols, "concat_rows: cols mismatch");
+        }
+        let total_rows: usize = matrices.iter().map(|m| m.rows).sum();
+        let total_elements = total_rows * cols;
+
+        let mut merged: CudaSlice<bf16> = ctx
+            .stream
+            .alloc_zeros(total_elements)
+            .map_err(|e| anyhow!("concat_rows alloc failed: {e}"))?;
+
+        let mut offset = 0usize;
+        for m in matrices {
+            let n = m.rows * m.cols;
+            ctx.stream
+                .memcpy_dtod(&m.data, &mut merged.slice_mut(offset..offset + n))
+                .map_err(|e| anyhow!("concat_rows D2D copy failed: {e}"))?;
+            offset += n;
+        }
+
+        Ok(Self {
+            data: merged,
+            rows: total_rows,
+            cols,
+        })
+    }
 }
 
 /// Batched hidden states: seq_len vectors of dim hidden_dim, stored contiguously.

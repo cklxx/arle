@@ -28,10 +28,14 @@ pub(crate) struct BatchDecodeBuffers {
     q_batch: HiddenStates,
     k_batch: HiddenStates,
     v_batch: HiddenStates,
+    /// Merged QKV output buffer [max_batch_size, q_dim + 2*kv_dim]
+    qkv_batch: HiddenStates,
     attn_output: HiddenStates,
     o_buf: HiddenStates,
     gate_out: HiddenStates,
     up_out: HiddenStates,
+    /// Merged gate+up output buffer [max_batch_size, 2*inter_dim]
+    gate_up_out: HiddenStates,
     act_out: HiddenStates,
 
     /// Embedding output buffer [max_batch_size, hidden_dim] — avoids alloc in graph.
@@ -85,10 +89,12 @@ impl BatchDecodeBuffers {
             q_batch: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
             k_batch: HiddenStates::zeros(ctx, kv_dim, max_batch_size)?,
             v_batch: HiddenStates::zeros(ctx, kv_dim, max_batch_size)?,
+            qkv_batch: HiddenStates::zeros(ctx, q_dim + 2 * kv_dim, max_batch_size)?,
             attn_output: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
             o_buf: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
             gate_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
             up_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
+            gate_up_out: HiddenStates::zeros(ctx, 2 * inter_dim, max_batch_size)?,
             act_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
 
             embedding_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
@@ -127,10 +133,12 @@ impl BatchDecodeBuffers {
         self.q_batch.seq_len = batch_size;
         self.k_batch.seq_len = batch_size;
         self.v_batch.seq_len = batch_size;
+        self.qkv_batch.seq_len = batch_size;
         self.attn_output.seq_len = batch_size;
         self.o_buf.seq_len = batch_size;
         self.gate_out.seq_len = batch_size;
         self.up_out.seq_len = batch_size;
+        self.gate_up_out.seq_len = batch_size;
         self.act_out.seq_len = batch_size;
     }
 }
@@ -360,25 +368,21 @@ impl Qwen3Model {
             &mut bufs.normed,
         );
 
-        // 2. Batched QKV projections (GEMM) → [B, q/kv_dim]
+        // 2. Merged QKV projection: 1 GEMM instead of 3 → [B, q_dim + 2*kv_dim]
         ops::gemm_into(
             &self.ctx,
-            &layer.attention.q_proj,
+            &layer.attention.qkv_proj,
             &bufs.normed,
+            &mut bufs.qkv_batch,
+        );
+        // Split into separate Q/K/V buffers via a single fused kernel (1 launch).
+        ops::split_qkv_batch(
+            &self.ctx,
+            &bufs.qkv_batch,
             &mut bufs.q_batch,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.k_proj,
-            &bufs.normed,
             &mut bufs.k_batch,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.v_proj,
-            &bufs.normed,
             &mut bufs.v_batch,
-        );
+        )?;
 
         // 3. Decode prep: QK-norm + RoPE (in-place on Q) + paged KV write
         ops::decode_prep_paged(
@@ -461,20 +465,19 @@ impl Qwen3Model {
             &mut bufs.normed,
         );
 
-        // 8. Batched MLP: gate + up → silu_mul → down
+        // 8. Batched MLP: merged gate+up GEMM → fused silu_mul from merged buffer → down
         ops::gemm_into(
             &self.ctx,
-            &layer.mlp.gate_proj,
+            &layer.mlp.gate_up_proj,
             &bufs.normed,
-            &mut bufs.gate_out,
+            &mut bufs.gate_up_out,
         );
-        ops::gemm_into(
+        // silu_mul directly from merged buffer (gate = first half, up = second half)
+        ops::silu_mul_fused_batch_into(
             &self.ctx,
-            &layer.mlp.up_proj,
-            &bufs.normed,
-            &mut bufs.up_out,
-        );
-        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+            &bufs.gate_up_out,
+            &mut bufs.act_out,
+        )?;
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,

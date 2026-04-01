@@ -650,4 +650,25 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    // Split merged QKV buffer into separate Q, K, V buffers.
+    pub(crate) fn split_qkv_cuda(
+        qkv: *const Half,
+        q: *mut Half,
+        k: *mut Half,
+        v: *mut Half,
+        batch_size: i32,
+        q_dim: i32,
+        kv_dim: i32,
+        stream: CUstream,
+    );
+
+    // Fused silu_mul from merged gate+up buffer.
+    pub(crate) fn silu_mul_fused_cuda(
+        gate_up: *const Half,
+        out: *mut Half,
+        batch_size: i32,
+        inter_dim: i32,
+        stream: CUstream,
+    );
+
 }

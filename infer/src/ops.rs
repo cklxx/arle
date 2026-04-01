@@ -33,7 +33,10 @@ pub use sampling::{argmax, gpu_sample, gpu_sample_into, gpu_sample_launch, gpu_s
 // pub(crate) re-exports
 #[cfg(test)]
 pub(crate) use attention::flash_attention_prefill_hd256_into;
-pub(crate) use elementwise::{add_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into};
+pub(crate) use elementwise::{
+    add_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into, silu_mul_fused_batch_into,
+    split_qkv_batch,
+};
 pub(crate) use linear::{gemm_into, linear};
 pub(crate) use norm::{
     fused_add_rms_norm_batch_into, rms_norm, rms_norm_batch_into, rms_norm_gated_batch_into,
