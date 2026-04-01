@@ -49,10 +49,10 @@ impl<M: ModelForward> Scheduler<M> {
 
     fn assign_slots(&mut self) {
         while !self.waiting.is_empty() {
-            let slot_idx = match self.find_free_slot() {
-                Some(idx) => idx,
-                None => break,
-            };
+            let free_slots = self.free_slots();
+            if free_slots.is_empty() {
+                break;
+            }
 
             let incoming = self.waiting.pop_front().expect("checked non-empty above");
             let prompt_tokens = match self.tokenizer.encode(&incoming.prompt) {
@@ -67,16 +67,28 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             };
 
+            // Pick the free slot with the best prefix match to maximize KV reuse.
+            let slot_idx = self.best_prefix_slot(&free_slots, &prompt_tokens);
+
             let id = self.next_id;
             self.next_id += 1;
 
-            info!(
-                "Request {} → slot {} (prompt={} tokens, queue={})",
-                id,
-                slot_idx,
-                prompt_tokens.len(),
-                self.waiting.len()
-            );
+            let prefix_len = self.cached_prompts[slot_idx]
+                .iter()
+                .zip(prompt_tokens.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if prefix_len > 0 {
+                info!(
+                    "Request {} → slot {} (prompt={} tokens, prefix_reuse={}, queue={})",
+                    id, slot_idx, prompt_tokens.len(), prefix_len, self.waiting.len()
+                );
+            } else {
+                info!(
+                    "Request {} → slot {} (prompt={} tokens, queue={})",
+                    id, slot_idx, prompt_tokens.len(), self.waiting.len()
+                );
+            }
 
             self.active.push(ActiveRequest {
                 id,
@@ -95,9 +107,33 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    fn find_free_slot(&self) -> Option<usize> {
+    /// Find all free slot indices.
+    fn free_slots(&self) -> Vec<usize> {
         let in_use: Vec<usize> = self.active.iter().map(|a| a.slot_idx).collect();
-        (0..self.states.len()).find(|i| !in_use.contains(i))
+        (0..self.states.len())
+            .filter(|i| !in_use.contains(i))
+            .collect()
+    }
+
+    /// Pick the free slot whose cached prompt best matches the given tokens.
+    /// Falls back to the first free slot if no prefix matches.
+    fn best_prefix_slot(&self, free_slots: &[usize], prompt_tokens: &[u32]) -> usize {
+        let mut best_slot = free_slots[0];
+        let mut best_match = 0usize;
+
+        for &slot in free_slots {
+            let cached = &self.cached_prompts[slot];
+            let match_len = cached
+                .iter()
+                .zip(prompt_tokens.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if match_len > best_match {
+                best_match = match_len;
+                best_slot = slot;
+            }
+        }
+        best_slot
     }
 
     fn cleanup(&mut self) {

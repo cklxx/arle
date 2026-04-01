@@ -183,6 +183,24 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // FlashInfer single-request prefill: replaces Triton FA2 for HEAD_DIM=128.
+    // Q/Output: [seq_len, num_q_heads * head_dim] NHD interleaved row-major.
+    // K/V cache: [num_kv_heads, max_seq_len, head_dim] HND layout.
+    pub(crate) fn flashinfer_single_prefill(
+        q: *mut Half,
+        k_cache: *mut Half,
+        v_cache: *mut Half,
+        output: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        seq_len: i32,
+        kv_len: i32,
+        max_seq_len: i32,
+        sm_scale: f32,
+        tmp_buffer: *mut u8,
+        stream: CUstream,
+    ) -> i32;
+
     // FlashAttention-2 prefill (Triton AOT) for HEAD_DIM=256.
     // Q/Output are col-major [q_dim, seq_len]. K/V cache are per-head [max_seq, HEAD_DIM].
     pub(crate) fn flash_attention_prefill_hd256_cuda(

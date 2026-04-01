@@ -121,7 +121,7 @@ impl<M: ModelForward> Scheduler<M> {
             total_generated_tokens: 0,
         };
 
-        let handle = SchedulerHandle::with_max_waiting(tx, model_id, num_slots * 4);
+        let handle = SchedulerHandle::with_max_waiting(tx, model_id, 256);
         debug_assert_eq!(handle.waiting_count(), 0);
 
         Ok((scheduler, handle))
@@ -135,7 +135,7 @@ impl<M: ModelForward> Scheduler<M> {
     ) -> Option<usize> {
         use crate::tensor::DeviceContext;
 
-        const DEFAULT_MAX_SEQ: usize = 1024;
+        const DEFAULT_MAX_SEQ: usize = 4096;
         const RESERVED_BYTES: usize = 512 * 1024 * 1024;
         const MIN_SEQ_LEN: usize = 256;
 
@@ -187,25 +187,29 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     /// Pre-capture CUDA Graphs for batched decode at common batch sizes.
+    ///
+    /// Warms up graphs for batch sizes 1..min(num_slots, 32) to support
+    /// larger concurrent batch sizes without runtime capture overhead.
     pub(super) fn warmup_cuda_graphs(&mut self) {
         let num_slots = self.states.len();
         if num_slots < 2 || self.paged_kv_pool.k_buffers.is_empty() {
             return;
         }
 
-        info!("Warming up CUDA Graphs for batch sizes 1..{}...", num_slots);
+        let max_warmup = num_slots.min(32);
+        info!("Warming up CUDA Graphs for batch sizes 1..{}...", max_warmup);
         let t0 = std::time::Instant::now();
 
-        for slot in 0..num_slots {
+        for slot in 0..max_warmup {
             if let Err(e) = self.paged_kv_pool.alloc_tokens(slot, 1) {
                 error!("Warmup: pool alloc for slot {} failed: {}", slot, e);
                 return;
             }
         }
 
-        let dummy_tokens: Vec<u32> = vec![0; num_slots];
-        let slot_indices: Vec<usize> = (0..num_slots).collect();
-        for bs in 1..=num_slots {
+        let dummy_tokens: Vec<u32> = vec![0; max_warmup];
+        let slot_indices: Vec<usize> = (0..max_warmup).collect();
+        for bs in 1..=max_warmup {
             let tokens = &dummy_tokens[..bs];
             let si = &slot_indices[..bs];
             if let Err(e) = self.model.forward_decode_batch(
@@ -225,7 +229,7 @@ impl<M: ModelForward> Scheduler<M> {
             let _ = self.model.device_context().sync();
         }
 
-        for slot in 0..num_slots {
+        for slot in 0..max_warmup {
             self.paged_kv_pool.free_slot(slot);
             let _ = self.states[slot].reset();
         }
@@ -233,7 +237,7 @@ impl<M: ModelForward> Scheduler<M> {
         info!(
             "CUDA Graph warmup done in {:.0}ms (batch sizes 1..{})",
             t0.elapsed().as_secs_f64() * 1e3,
-            num_slots,
+            max_warmup,
         );
     }
 }
