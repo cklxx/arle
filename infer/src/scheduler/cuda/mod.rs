@@ -13,7 +13,7 @@ use crate::paged_kv::PagedKVPool;
 use crate::server_engine::{FinishReason, StreamDelta, Usage};
 use crate::tokenizer::Tokenizer;
 
-use super::{IncomingRequest, SchedulerHandle};
+use super::{IncomingRequest, SchedulerConfig, SchedulerHandle};
 
 mod core;
 mod decode;
