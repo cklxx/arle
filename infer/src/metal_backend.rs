@@ -99,6 +99,18 @@ mod metal_ffi {
 
         /// GPU categorical sample from temperature-scaled logits.  Returns scalar int32 array.
         pub(super) fn metal_categorical_sample(scaled_logits: mlx_array) -> mlx_array;
+
+        /// Release accumulated temporary Metal buffer allocations from MLX's cache (P5).
+        pub(super) fn metal_clear_cache();
+
+        /// Grow KV cache from [1, n_kv, old_cap, head_dim] to [1, n_kv, new_cap, head_dim]
+        /// by appending zeros along axis 2 (P5 chunked KV).
+        pub(super) fn metal_kv_extend(
+            cache: *mut mlx_array,
+            n_kv_heads: i32,
+            head_dim: i32,
+            new_cap: i32,
+        );
     }
 }
 
@@ -377,11 +389,18 @@ impl InferenceBackend for MetalBackend {
 /// Optimisations applied:
 /// - **P1**: Dense weights are pre-transposed at load time (no per-step transpose).
 /// - **P2**: Full transformer block is one C++ FFI call (`metal_fused_block_cached`),
-///           eliminating ~40 mlx-rs round-trips per layer.  Falls back to the
-///           Rust path for quantized models (quantized_matmul not fused yet).
-/// - **P3**: async_eval double-buffering: GPU computes step N+1 while CPU reads
-///           the token from step N.
+///   eliminating ~40 mlx-rs round-trips per layer. Falls back to the
+///   Rust path for quantized models (quantized_matmul not fused yet).
+/// - **P3/P6**: async_eval double-buffering: GPU computes step N while CPU processes
+///   step N-1's token. Graph construction (CPU-only) overlaps GPU execution.
 /// - **P4**: argmax / categorical sampling stays on GPU (no 152 K float transfer).
+/// - **P5**: KV cache grows in 256-token chunks; `metal_clear_cache()` every 256 steps.
+/// - **P7**: Fused path keeps all intermediates in C++ scope; Rust holds only
+///   per-layer input/output `Array` handles.
+// P5: KV cache grows in this many token increments (aligned with mlx-lm convention).
+#[cfg(feature = "metal")]
+const KV_CACHE_CHUNK: i32 = 256;
+
 // GPU required: all tensor operations use mlx-rs Arrays on Metal unified memory.
 #[cfg(feature = "metal")]
 fn metal_generate(
@@ -392,12 +411,7 @@ fn metal_generate(
     max_new_tokens: usize,
     t0: Instant,
 ) -> Result<Vec<u32>> {
-    use mlx_rs::{
-        fast,
-        ops::indexing::take_axis,
-        ops::zeros_dtype_device,
-        transforms::eval,
-    };
+    use mlx_rs::{ops::zeros_dtype_device, StreamOrDevice};
 
     let n_layers = config.num_hidden_layers;
     let n_heads = config.num_attention_heads as i32;
@@ -408,17 +422,23 @@ fn metal_generate(
     let eos_id = config.eos_token_id;
     let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
 
-    // P2: use fused C++ block only for Dense (non-quantized) models.
-    let use_fused = weights.layers.iter().all(|l| {
-        matches!(l.q_proj, WeightTensor::Dense(_))
-    });
+    // P2 + P7: fused C++ path only for Dense (non-quantized) models.
+    // In the fused path all intermediate Arrays are C++-scoped; Rust holds only
+    // the per-layer input/output handles.
+    let use_fused = weights
+        .layers
+        .iter()
+        .all(|l| matches!(l.q_proj, WeightTensor::Dense(_)));
 
-    // Pre-allocate KV cache: [1, n_kv_heads, max_seq_len, head_dim].
-    // Allocated once; each step writes via slice_update instead of concatenate,
-    // eliminating 2*n_layers Metal buffer allocations per decode step.
-    let max_seq_len = (input_ids.len() + max_new_tokens) as i32;
+    // P5: KV cache starts at the next 256-token boundary above the prefill length,
+    // plus one chunk for initial decode steps.  Grown lazily in KV_CACHE_CHUNK steps.
+    let prefill_len = input_ids.len() as i32;
+    let initial_cap =
+        ((prefill_len + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK + 1) * KV_CACHE_CHUNK;
+    let mut kv_capacity = initial_cap;
+
     let kv_dtype = weights.layers[0].k_proj.dtype();
-    let cache_shape = [1i32, n_kv_heads, max_seq_len, head_dim];
+    let cache_shape = [1i32, n_kv_heads, initial_cap, head_dim];
     let mut k_caches: Vec<Array> = (0..n_layers)
         .map(|_| zeros_dtype_device(&cache_shape, kv_dtype, StreamOrDevice::default()))
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -429,124 +449,85 @@ fn metal_generate(
         .context("pre-alloc v_caches")?;
 
     let mut generated: Vec<u32> = Vec::new();
-    let mut first_token_logged = false;
     let mut cache_len: i32 = 0;
 
-    // Prefill on first step, then single-token decode
-    let mut current_ids: Vec<u32> = input_ids.to_vec();
+    // ── Phase 1: Prefill — build lazy graph, schedule GPU asynchronously ─────
+    let prefill_token = build_forward_graph(
+        input_ids, weights, &mut k_caches, &mut v_caches,
+        cache_len, n_heads, n_kv_heads, head_dim,
+        attn_scale, rope_base, eps, use_fused, params,
+    )?;
+    // P6: schedule GPU execution without blocking CPU.
+    // SAFETY: prefill_token is a valid lazy Array; async_eval borrows by ctx pointer.
+    unsafe { metal_ffi::metal_async_eval(prefill_token.as_ptr()); }
+    cache_len += prefill_len;
+
+    // ── Phase 2: Decode loop (double-buffered — P3/P6) ────────────────────────
+    //
+    // Each iteration: sync *previous* token via item() (GPU likely done since
+    // async_eval), then build *next* graph and async_eval it before looping.
+    // CPU graph-build overlaps with GPU execution of the current step.
+    let mut pending = prefill_token;
+    let mut decode_step: usize = 0;
 
     loop {
-        let seq = current_ids.len() as i32;
-        let is_prefill = seq > 1;
+        // P6: sync — blocks until GPU computation for this token is complete.
+        let next_token = pending.item::<i32>() as u32;
 
-        // ── Embedding lookup ─────────────────────────────────────────────────
-        let idx_i32: Vec<i32> = current_ids.iter().map(|&t| t as i32).collect();
-        let idx_arr = Array::from_slice(&idx_i32, &[seq]);
-        let mut x = take_axis(&weights.embed_tokens, &idx_arr, 0).context("embedding take_axis")?;
-
-        // ── Transformer layers ────────────────────────────────────────────────
-        if use_fused {
-            // P2: one C++ FFI call per layer instead of ~40 mlx-rs calls.
-            for (li, layer) in weights.layers.iter().enumerate() {
-                let (q_t, k_t, v_t, o_t) = match (
-                    &layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj,
-                ) {
-                    (WeightTensor::Dense(q), WeightTensor::Dense(k),
-                     WeightTensor::Dense(v), WeightTensor::Dense(o)) => (q, k, v, o),
-                    _ => unreachable!("use_fused only when all layers are Dense"),
-                };
-                let (gate_t, up_t, down_t) = match (
-                    &layer.gate_proj, &layer.up_proj, &layer.down_proj,
-                ) {
-                    (WeightTensor::Dense(g), WeightTensor::Dense(u), WeightTensor::Dense(d)) => (g, u, d),
-                    _ => unreachable!("use_fused only when all layers are Dense"),
-                };
-
-                // Safety: metal_fused_block_cached borrows all inputs (does not free them).
-                // It writes a newly heap-allocated array into result_raw, which we wrap
-                // in Array::from_ptr() to take ownership (Array's Drop will free it).
-                // k_cache / v_cache are updated in-place by the C++ shim; their ctx
-                // pointers may change (slice_update returns a new array), but the Rust
-                // Array wrapper stays valid since we pass a *mut to the wrapper struct.
-                let result_raw: mlx_sys::mlx_array = unsafe {
-                    let mut r = std::mem::MaybeUninit::<mlx_sys::mlx_array>::uninit();
-                    metal_ffi::metal_fused_block_cached(
-                        x.as_ptr(),
-                        layer.input_layernorm.as_ptr(),
-                        layer.post_attention_layernorm.as_ptr(),
-                        q_t.as_ptr(),
-                        k_t.as_ptr(),
-                        v_t.as_ptr(),
-                        o_t.as_ptr(),
-                        layer.q_norm.as_ptr(),
-                        layer.k_norm.as_ptr(),
-                        gate_t.as_ptr(),
-                        up_t.as_ptr(),
-                        down_t.as_ptr(),
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        attn_scale,
-                        rope_base,
-                        head_dim, // rope_dims = head_dim
-                        eps,
-                        // Array is #[repr(transparent)] over mlx_array, so *mut Array
-                        // is layout-compatible with *mut mlx_array.
-                        &mut k_caches[li] as *mut Array as *mut mlx_sys::mlx_array,
-                        &mut v_caches[li] as *mut Array as *mut mlx_sys::mlx_array,
-                        cache_len,
-                        seq,
-                        r.as_mut_ptr(),
-                    );
-                    r.assume_init()
-                };
-                // SAFETY: C++ wrote a valid, heap-allocated array into result_raw.
-                x = unsafe { Array::from_ptr(result_raw) };
-            }
-        } else {
-            // Fallback: Rust-level layer loop (quantized models or when fused unavailable).
-            for (li, layer) in weights.layers.iter().enumerate() {
-                x = rust_transformer_layer(
-                    x, layer, li,
-                    &mut k_caches, &mut v_caches,
-                    seq, cache_len, n_heads, n_kv_heads, head_dim,
-                    attn_scale, rope_base, eps,
-                )?;
-            }
-        }
-
-        // ── Final norm + lm_head ─────────────────────────────────────────────
-        let last_idx = Array::from_slice(&[seq - 1], &[1]);
-        let last_x = take_axis(&x, &last_idx, 0).context("take last hidden")?;
-        let last_x = fast::rms_norm(&last_x, &weights.norm, eps).context("final norm")?;
-        let logits = linear(&last_x, &weights.lm_head)?; // [1, vocab]
-
-        // ── P4: GPU-side sampling + P3: eval ─────────────────────────────────
-        // Argmax / categorical stays on GPU (P4); scalar only crosses to CPU on .item().
-        // P3: eval forces the full graph (embed → transformer → sample) to execute.
-        let token_arr = gpu_sample_token(&logits, params)?;
-        eval([&token_arr]).context("eval token")?;
-        let next_token = token_arr.item::<i32>() as u32;
-
-        if !first_token_logged {
+        if decode_step == 0 {
             let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
             log::info!(
-                "  TTFT: {ttft_ms:.1}ms (including prefill of {} tokens)",
+                "  TTFT: {ttft_ms:.1}ms (prefill {} tokens)",
                 input_ids.len()
             );
-            first_token_logged = true;
         }
 
         let stop = next_token == eos_id || params.stop_token_ids.contains(&next_token);
         generated.push(next_token);
-        cache_len += seq;
 
         if stop || generated.len() >= max_new_tokens {
             break;
         }
 
-        // Next step: single new token
-        current_ids = vec![next_token];
+        // P5: grow KV cache in 256-token chunks when capacity is about to overflow.
+        if cache_len + 1 > kv_capacity {
+            let new_cap = kv_capacity + KV_CACHE_CHUNK;
+            for li in 0..n_layers {
+                // SAFETY: metal_kv_extend replaces the Array ctx pointer in-place.
+                unsafe {
+                    metal_ffi::metal_kv_extend(
+                        (&raw mut k_caches[li]).cast::<mlx_sys::mlx_array>(),
+                        n_kv_heads, head_dim, new_cap,
+                    );
+                    metal_ffi::metal_kv_extend(
+                        (&raw mut v_caches[li]).cast::<mlx_sys::mlx_array>(),
+                        n_kv_heads, head_dim, new_cap,
+                    );
+                }
+            }
+            kv_capacity = new_cap;
+        }
+
+        // P5: release accumulated temporary Metal allocations every 256 steps.
+        if decode_step > 0 && decode_step.is_multiple_of(256) {
+            // SAFETY: pure cache management; no Array handles are affected.
+            unsafe { metal_ffi::metal_clear_cache(); }
+        }
+
+        // Build next decode step's lazy graph (CPU-only; GPU idle until async_eval).
+        let new_pending = build_forward_graph(
+            &[next_token], weights, &mut k_caches, &mut v_caches,
+            cache_len, n_heads, n_kv_heads, head_dim,
+            attn_scale, rope_base, eps, use_fused, params,
+        )?;
+        cache_len += 1;
+        decode_step += 1;
+
+        // P6: kick off GPU — CPU syncs at top of next iteration via item().
+        // SAFETY: new_pending is a valid lazy Array; async_eval borrows by ctx pointer.
+        unsafe { metal_ffi::metal_async_eval(new_pending.as_ptr()); }
+
+        pending = new_pending;
     }
 
     let elapsed = t0.elapsed().as_secs_f64();
@@ -556,10 +537,102 @@ fn metal_generate(
     Ok(generated)
 }
 
+/// Build one forward-pass compute graph (lazy — no GPU work until eval/async_eval).
+///
+/// Returns an unsynchronised token `Array` (greedy argmax or categorical sample).
+/// The caller must `async_eval` or `eval` then call `.item()` to materialise the token.
+// GPU required: all ops register Metal-backed lazy computation nodes.
+#[cfg(feature = "metal")]
+#[allow(clippy::too_many_arguments)]
+fn build_forward_graph(
+    current_ids: &[u32],
+    weights: &MetalWeights,
+    k_caches: &mut [Array],
+    v_caches: &mut [Array],
+    cache_len: i32,
+    n_heads: i32,
+    n_kv_heads: i32,
+    head_dim: i32,
+    attn_scale: f32,
+    rope_base: f32,
+    eps: f32,
+    use_fused: bool,
+    params: &SamplingParams,
+) -> Result<Array> {
+    use mlx_rs::{fast, ops::indexing::take_axis};
+
+    let seq = current_ids.len() as i32;
+
+    // ── Embedding lookup ─────────────────────────────────────────────────────
+    let idx_i32: Vec<i32> = current_ids.iter().map(|&t| t as i32).collect();
+    let idx_arr = Array::from_slice(&idx_i32, &[seq]);
+    let mut x = take_axis(&weights.embed_tokens, &idx_arr, 0).context("embedding take_axis")?;
+
+    // ── Transformer layers ────────────────────────────────────────────────────
+    if use_fused {
+        // P2 + P7: one C++ FFI call per layer; all intermediate Arrays are C++-scoped.
+        // Rust only holds the layer input (x) and output (x_next) Array handles.
+        for (li, layer) in weights.layers.iter().enumerate() {
+            let (WeightTensor::Dense(q_proj_t), WeightTensor::Dense(k_proj_t),
+                 WeightTensor::Dense(v_proj_t), WeightTensor::Dense(o_proj_t)) =
+                (&layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj)
+            else { unreachable!("use_fused only when all layers are Dense") };
+            let (WeightTensor::Dense(gate_proj_t), WeightTensor::Dense(up_proj_t),
+                 WeightTensor::Dense(down_proj_t)) =
+                (&layer.gate_proj, &layer.up_proj, &layer.down_proj)
+            else { unreachable!("use_fused only when all layers are Dense") };
+
+            // SAFETY: metal_fused_block_cached borrows all inputs (does not free them).
+            // It writes a newly heap-allocated array into result_raw, transferred to Rust.
+            let result_raw: mlx_sys::mlx_array = unsafe {
+                let mut r = std::mem::MaybeUninit::<mlx_sys::mlx_array>::uninit();
+                metal_ffi::metal_fused_block_cached(
+                    x.as_ptr(),
+                    layer.input_layernorm.as_ptr(),
+                    layer.post_attention_layernorm.as_ptr(),
+                    q_proj_t.as_ptr(), k_proj_t.as_ptr(), v_proj_t.as_ptr(), o_proj_t.as_ptr(),
+                    layer.q_norm.as_ptr(), layer.k_norm.as_ptr(),
+                    gate_proj_t.as_ptr(), up_proj_t.as_ptr(), down_proj_t.as_ptr(),
+                    n_heads, n_kv_heads, head_dim,
+                    attn_scale, rope_base,
+                    head_dim, // rope_dims = head_dim
+                    eps,
+                    (&raw mut k_caches[li]).cast::<mlx_sys::mlx_array>(),
+                    (&raw mut v_caches[li]).cast::<mlx_sys::mlx_array>(),
+                    cache_len, seq,
+                    r.as_mut_ptr(),
+                );
+                r.assume_init()
+            };
+            // SAFETY: C++ heap-allocated array transferred to Rust ownership.
+            x = unsafe { Array::from_ptr(result_raw) };
+        }
+    } else {
+        // Fallback: Rust-level layer loop (quantized models).
+        for (li, layer) in weights.layers.iter().enumerate() {
+            x = rust_transformer_layer(
+                x, layer, li,
+                k_caches, v_caches,
+                seq, cache_len, n_heads, n_kv_heads, head_dim,
+                attn_scale, rope_base, eps,
+            )?;
+        }
+    }
+
+    // ── Final norm + lm_head ─────────────────────────────────────────────────
+    let last_idx = Array::from_slice(&[seq - 1], &[1]);
+    let last_x = take_axis(&x, &last_idx, 0).context("take last hidden")?;
+    let last_x = fast::rms_norm(&last_x, &weights.norm, eps).context("final norm")?;
+    let logits = linear(&last_x, &weights.lm_head)?; // [1, vocab]
+
+    // P4: GPU-side sampling — stays on GPU, only scalar crosses on .item() later.
+    gpu_sample_token(&logits, params)
+}
+
 /// Single transformer layer — used as fallback for quantized models.
 // GPU required
 #[cfg(feature = "metal")]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 fn rust_transformer_layer(
     x: Array,
     layer: &MetalLayerWeights,
@@ -824,7 +897,7 @@ fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<Met
             };
             // SAFETY: `bytes` is alive for this scope; from_raw_data copies into Metal memory.
             let arr = unsafe { Array::from_raw_data(view.data().as_ptr().cast(), &shape, dtype) };
-            tensors.insert(name.to_string(), arr);
+            tensors.insert(name.clone(), arr);
         }
     }
 
@@ -938,13 +1011,12 @@ fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<Met
 fn collect_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut shards: Vec<PathBuf> = std::fs::read_dir(model_dir)
         .with_context(|| format!("read_dir {}", model_dir.display()))?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.path())
         .filter(|p| {
             p.extension()
                 .and_then(|e| e.to_str())
-                .map(|e| e == "safetensors")
-                .unwrap_or(false)
+                .is_some_and(|e| e == "safetensors")
         })
         .collect();
     shards.sort();

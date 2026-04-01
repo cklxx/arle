@@ -1437,6 +1437,7 @@ dependencies = [
  "futures-util",
  "half",
  "hf-hub",
+ "libc",
  "log",
  "logforth",
  "memmap2",

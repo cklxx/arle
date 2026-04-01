@@ -702,49 +702,38 @@ fn find_mlx_include_dirs() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     None
 }
 
-fn main() {
-    // ── Metal C++ fused-ops shim (macOS only, requires `metal` feature) ────────
-    if std::env::var("CARGO_FEATURE_METAL").is_ok() {
-        println!("cargo:rerun-if-changed=csrc/metal/metal_fused_ops.cpp");
-        match find_mlx_include_dirs() {
-            Some((cpp_hdr, c_hdr)) => {
-                let mut build = cc::Build::new();
-                build
-                    .cpp(true)
-                    .std("c++17")
-                    .warnings(false)
-                    .flag("-O3")
-                    // MLX C++ headers (mlx/fast.h, mlx/transforms.h, …)
-                    .include(&cpp_hdr)
-                    // mlx-c public headers (mlx_array typedef used in our ABI)
-                    .include(&c_hdr)
-                    .file("csrc/metal/metal_fused_ops.cpp");
+/// Returns `true` when `xcrun metal` is available (Xcode / CLT installed on macOS).
+fn xcrun_metal_available() -> bool {
+    Command::new("xcrun")
+        .args(["--find", "metal"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
 
-                // On macOS, use clang++ and link frameworks
-                if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-                    build.compiler("clang++");
-                }
-
-                build.compile("metal_fused_ops");
-                // libmlxc (C wrappers) and libmlx (C++ core) are already linked by
-                // mlx-sys; we don't need to repeat link lines here.
-                println!(
-                    "cargo:warning=metal_fused_ops: compiled with MLX headers from {}",
-                    cpp_hdr.display()
-                );
-            }
-            None => {
-                // mlx-sys hasn't been built yet, or OUT_DIR structure changed.
-                // This is a hard error — without the C++ shim we can't compile
-                // the metal feature.  The user will see this message.
-                panic!(
-                    "metal_fused_ops: cannot find mlx-sys build output (expected \
-                     mlx-sys-*/out/build/_deps/mlx-src under the cargo build dir). \
-                     Try `cargo clean` and rebuild."
-                );
-            }
-        }
+/// Try to download a pre-built `libmetal_fused_ops.a` into `out_dir`.
+///
+/// Controlled by env var `METAL_PREBUILT_URL` — set to the download URL.
+/// Returns the path to the downloaded file on success, or `None`.
+fn try_download_prebuilt(out_dir: &Path) -> Option<PathBuf> {
+    let url = std::env::var("METAL_PREBUILT_URL").ok()?;
+    let dest = out_dir.join("libmetal_fused_ops.a");
+    println!("cargo:warning=metal_fused_ops: downloading prebuilt from {url}");
+    let status = Command::new("curl")
+        .args(["-fsSL", "-o", dest.to_str().unwrap(), &url])
+        .status()
+        .unwrap_or_else(|e| panic!("curl not found: {e}"));
+    if status.success() && dest.exists() {
+        println!(
+            "cargo:warning=metal_fused_ops: using prebuilt library from {}",
+            dest.display()
+        );
+        Some(dest)
+    } else {
+        println!("cargo:warning=metal_fused_ops: prebuilt download failed (status={status})");
+        None
     }
+}
 
 /// Find FlashInfer C++ include directory.
 ///
@@ -795,6 +784,60 @@ fn find_flashinfer_include() -> Option<String> {
 
     None
 }
+
+fn main() {
+    // ── Metal C++ fused-ops shim (macOS only, requires `metal` feature) ────────
+    if std::env::var("CARGO_FEATURE_METAL").is_ok() {
+        println!("cargo:rerun-if-changed=csrc/metal/metal_fused_ops.cpp");
+        println!("cargo:rerun-if-env-changed=METAL_BUILD_FROM_SOURCE");
+        println!("cargo:rerun-if-env-changed=METAL_PREBUILT_URL");
+
+        let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+        let force_source = std::env::var("METAL_BUILD_FROM_SOURCE").as_deref() == Ok("1");
+        let can_build = force_source || xcrun_metal_available();
+
+        if can_build {
+            match find_mlx_include_dirs() {
+                Some((cpp_hdr, c_hdr)) => {
+                    let mut build = cc::Build::new();
+                    build
+                        .cpp(true)
+                        .std("c++17")
+                        .warnings(false)
+                        .flag("-O3")
+                        .include(&cpp_hdr)
+                        .include(&c_hdr)
+                        .file("csrc/metal/metal_fused_ops.cpp");
+                    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+                        build.compiler("clang++");
+                    }
+                    build.compile("metal_fused_ops");
+                    println!(
+                        "cargo:warning=metal_fused_ops: compiled from source (MLX: {})",
+                        cpp_hdr.display()
+                    );
+                }
+                None => {
+                    panic!(
+                        "metal_fused_ops: xcrun metal found but mlx-sys headers missing \
+                         (expected mlx-sys-*/out/build/_deps/mlx-src). \
+                         Try `cargo clean` and rebuild."
+                    );
+                }
+            }
+        } else if let Some(_prebuilt) = try_download_prebuilt(&out_dir) {
+            println!("cargo:rustc-link-search=native={}", out_dir.display());
+            println!("cargo:rustc-link-lib=static=metal_fused_ops");
+        } else {
+            panic!(
+                "metal_fused_ops: cannot build Metal C++ shim.\n\
+                 Options:\n\
+                 1. Install Xcode CLT: `xcode-select --install`\n\
+                 2. Set METAL_PREBUILT_URL=<url-to-libmetal_fused_ops.a>\n\
+                 3. Set METAL_BUILD_FROM_SOURCE=1 to force source build"
+            );
+        }
+    }
 
     // When the `no-cuda` feature is active (e.g. macOS dev machines without a GPU),
     // skip all CUDA/Triton compilation. GPU ops will panic at runtime.
