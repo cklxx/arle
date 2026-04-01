@@ -103,8 +103,8 @@ do_check() {
     # Rust
     if check_cmd rustc; then
         info "  rustc $(rustc --version 2>/dev/null | awk '{print $2}')"
-    else ((errors++)); fi
-    check_cmd cargo || ((errors++))
+    else errors=$((errors + 1)); fi
+    check_cmd cargo || errors=$((errors + 1))
 
     # CUDA
     if [ -x "$CUDA_HOME/bin/nvcc" ]; then
@@ -112,13 +112,13 @@ do_check() {
         info "  $("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | grep release)"
     else
         fail "nvcc not found at $CUDA_HOME/bin/nvcc"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # GPU
     if check_cmd nvidia-smi; then
         info "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
-    else ((errors++)); fi
+    else errors=$((errors + 1)); fi
 
     # Venv
     if [ -f "$VENV_DIR/bin/activate" ]; then
@@ -126,29 +126,31 @@ do_check() {
         activate_venv
     else
         fail "venv not found — run ./setup.sh --deps-only"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Python (from venv)
     if check_cmd python; then
         info "  python $(python --version 2>/dev/null | awk '{print $2}')"
-    else ((errors++)); fi
+    else errors=$((errors + 1)); fi
 
     # Pinned packages
     local pkg_errors=0
-    while IFS='==' read -r pkg ver; do
-        [[ "$pkg" =~ ^#.*$ || -z "$pkg" ]] && continue
-        pkg_name="${pkg//-/_}"
+    while IFS= read -r line; do
+        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+        local pkg ver
+        pkg="${line%%==*}"; ver="${line##*==}"
         local actual
-        actual=$(python -c "import $pkg_name; print($pkg_name.__version__)" 2>/dev/null || echo "MISSING")
+        actual=$(pip show "$pkg" 2>/dev/null | grep "^Version:" | awk '{print $2}')
+        actual="${actual:-MISSING}"
         if [ "$actual" = "$ver" ]; then
             ok "  $pkg==$ver"
         else
-            fail "  $pkg: expected $ver, got $actual"
-            ((pkg_errors++))
+            fail "  $pkg: want $ver, got $actual"
+            pkg_errors=$((pkg_errors + 1))
         fi
     done < <(grep -E '^[a-zA-Z].*==' requirements-build.txt)
-    ((errors += pkg_errors))
+    errors=$((errors + pkg_errors))
 
     # nsjail
     if check_cmd nsjail; then
@@ -162,7 +164,7 @@ do_check() {
         ok "target/release/agent-infer built"
     else
         fail "agent-infer binary not found — run ./setup.sh --build-only"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Model
@@ -233,7 +235,10 @@ do_deps() {
         ok "venv exists: $VENV_DIR"
     else
         info "Creating venv at $VENV_DIR ..."
-        "$PYTHON" -m venv "$VENV_DIR"
+        # --without-pip: some distros lack ensurepip for newer Python.
+        # We bootstrap pip via get-pip.py immediately after.
+        "$PYTHON" -m venv --without-pip "$VENV_DIR" 2>/dev/null \
+            || "$PYTHON" -m venv "$VENV_DIR"
         ok "venv created"
     fi
 
@@ -241,7 +246,11 @@ do_deps() {
     source "$VENV_DIR/bin/activate"
     info "Python: $(python --version) — $(which python)"
 
-    # Upgrade pip
+    # Bootstrap pip if missing (happens with --without-pip)
+    if ! python -m pip --version &>/dev/null; then
+        info "Bootstrapping pip..."
+        curl -sSL https://bootstrap.pypa.io/get-pip.py | python -q
+    fi
     python -m pip install --upgrade pip -q
 
     # --- Pinned build deps ---
@@ -250,13 +259,13 @@ do_deps() {
 
     # Install flashinfer separately with --no-deps
     local fi_line
-    fi_line=$(grep "flashinfer" requirements-build.txt | head -1)
+    fi_line=$(grep -E '^flashinfer' requirements-build.txt | head -1)
     pip install "$fi_line" --no-deps -q
     ok "$fi_line (headers only)"
 
-    # Install remaining build deps normally
-    grep -v "flashinfer" requirements-build.txt | grep -v "^#" | grep -v "^$" | \
-        xargs pip install -q
+    # Install remaining build deps normally (skip comments, blanks, flashinfer)
+    grep -E '^[a-zA-Z]' requirements-build.txt | grep -v 'flashinfer' | \
+        pip install -r /dev/stdin -q
     ok "Build deps installed"
 
     # --- Bench/test deps ---
@@ -274,16 +283,21 @@ do_deps() {
     # --- Verify pinned versions ---
     step "Verifying pinned versions"
     local ok_count=0
-    while IFS='==' read -r pkg ver; do
-        [[ "$pkg" =~ ^#.*$ || -z "$pkg" ]] && continue
-        pkg_name="${pkg//-/_}"
+    while IFS= read -r line; do
+        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+        local pkg ver
+        pkg="${line%%==*}"
+        ver="${line##*==}"
+        local pkg_name="${pkg//-/_}"
         local actual
-        actual=$(python -c "import $pkg_name; print($pkg_name.__version__)" 2>/dev/null || echo "?")
+        # flashinfer can't be imported without torch — check pip metadata instead
+        actual=$(pip show "$pkg" 2>/dev/null | grep "^Version:" | awk '{print $2}')
+        actual="${actual:-MISSING}"
         if [ "$actual" = "$ver" ]; then
             ok "  $pkg==$ver"
-            ((ok_count++))
+            ok_count=$((ok_count + 1))
         else
-            fail "  $pkg: expected $ver, got $actual"
+            fail "  $pkg: want $ver, got $actual"
         fi
     done < <(grep -E '^[a-zA-Z].*==' requirements-build.txt)
     info "$ok_count pinned packages verified"
@@ -416,7 +430,7 @@ do_full() {
 # Dispatch
 # ---------------------------------------------------------------------------
 case "$MODE" in
-    check) activate_venv; do_check ;;
+    check) [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"; activate_venv; do_check ;;
     deps)  do_deps ;;
     build) do_build ;;
     model) do_model ;;

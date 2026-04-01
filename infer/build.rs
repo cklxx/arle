@@ -746,6 +746,56 @@ fn main() {
         }
     }
 
+/// Find FlashInfer C++ include directory.
+///
+/// Search order:
+///   1. FLASHINFER_INCLUDE_DIR env var (explicit override)
+///   2. `pip show flashinfer-python` → Location + /flashinfer/data/include
+///   3. `python3 -c "import flashinfer; ..."` (legacy, needs working import)
+fn find_flashinfer_include() -> Option<String> {
+    // 1. Explicit override
+    if let Ok(dir) = std::env::var("FLASHINFER_INCLUDE_DIR") {
+        if Path::new(&dir).join("flashinfer").exists() {
+            return Some(dir);
+        }
+    }
+
+    // 2. pip show (works even when flashinfer can't be imported)
+    let python = std::env::var("PEGAINFER_TRITON_PYTHON")
+        .unwrap_or_else(|_| "python3".to_string());
+    if let Ok(output) = Command::new(&python)
+        .args(["-m", "pip", "show", "flashinfer-python"])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some(loc) = line.strip_prefix("Location: ") {
+                    let candidate = format!("{}/flashinfer/data/include", loc.trim());
+                    if Path::new(&candidate).join("flashinfer").exists() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Legacy: import flashinfer
+    if let Ok(output) = Command::new(&python)
+        .args(["-c", "import flashinfer, os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data', 'include'))"])
+        .output()
+    {
+        if output.status.success() {
+            let inc = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if Path::new(&inc).join("flashinfer").exists() {
+                return Some(inc);
+            }
+        }
+    }
+
+    None
+}
+
     // When the `no-cuda` feature is active (e.g. macOS dev machines without a GPU),
     // skip all CUDA/Triton compilation. GPU ops will panic at runtime.
     if std::env::var("CARGO_FEATURE_NO_CUDA").is_ok() {
@@ -816,22 +866,14 @@ fn main() {
 
         // FlashInfer headers for flashinfer_decode.cu
         if stem == "flashinfer_decode" {
-            // Find FlashInfer include path from pip
-            if let Ok(output) = Command::new("python3")
-                .args(["-c", "import flashinfer; import os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data', 'include'))"])
-                .output()
-            {
-                if output.status.success() {
-                    let fi_include = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if Path::new(&fi_include).exists() {
-                        nvcc_args.extend([
-                            format!("-I{}", fi_include),
-                            "-std=c++17".to_string(),
-                            "--expt-relaxed-constexpr".to_string(),
-                        ]);
-                        println!("cargo:warning=FlashInfer include: {}", fi_include);
-                    }
-                }
+            let fi_include = find_flashinfer_include();
+            if let Some(ref inc) = fi_include {
+                nvcc_args.extend([
+                    format!("-I{}", inc),
+                    "-std=c++17".to_string(),
+                    "--expt-relaxed-constexpr".to_string(),
+                ]);
+                println!("cargo:warning=FlashInfer include: {}", inc);
             }
         }
 
