@@ -11,7 +11,7 @@
 //! # Full options
 //! ./target/release/metal_bench \
 //!   --model models/Qwen3-0.6B-4bit \
-//!   --max-tokens 256 --warmup 3 --runs 5 --json
+//!   --prompt-tokens 20 --generation-tokens 256 --warmup 3 --runs 5 --json
 //! ```
 
 use std::time::Instant;
@@ -30,9 +30,13 @@ struct Cli {
     #[arg(long, short)]
     model: String,
 
-    /// Maximum new tokens to generate per run.
-    #[arg(long, default_value_t = 256)]
-    max_tokens: usize,
+    /// Exact number of prompt tokens to benchmark.
+    #[arg(long, default_value_t = 20)]
+    prompt_tokens: usize,
+
+    /// Exact number of generated tokens to benchmark.
+    #[arg(long, visible_alias = "max-tokens", default_value_t = 256)]
+    generation_tokens: usize,
 
     /// Number of warmup runs (excluded from statistics).
     #[arg(long, default_value_t = 3)]
@@ -49,6 +53,16 @@ struct Cli {
     /// Emit results as JSON on stdout (suppresses human-readable table).
     #[arg(long, default_value_t = false)]
     json: bool,
+}
+
+struct Run {
+    total_time_ms: f64,
+    prompt_tokens: usize,
+    tokens: usize,
+    prompt_tps: f64,
+    generation_tps: f64,
+    ttft_ms: f64,
+    e2e_tps: f64,
 }
 
 fn main() -> Result<()> {
@@ -73,14 +87,10 @@ fn run_bench() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Prompt exercises both prefill and decode.
-    let prompt = "<|im_start|>user\n\
-                  Write a detailed explanation of how attention mechanisms work in transformers.\
-                  <|im_end|>\n<|im_start|>assistant\n";
-
     let params = SamplingParams {
         temperature: 0.0, // greedy — deterministic runs
-        max_new_tokens: Some(cli.max_tokens),
+        ignore_eos: true,
+        max_new_tokens: Some(cli.generation_tokens),
         ..Default::default()
     };
 
@@ -102,34 +112,35 @@ fn run_bench() -> Result<()> {
         eprintln!("Loaded {load_ms:.0}ms  [{quant_hint}]");
     }
 
+    let prompt_ids = backend.benchmark_prompt_ids(cli.prompt_tokens)?;
+
     // ── Warmup ───────────────────────────────────────────────────────────────
     if !cli.json {
         eprintln!("Warmup ({} runs)…", cli.warmup);
     }
     for _ in 0..cli.warmup {
-        backend.generate(prompt, &params)?;
+        backend.generate_from_token_ids(&prompt_ids, &params)?;
     }
 
     // ── Timed runs ───────────────────────────────────────────────────────────
-    struct Run {
-        total_time_ms: f64,
-        prompt_tokens: usize,
-        tokens: usize,
-        prompt_tps: f64,
-        generation_tps: f64,
-        ttft_ms: f64,
-        e2e_tps: f64,
-    }
-
     let mut runs: Vec<Run> = Vec::with_capacity(cli.runs);
 
     for i in 0..cli.runs {
-        let result = backend.generate(prompt, &params)?;
+        let result = backend.generate_from_token_ids(&prompt_ids, &params)?;
+        if result.finish_reason != "length" || result.completion_tokens != cli.generation_tokens {
+            anyhow::bail!(
+                "benchmark invariant failed on run {}: finish_reason={}, completion_tokens={}, expected={}",
+                i + 1,
+                result.finish_reason,
+                result.completion_tokens,
+                cli.generation_tokens,
+            );
+        }
         let e2e_tps = result.completion_tokens as f64 / (result.total_time_ms / 1000.0).max(1e-9);
 
         if cli.profile || !cli.json {
             eprintln!(
-                "  run {:2}: prompt {:3} tok @ {:6.1} tok/s  gen {:4} tok @ {:6.1} tok/s  e2e {:6.1} tok/s  ttft {:6.1}ms  total {:6.1}ms",
+                "  run {:2}: prompt {:3} tok @ {:6.1} tok/s  gen {:4} tok @ {:6.1} tok/s  repo-e2e {:6.1} tok/s  ttft {:6.1}ms  total {:6.1}ms",
                 i + 1,
                 result.prompt_tokens,
                 result.prompt_tps,
@@ -196,7 +207,8 @@ fn run_bench() -> Result<()> {
             serde_json::json!({
                 "model": cli.model,
                 "quantization": quant_hint,
-                "max_tokens": cli.max_tokens,
+                "prompt_tokens_requested": cli.prompt_tokens,
+                "generation_tokens_requested": cli.generation_tokens,
                 "warmup_runs": cli.warmup,
                 "timed_runs": cli.runs,
                 "load_ms": load_ms,
@@ -204,9 +216,9 @@ fn run_bench() -> Result<()> {
                 "avg_tokens": avg_tokens,
                 "prompt_tps": { "mean": mean_prompt_tps, "p50": p50_prompt_tps, "p99": p99_prompt_tps },
                 "generation_tps": { "mean": mean_generation_tps, "p50": p50_generation_tps, "p99": p99_generation_tps },
-                "e2e_tps": { "mean": mean_e2e_tps, "p50": p50_e2e_tps, "p99": p99_e2e_tps },
                 "ttft_ms": { "mean": mean_ttft_ms, "p50": p50_ttft_ms, "p99": p99_ttft_ms },
                 "total_time_ms": { "mean": mean_total_time_ms, "p50": p50_total_time_ms, "p99": p99_total_time_ms },
+                "repo_e2e_tps": { "mean": mean_e2e_tps, "p50": p50_e2e_tps, "p99": p99_e2e_tps },
                 "peak_rss_mb": peak_mb,
             })
         );
@@ -223,13 +235,13 @@ fn run_bench() -> Result<()> {
             "  Generation      : {mean_generation_tps:.1} tok/s mean  |  {p50_generation_tps:.1} p50  |  {p99_generation_tps:.1} p99"
         );
         println!(
-            "  End-to-end      : {mean_e2e_tps:.1} tok/s mean  |  {p50_e2e_tps:.1} p50  |  {p99_e2e_tps:.1} p99"
-        );
-        println!(
             "  TTFT            : {mean_ttft_ms:.0}ms mean  |  {p50_ttft_ms:.0}ms p50  |  {p99_ttft_ms:.0}ms p99"
         );
         println!(
             "  Total wall      : {mean_total_time_ms:.0}ms mean  |  {p50_total_time_ms:.0}ms p50  |  {p99_total_time_ms:.0}ms p99"
+        );
+        println!(
+            "  Repo E2E        : {mean_e2e_tps:.1} tok/s mean  |  {p50_e2e_tps:.1} p50  |  {p99_e2e_tps:.1} p99"
         );
         println!("  Peak RSS        : {peak_mb:.0}MB");
         println!(
@@ -256,7 +268,7 @@ fn peak_rss_kb() -> u64 {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut ru) };
         ru.ru_maxrss as u64 / 1024
     }
     #[cfg(not(all(target_os = "macos", feature = "metal")))]

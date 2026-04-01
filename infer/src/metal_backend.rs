@@ -392,6 +392,83 @@ impl MetalBackend {
             _weights: (),
         }
     }
+
+    pub fn generate_from_token_ids(
+        &self,
+        input_ids: &[u32],
+        params: &SamplingParams,
+    ) -> Result<GenerateResult> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .context("model not loaded — call load() first")?;
+        let config = self.config.as_ref().unwrap();
+        let prompt_tokens = input_ids.len();
+
+        #[cfg(feature = "metal")]
+        {
+            let weights = self.weights.as_ref().context("weights not loaded")?;
+            let max_new_tokens = params.max_new_tokens.unwrap_or(512);
+            let t0 = Instant::now();
+
+            let generated = metal_generate(input_ids, weights, config, params, max_new_tokens, t0)?;
+
+            let ttft_s = generated.ttft_ms / 1000.0;
+            let total_s = generated.total_time_ms / 1000.0;
+            let prompt_tps = if generated.ttft_ms > 0.0 && prompt_tokens > 0 {
+                prompt_tokens as f64 / ttft_s.max(1e-9)
+            } else {
+                0.0
+            };
+            let generation_tps = if generated.tokens.is_empty() {
+                0.0
+            } else {
+                generated.tokens.len() as f64 / (total_s - ttft_s).max(1e-9)
+            };
+
+            let text = tokenizer.decode(&generated.tokens)?;
+            Ok(GenerateResult {
+                text,
+                prompt_tokens,
+                completion_tokens: generated.tokens.len(),
+                finish_reason: generated.finish_reason.to_string(),
+                ttft_ms: generated.ttft_ms,
+                prompt_tps,
+                generation_tps,
+                total_time_ms: generated.total_time_ms,
+            })
+        }
+
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = (tokenizer, config, params, prompt_tokens);
+            todo!(
+                "Metal GPU required: rebuild with --no-default-features \
+                 --features metal,no-cuda to enable Metal inference"
+            )
+        }
+    }
+
+    /// Build a deterministic benchmark prompt with an exact token count.
+    pub fn benchmark_prompt_ids(&self, prompt_tokens: usize) -> Result<Vec<u32>> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .context("model not loaded — call load() first")?;
+
+        if prompt_tokens == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut prompt = String::from(BENCHMARK_PROMPT_CHUNK);
+        let mut input_ids = tokenizer.encode(&prompt)?;
+        while input_ids.len() < prompt_tokens {
+            prompt.push_str(BENCHMARK_PROMPT_CHUNK);
+            input_ids = tokenizer.encode(&prompt)?;
+        }
+        input_ids.truncate(prompt_tokens);
+        Ok(input_ids)
+    }
 }
 
 impl Default for MetalBackend {
@@ -471,59 +548,8 @@ impl InferenceBackend for MetalBackend {
             .tokenizer
             .as_ref()
             .context("model not loaded — call load() first")?;
-        let config = self.config.as_ref().unwrap();
-
-        // ── Tokenise ──────────────────────────────────────────────────────────
         let input_ids = tokenizer.encode(prompt)?;
-        let prompt_tokens = input_ids.len();
-
-        // ── Forward pass + sampling (Metal GPU required) ─────────────────────
-        #[cfg(feature = "metal")]
-        {
-            let weights = self.weights.as_ref().context("weights not loaded")?;
-
-            let max_new_tokens = params.max_new_tokens.unwrap_or(512);
-            let t0 = Instant::now();
-
-            let generated =
-                metal_generate(&input_ids, weights, config, params, max_new_tokens, t0)?;
-
-            let elapsed = t0.elapsed().as_secs_f64();
-            let ttft_s = generated.ttft_ms / 1000.0;
-            let prompt_tps = if generated.ttft_ms > 0.0 && prompt_tokens > 0 {
-                prompt_tokens as f64 / ttft_s.max(1e-9)
-            } else {
-                0.0
-            };
-            let generation_tps = if generated.tokens.is_empty() {
-                0.0
-            } else {
-                generated.tokens.len() as f64 / (elapsed - ttft_s).max(1e-9)
-            };
-
-            let text = tokenizer.decode(&generated.tokens)?;
-            #[allow(clippy::needless_return)]
-            return Ok(GenerateResult {
-                text,
-                prompt_tokens,
-                completion_tokens: generated.tokens.len(),
-                finish_reason: generated.finish_reason.to_string(),
-                ttft_ms: generated.ttft_ms,
-                prompt_tps,
-                generation_tps,
-                total_time_ms: generated.total_time_ms,
-            });
-        }
-
-        // ── Fallback when compiled without metal feature ──────────────────────
-        #[cfg(not(feature = "metal"))]
-        {
-            let _ = (tokenizer, config, params, prompt_tokens);
-            todo!(
-                "Metal GPU required: rebuild with --no-default-features \
-                 --features metal,no-cuda to enable Metal inference"
-            )
-        }
+        self.generate_from_token_ids(&input_ids, params)
     }
 }
 
@@ -560,6 +586,9 @@ impl InferenceBackend for MetalBackend {
 // P5: KV cache grows in this many token increments (aligned with mlx-lm convention).
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
+
+#[cfg(feature = "metal")]
+const BENCHMARK_PROMPT_CHUNK: &str = " benchmark throughput";
 
 #[cfg(feature = "metal")]
 struct MetalGenerateOutput {
@@ -735,6 +764,7 @@ fn metal_generate(
 }
 
 #[cfg(all(feature = "metal", metal_fused_ops))]
+#[allow(clippy::unnecessary_wraps)]
 fn metal_async_eval(arr: &Array) -> Result<()> {
     // SAFETY: `arr` is a valid lazy MLX array; the fused shim only borrows it.
     unsafe {
@@ -762,11 +792,12 @@ fn clear_metal_cache() {
 }
 
 #[cfg(all(feature = "metal", metal_fused_ops))]
+#[allow(clippy::unnecessary_wraps)]
 fn extend_kv_cache(cache: &mut Array, n_kv_heads: i32, head_dim: i32, new_cap: i32) -> Result<()> {
     // SAFETY: metal_kv_extend replaces the Array ctx pointer in-place.
     unsafe {
         metal_ffi::metal_kv_extend(
-            (cache as *mut Array).cast::<mlx_sys::mlx_array>(),
+            std::ptr::from_mut(cache).cast::<mlx_sys::mlx_array>(),
             n_kv_heads,
             head_dim,
             new_cap,
@@ -888,6 +919,7 @@ fn build_forward_graph(
 }
 
 #[cfg(all(feature = "metal", metal_fused_ops))]
+#[allow(clippy::unnecessary_wraps)]
 #[allow(clippy::too_many_arguments)]
 fn fused_transformer_layer(
     x: &Array,
@@ -934,8 +966,8 @@ fn fused_transformer_layer(
             rope_base,
             head_dim, // rope_dims = head_dim
             eps,
-            (k_cache as *mut Array).cast::<mlx_sys::mlx_array>(),
-            (v_cache as *mut Array).cast::<mlx_sys::mlx_array>(),
+            std::ptr::from_mut(k_cache).cast::<mlx_sys::mlx_array>(),
+            std::ptr::from_mut(v_cache).cast::<mlx_sys::mlx_array>(),
             cache_len,
             seq,
             r.as_mut_ptr(),
@@ -1088,6 +1120,7 @@ fn gpu_sample_token(logits: &Array, params: &SamplingParams) -> Result<Array> {
 }
 
 #[cfg(all(feature = "metal", metal_fused_ops))]
+#[allow(clippy::unnecessary_wraps)]
 fn greedy_sample_token(logits: &Array) -> Result<Array> {
     // SAFETY: metal_argmax returns a newly allocated array we own.
     Ok(unsafe { Array::from_ptr(metal_ffi::metal_argmax(logits.as_ptr())) })
@@ -1099,6 +1132,7 @@ fn greedy_sample_token(logits: &Array) -> Result<Array> {
 }
 
 #[cfg(all(feature = "metal", metal_fused_ops))]
+#[allow(clippy::unnecessary_wraps)]
 fn categorical_sample_token(logits: &Array) -> Result<Array> {
     // SAFETY: metal_categorical_sample returns a newly allocated array we own.
     Ok(unsafe { Array::from_ptr(metal_ffi::metal_categorical_sample(logits.as_ptr())) })
@@ -1580,10 +1614,10 @@ mod tests {
         println!("\n=== Metal Benchmark: {label} ===");
         println!("Model:      {}", model_dir.display());
         println!("Prompt TPS: {:.1} tok/s", result.prompt_tps);
+        println!("Gen TPS:    {:.1} tok/s", result.generation_tps);
         println!("TTFT:       {:.1}ms", result.ttft_ms);
         println!("Tokens out: {}", result.completion_tokens);
-        println!("Elapsed:    {:.2}s", result.total_time_ms / 1000.0);
-        println!("Gen TPS:    {:.1} tok/s", result.generation_tps);
+        println!("Total wall: {:.2}s", result.total_time_ms / 1000.0);
         println!("Finished:   {}", result.finish_reason);
         println!(
             "Output:     {:?}",

@@ -106,5 +106,31 @@ What this improved:
 
 Remaining gap:
 
-- this still trails local `mlx_lm` generation throughput (`~316 tok/s`)
-- benchmark parity can be tightened further by benchmarking exact token-count prompts and ignoring EOS, matching `mlx_lm` more closely
+- this still trailed the earlier local prose-prompt `mlx_lm` reading (`~316 tok/s`)
+- benchmark parity still needed exact token-count prompts and `ignore_eos`, matching `mlx_lm` more closely
+
+## Step 3: Token-Count Benchmark Parity With `mlx_lm`
+
+Changes:
+
+- `MetalBackend` now exposes `generate_from_token_ids(...)` so benchmarking does not have to round-trip through text prompts
+- `metal_bench` now benchmarks:
+  - exact `--prompt-tokens`
+  - exact `--generation-tokens`
+  - `ignore_eos: true`
+- benchmark runs now fail fast unless they finish with `finish_reason == "length"` and produce the requested token count
+- `prompt_tps` and `generation_tps` are now the primary metrics
+- repo-specific `e2e` throughput is still reported, but demoted and clearly labeled as `repo_e2e_tps`
+
+Measured on this machine, exact token-count benchmark (`prompt_tokens=20`, `generation_tokens=512`, `warmup=1`, `runs=3`):
+
+| Runner | Prompt speed | Generation speed | Peak memory |
+| --- | ---: | ---: | ---: |
+| `mlx_lm 0.30.4` benchmark | `~823.4 tok/s` | `~200.1 tok/s` | `~0.486 GB` |
+| `agent-infer` token benchmark | `~1443.6 tok/s` | `~174.7 tok/s` | `~800 MB RSS` |
+
+What this clarified:
+
+- the apples-to-apples gap is now much smaller than the earlier prose-prompt comparison suggested
+- with the merged quantized projection path, `agent-infer` reaches about `87.3%` of local `mlx_lm` decode throughput on this workload
+- remaining gap is real decode efficiency, not mostly benchmark semantics anymore
