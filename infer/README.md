@@ -39,15 +39,15 @@ HTTP → Scheduler (continuous batching) → model.forward(tokens, state)
                               │                   │
                               └─────────┬─────────┘
                                         │
-                     Prefill: chunked (512 tok), FlashAttention-2 (Triton AOT)
-                     Decode:  batched GEMM + FlashInfer + CUDA Graph
+                     Prefill: chunked (4096 tok), FlashInfer single (HD128) / Triton FA2 (HD256)
+                     Decode:  merged QKV+gate-up GEMM + FlashInfer + CUDA Graph
                                         │
                               ops → ffi → CUDA / Triton kernels
 ```
 
 Key decisions:
-- **Zero Python at runtime** — Triton kernels compiled AOT at build time into C wrappers
-- **Continuous batching** — decode-priority scheduling; long prefills chunked to 512 tokens to keep decode slots live
+- **Zero Python at runtime** — Triton kernels compiled AOT at build time into C wrappers; FlashInfer linked as C library
+- **Continuous batching** — decode-priority scheduling; long prefills chunked to 4096 tokens (64 when decode active) to keep decode slots live
 - **Token-level KV pool** — SGLang-style `[max_tokens, kv_dim]` layout, page_size=1; FlashInfer handles paged attention
 - **CUDA Graph per batch size** — one graph per batch size N, captured on first call, replayed thereafter; ~504 kernel launches eliminated per step
 - **BF16 storage, FP32 accumulation** — cuBLAS GEMM for prefill, custom GEMV kernel for decode
@@ -137,9 +137,10 @@ Model type is auto-detected from `config.json`.
 ## Features
 
 - Continuous batching with decode-priority scheduling
-- Chunked prefill (512-token chunks) for long prompts
-- FlashAttention-2 (Triton AOT) for prefill
+- Chunked prefill (4096-token chunks, 64 when decode active)
+- FlashInfer single prefill (HD128) + Triton FA2 (HD256)
 - FlashInfer paged decode attention
+- Merged QKV + gate-up GEMM (96 fewer kernel launches/step)
 - CUDA Graph for batched decode (one graph per batch size)
 - Token-level KV pool (SGLang-style)
 - CPU KV offload
@@ -198,7 +199,7 @@ src/
 ├── main.rs                # CLI entry point + HTTP server (axum)
 ├── server_engine.rs       # Model detection, single-request engine
 ├── http_server/           # /v1/completions, /v1/chat/completions, SSE
-├── scheduler.rs           # Continuous batching scheduler
+├── scheduler/             # Continuous batching scheduler (mod, batch, types)
 ├── model.rs               # ModelForward + GenerationState traits
 ├── model/
 │   ├── cuda_graph.rs      # CUDA Graph capture/replay (per batch size)
@@ -240,14 +241,15 @@ Triton kernels are compiled at build time into generated C wrappers. Runtime has
 
 ## Roadmap
 
-Immediate (CPU-verifiable):
-- Additional model architectures: Llama 3/4, DeepSeek-V3, Mistral, Gemma, Phi
-- PagedAttention CUDA kernel (unblocks prefix caching + large contexts)
-- Quantization GPU kernels (GPTQ/AWQ INT4, FP8, INT8)
+Phase 0 (foundation) is complete. Active focus:
 
-GPU-required:
+- **Qwen3.5 SGLang parity** — close ITL gap via batched recurrent kernels (in progress)
+- **Llama 3/4** — most requested model architecture
+- **DeepSeek-V3 / R1** — requires MLA attention first
+- **Quantization GPU kernels** (GPTQ/AWQ INT4, FP8, INT8)
+
+Future:
 - FlashAttention-3 (SM90 / H100)
-- Multi-head Latent Attention (DeepSeek MLA)
 - Tensor parallelism (NCCL all-reduce)
 - Speculative decoding GPU integration
 - Metal HTTP server integration (full server mode on Apple Silicon)

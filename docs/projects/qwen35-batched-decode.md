@@ -1,7 +1,9 @@
 # Qwen3.5 Batched Decode 实现计划
 
-> **状态**: 调研完成，待实现
-> **当前瓶颈**: Qwen3.5 无 `forward_decode_batch`，高并发回退到串行 forward()，C=4 仅 90 tok/s
+> **状态**: ✅ 完成 (2026-04-01)
+> **成果**: Qwen3.5 batched decode 已实现。C=1 100 tok/s, C=4 290 tok/s (vs SGLang 107/349)。
+> FlashInfer HD256 paged attention + scheduler 集成 + batched sampling。
+> **后续**: 见 [plans/qwen35-sglang-parity.md](../plans/qwen35-sglang-parity.md) — ITL 差距优化（batched recurrent kernels）
 
 ---
 
