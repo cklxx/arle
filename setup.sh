@@ -104,6 +104,13 @@ do_check() {
         ((errors++))
     fi
 
+    # nsjail
+    if check_cmd nsjail; then
+        info "  sandbox isolation active"
+    else
+        warn "nsjail not found — tool execution will run without sandbox"
+    fi
+
     # Python packages
     for pkg in triton flashinfer huggingface_hub; do
         if python3 -c "import $pkg" 2>/dev/null; then
@@ -160,6 +167,23 @@ do_deps() {
         fail "CUDA toolkit not found at $CUDA_HOME"
         info "Install CUDA toolkit or set CUDA_HOME=/path/to/cuda"
         exit 1
+    fi
+
+    step "Installing nsjail (sandbox)"
+    if command -v nsjail &>/dev/null; then
+        ok "nsjail already installed"
+    else
+        info "Building nsjail from source..."
+        apt-get install -y -qq autoconf bison flex gcc g++ git \
+            libprotobuf-dev libnl-route-3-dev libtool make pkg-config protobuf-compiler \
+            >/dev/null 2>&1
+        local nsjail_tmp
+        nsjail_tmp="$(mktemp -d)"
+        git clone --depth 1 https://github.com/google/nsjail.git "$nsjail_tmp/nsjail" 2>/dev/null
+        make -C "$nsjail_tmp/nsjail" -j"$(nproc)" >/dev/null 2>&1
+        cp "$nsjail_tmp/nsjail/nsjail" /usr/local/bin/
+        rm -rf "$nsjail_tmp"
+        ok "nsjail built and installed"
     fi
 
     step "Installing Python packages"
