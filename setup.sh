@@ -186,33 +186,50 @@ do_deps() {
         ok "nsjail built and installed"
     fi
 
-    step "Installing Python packages"
+    step "Installing Python packages (pinned versions)"
+
+    # ---------- Pinned dependency versions ----------
+    # FlashInfer headers — MUST match the version our csrc/cuda/flashinfer_decode.cu is compiled against.
+    # 0.2.x: no enable_pdl param.  0.6.x: has enable_pdl param.
+    FLASHINFER_VERSION="0.6.3"
+    TRITON_VERSION="3.5.1"
+    HUGGINGFACE_HUB_VERSION="0.36.2"
+    HTTPX_VERSION="0.28.1"
+    # ------------------------------------------------
+
     # FlashInfer headers (--no-deps: we only need the C++ headers, not the torch runtime)
-    if python3 -c "import flashinfer" 2>/dev/null; then
-        ok "flashinfer already installed"
+    local fi_ver
+    fi_ver=$(python3 -c "import flashinfer; print(flashinfer.__version__)" 2>/dev/null || echo "")
+    if [ "$fi_ver" = "$FLASHINFER_VERSION" ]; then
+        ok "flashinfer $FLASHINFER_VERSION already installed"
     else
-        info "Installing flashinfer-python (headers only, --no-deps)..."
-        pip3 install flashinfer-python --no-deps -q
-        ok "flashinfer headers installed"
+        info "Installing flashinfer-python==$FLASHINFER_VERSION (headers only, --no-deps)..."
+        pip3 install "flashinfer-python==$FLASHINFER_VERSION" --no-deps -q
+        ok "flashinfer $FLASHINFER_VERSION installed"
     fi
 
     # Triton (needed for AOT kernel compilation at build time)
-    if python3 -c "import triton" 2>/dev/null; then
-        ok "triton already installed"
+    local tri_ver
+    tri_ver=$(python3 -c "import triton; print(triton.__version__)" 2>/dev/null || echo "")
+    if [ "$tri_ver" = "$TRITON_VERSION" ]; then
+        ok "triton $TRITON_VERSION already installed"
     else
-        info "Installing triton..."
-        pip3 install triton -q
-        ok "triton installed"
+        info "Installing triton==$TRITON_VERSION..."
+        pip3 install "triton==$TRITON_VERSION" -q
+        ok "triton $TRITON_VERSION installed"
     fi
 
     # HuggingFace Hub (for model downloads)
     if python3 -c "import huggingface_hub" 2>/dev/null; then
         ok "huggingface_hub already installed"
     else
-        info "Installing huggingface_hub..."
-        pip3 install huggingface_hub -q
+        info "Installing huggingface_hub==$HUGGINGFACE_HUB_VERSION..."
+        pip3 install "huggingface_hub==$HUGGINGFACE_HUB_VERSION" -q
         ok "huggingface_hub installed"
     fi
+
+    # httpx (for benchmarks)
+    pip3 install "httpx>=$HTTPX_VERSION" -q 2>/dev/null || true
 
     # Project Python deps
     if [ -f pyproject.toml ]; then
