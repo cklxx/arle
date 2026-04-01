@@ -785,6 +785,8 @@ fn find_flashinfer_include() -> Option<String> {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(metal_fused_ops)");
+
     // ── Metal C++ fused-ops shim (macOS only, requires `metal` feature) ────────
     if std::env::var("CARGO_FEATURE_METAL").is_ok() {
         println!("cargo:rerun-if-changed=csrc/metal/metal_fused_ops.cpp");
@@ -811,29 +813,28 @@ fn main() {
                         build.compiler("clang++");
                     }
                     build.compile("metal_fused_ops");
+                    println!("cargo:rustc-cfg=metal_fused_ops");
                     println!(
                         "cargo:warning=metal_fused_ops: compiled from source (MLX: {})",
                         cpp_hdr.display()
                     );
                 }
                 None => {
-                    panic!(
-                        "metal_fused_ops: xcrun metal found but mlx-sys headers missing \
-                         (expected mlx-sys-*/out/build/_deps/mlx-src). \
-                         Try `cargo clean` and rebuild."
+                    println!(
+                        "cargo:warning=metal_fused_ops: mlx-sys headers not available yet; \
+                         building without the optional Metal fused shim and falling back to \
+                         the Rust/MLX path"
                     );
                 }
             }
         } else if let Some(_prebuilt) = try_download_prebuilt(&out_dir) {
+            println!("cargo:rustc-cfg=metal_fused_ops");
             println!("cargo:rustc-link-search=native={}", out_dir.display());
             println!("cargo:rustc-link-lib=static=metal_fused_ops");
         } else {
-            panic!(
-                "metal_fused_ops: cannot build Metal C++ shim.\n\
-                 Options:\n\
-                 1. Install Xcode CLT: `xcode-select --install`\n\
-                 2. Set METAL_PREBUILT_URL=<url-to-libmetal_fused_ops.a>\n\
-                 3. Set METAL_BUILD_FROM_SOURCE=1 to force source build"
+            println!(
+                "cargo:warning=metal_fused_ops: Metal toolchain unavailable and no prebuilt \
+                 library provided; building without the optional fused shim"
             );
         }
     }

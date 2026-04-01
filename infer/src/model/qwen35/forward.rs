@@ -79,8 +79,7 @@ impl ModelForward for Qwen35Model {
 
     fn create_state(&self) -> Result<Self::State> {
         let single_token_bufs = SingleTokenBuffers::new(&self.ctx, &self.config)?;
-        let decode_bufs =
-            DecodeBuffers35::new(&self.ctx, &self.config, &single_token_bufs.logits)?;
+        let decode_bufs = DecodeBuffers35::new(&self.ctx, &self.config, &single_token_bufs.logits)?;
         Ok(Qwen35State {
             ctx: self.ctx.clone(),
             decode_bufs,
@@ -195,22 +194,20 @@ impl ModelForward for Qwen35Model {
                         let b_dim = c.linear_num_value_heads;
                         let max_bs = states.len();
                         let max_pages = pool.max_total_tokens;
-                        let b: Box<dyn std::any::Any + Send> = Box::new(
-                            BatchDecodeBuffers35::new(
-                                &self.ctx,
-                                c.hidden_size,
-                                q_proj_dim,
-                                q_dim,
-                                kv_dim,
-                                inter_dim,
-                                qkv_dim,
-                                z_dim,
-                                b_dim,
-                                max_bs,
-                                c.num_attention_heads,
-                                max_pages,
-                            )?,
-                        );
+                        let b: Box<dyn std::any::Any + Send> = Box::new(BatchDecodeBuffers35::new(
+                            &self.ctx,
+                            c.hidden_size,
+                            q_proj_dim,
+                            q_dim,
+                            kv_dim,
+                            inter_dim,
+                            qkv_dim,
+                            z_dim,
+                            b_dim,
+                            max_bs,
+                            c.num_attention_heads,
+                            max_pages,
+                        )?);
                         *decode_bufs_cache = Some(b);
                         decode_bufs_cache
                             .as_mut()

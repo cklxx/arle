@@ -120,35 +120,45 @@ impl Qwen3Model {
                 )?,
                 attention: {
                     let q_proj = load_tensor_2d(
-                        &ctx, &shards, &weight_map,
+                        &ctx,
+                        &shards,
+                        &weight_map,
                         &format!("{}.self_attn.q_proj.weight", prefix),
                     )?;
                     let k_proj = load_tensor_2d(
-                        &ctx, &shards, &weight_map,
+                        &ctx,
+                        &shards,
+                        &weight_map,
                         &format!("{}.self_attn.k_proj.weight", prefix),
                     )?;
                     let v_proj = load_tensor_2d(
-                        &ctx, &shards, &weight_map,
+                        &ctx,
+                        &shards,
+                        &weight_map,
                         &format!("{}.self_attn.v_proj.weight", prefix),
                     )?;
-                    let qkv_proj = DeviceMatrix::concat_rows(
-                        &ctx, &[&q_proj, &k_proj, &v_proj],
-                    )?;
+                    let qkv_proj = DeviceMatrix::concat_rows(&ctx, &[&q_proj, &k_proj, &v_proj])?;
                     Attention {
                         q_proj,
                         k_proj,
                         v_proj,
                         qkv_proj,
                         o_proj: load_tensor_2d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.self_attn.o_proj.weight", prefix),
                         )?,
                         q_norm: load_tensor_1d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.self_attn.q_norm.weight", prefix),
                         )?,
                         k_norm: load_tensor_1d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.self_attn.k_norm.weight", prefix),
                         )?,
                     }
@@ -161,22 +171,26 @@ impl Qwen3Model {
                 )?,
                 mlp: {
                     let gate_proj = load_tensor_2d(
-                        &ctx, &shards, &weight_map,
+                        &ctx,
+                        &shards,
+                        &weight_map,
                         &format!("{}.mlp.gate_proj.weight", prefix),
                     )?;
                     let up_proj = load_tensor_2d(
-                        &ctx, &shards, &weight_map,
+                        &ctx,
+                        &shards,
+                        &weight_map,
                         &format!("{}.mlp.up_proj.weight", prefix),
                     )?;
-                    let gate_up_proj = DeviceMatrix::concat_rows(
-                        &ctx, &[&gate_proj, &up_proj],
-                    )?;
+                    let gate_up_proj = DeviceMatrix::concat_rows(&ctx, &[&gate_proj, &up_proj])?;
                     MLP {
                         gate_proj,
                         up_proj,
                         gate_up_proj,
                         down_proj: load_tensor_2d(
-                            &ctx, &shards, &weight_map,
+                            &ctx,
+                            &shards,
+                            &weight_map,
                             &format!("{}.mlp.down_proj.weight", prefix),
                         )?,
                     }
