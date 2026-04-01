@@ -33,6 +33,10 @@ pub(crate) struct FlashInferDecodeMetadata {
     indices_scratch: Vec<i32>,
     /// Cached host-side indptr from last `update()`, reused by `plan()`.
     indptr_h: Vec<i32>,
+    /// Batch size from last successful plan (for plan caching).
+    plan_batch_size: usize,
+    /// Whether the plan needs to be re-run (batch composition changed).
+    plan_dirty: bool,
 }
 
 impl FlashInferDecodeMetadata {
@@ -68,6 +72,8 @@ impl FlashInferDecodeMetadata {
             positions_scratch: Vec::with_capacity(max_batch_size),
             indices_scratch: Vec::with_capacity(max_batch_size),
             indptr_h: Vec::with_capacity(max_batch_size + 1),
+            plan_batch_size: 0,
+            plan_dirty: true,
         })
     }
 
@@ -112,32 +118,55 @@ impl FlashInferDecodeMetadata {
         let mut reallocated = false;
 
         if same_batch && self.prev_total_tokens > 0 && new_total <= self.max_total_pages {
-            // Incremental: rebuild into pre-allocated scratch buffer (avoids heap alloc).
+            // Truly incremental: each slot grew by exactly 1 token since last step.
+            // Append only the new token indices to the existing scratch buffer,
+            // then H2D the entire array. This avoids O(total_tokens) iteration.
+            //
+            // We must insert each slot's new token at the correct offset within
+            // the flat indices array (after all that slot's existing tokens).
+            // With page_size=1, indptr gives cumulative token counts per slot.
+            for (i, &slot) in slot_indices.iter().enumerate() {
+                let insert_pos = self.indptr_h[i + 1] as usize - 1; // last token of slot i
+                let last_idx = *pool.token_indices(slot).last().unwrap() as i32;
+                if insert_pos < self.indices_scratch.len() {
+                    self.indices_scratch[insert_pos] = last_idx;
+                } else {
+                    // Grow scratch to fit
+                    self.indices_scratch.resize(insert_pos + 1, 0);
+                    self.indices_scratch[insert_pos] = last_idx;
+                }
+            }
+            // Truncate to exact size
+            self.indices_scratch.truncate(new_total);
+            ctx.stream
+                .memcpy_htod(&self.indices_scratch, &mut self.kv_indices)
+                .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
+        } else {
+            // Full rebuild (first call, or batch composition changed).
+            // Populate indices_scratch so next incremental step can build on it.
             self.indices_scratch.clear();
             for &slot in slot_indices.iter() {
                 for &idx in pool.token_indices(slot) {
                     self.indices_scratch.push(idx as i32);
                 }
             }
-            ctx.stream
-                .memcpy_htod(&self.indices_scratch, &mut self.kv_indices)
-                .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
-        } else {
-            // Full rebuild (first call, or batch composition changed).
-            let indices_h = pool.build_indices(slot_indices);
-            if indices_h.len() > self.max_total_pages {
+            if self.indices_scratch.len() > self.max_total_pages {
                 self.kv_indices = ctx
                     .stream
-                    .alloc_zeros(indices_h.len())
+                    .alloc_zeros(self.indices_scratch.len())
                     .map_err(|e| anyhow::anyhow!("Realloc kv_indices: {e}"))?;
-                self.max_total_pages = indices_h.len();
+                self.max_total_pages = self.indices_scratch.len();
                 reallocated = true;
             }
             ctx.stream
-                .memcpy_htod(&indices_h, &mut self.kv_indices)
+                .memcpy_htod(&self.indices_scratch, &mut self.kv_indices)
                 .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
         }
         self.prev_total_tokens = new_total;
+        // Mark plan dirty if batch composition or size changed.
+        if !same_batch || slot_indices.len() != self.plan_batch_size || reallocated {
+            self.plan_dirty = true;
+        }
         self.prev_slot_indices.clear();
         self.prev_slot_indices.extend_from_slice(slot_indices);
 
@@ -148,6 +177,10 @@ impl FlashInferDecodeMetadata {
     ///
     /// Must be called once per decode step after `update()`, before any layer
     /// runs. The plan result works for all layers since KV layout is the same.
+    ///
+    /// Skips re-planning when batch composition is unchanged (steady-state decode),
+    /// since the work partitioning across CUDA blocks is stable when only KV lengths
+    /// grow by 1 each step.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn plan(
         &mut self,
@@ -158,6 +191,9 @@ impl FlashInferDecodeMetadata {
         page_size: usize,
         head_dim: usize,
     ) -> Result<()> {
+        if !self.plan_dirty && self.plan_batch_size == batch_size {
+            return Ok(());
+        }
         ops::flashinfer_plan(
             ctx,
             &self.indptr_h,
@@ -167,6 +203,9 @@ impl FlashInferDecodeMetadata {
             num_kv_heads,
             page_size,
             head_dim,
-        )
+        )?;
+        self.plan_batch_size = batch_size;
+        self.plan_dirty = false;
+        Ok(())
     }
 }
