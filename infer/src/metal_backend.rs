@@ -337,24 +337,35 @@ impl InferenceBackend for MetalBackend {
         {
             let weights = self.weights.as_ref().context("weights not loaded")?;
 
-            let max_new_tokens = 512usize;
+            let max_new_tokens = params.max_new_tokens.unwrap_or(512);
             let t0 = Instant::now();
 
             let generated =
                 metal_generate(&input_ids, weights, config, params, max_new_tokens, t0)?;
 
             let elapsed = t0.elapsed().as_secs_f64();
-            let gen_tps = generated.len() as f64 / elapsed.max(1e-9);
+            let ttft_s = generated.ttft_ms / 1000.0;
+            let prompt_tps = if generated.ttft_ms > 0.0 && prompt_tokens > 0 {
+                prompt_tokens as f64 / ttft_s.max(1e-9)
+            } else {
+                0.0
+            };
+            let generation_tps = if generated.tokens.is_empty() {
+                0.0
+            } else {
+                generated.tokens.len() as f64 / (elapsed - ttft_s).max(1e-9)
+            };
 
-            let text = tokenizer.decode(&generated)?;
+            let text = tokenizer.decode(&generated.tokens)?;
             #[allow(clippy::needless_return)]
             return Ok(GenerateResult {
                 text,
                 prompt_tokens,
-                completion_tokens: generated.len(),
-                finish_reason: "stop".to_string(),
-                prompt_tps: 0.0,
-                generation_tps: gen_tps,
+                completion_tokens: generated.tokens.len(),
+                finish_reason: generated.finish_reason.to_string(),
+                ttft_ms: generated.ttft_ms,
+                prompt_tps,
+                generation_tps,
             });
         }
 
@@ -404,6 +415,13 @@ impl InferenceBackend for MetalBackend {
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
 
+#[cfg(feature = "metal")]
+struct MetalGenerateOutput {
+    tokens: Vec<u32>,
+    finish_reason: &'static str,
+    ttft_ms: f64,
+}
+
 // GPU required: all tensor operations use mlx-rs Arrays on Metal unified memory.
 #[cfg(feature = "metal")]
 fn metal_generate(
@@ -413,8 +431,16 @@ fn metal_generate(
     params: &SamplingParams,
     max_new_tokens: usize,
     t0: Instant,
-) -> Result<Vec<u32>> {
+) -> Result<MetalGenerateOutput> {
     use mlx_rs::{StreamOrDevice, ops::zeros_dtype_device};
+
+    if max_new_tokens == 0 {
+        return Ok(MetalGenerateOutput {
+            tokens: Vec::new(),
+            finish_reason: "length",
+            ttft_ms: 0.0,
+        });
+    }
 
     let n_layers = config.num_hidden_layers;
     let n_heads = config.num_attention_heads as i32;
@@ -453,6 +479,7 @@ fn metal_generate(
 
     let mut generated: Vec<u32> = Vec::new();
     let mut cache_len: i32 = 0;
+    let mut ttft_ms = 0.0;
 
     // ── Phase 1: Prefill — build lazy graph, schedule GPU asynchronously ─────
     let prefill_token = build_forward_graph(
@@ -482,23 +509,27 @@ fn metal_generate(
     let mut pending = prefill_token;
     let mut decode_step: usize = 0;
 
-    loop {
+    let finish_reason = loop {
         // P6: sync — blocks until GPU computation for this token is complete.
         let next_token = pending.item::<i32>() as u32;
 
         if decode_step == 0 {
-            let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
             log::info!(
                 "  TTFT: {ttft_ms:.1}ms (prefill {} tokens)",
                 input_ids.len()
             );
         }
 
-        let stop = next_token == eos_id || params.stop_token_ids.contains(&next_token);
+        let stop = (!params.ignore_eos && next_token == eos_id)
+            || params.stop_token_ids.contains(&next_token);
         generated.push(next_token);
 
-        if stop || generated.len() >= max_new_tokens {
-            break;
+        if stop {
+            break "stop";
+        }
+        if generated.len() >= max_new_tokens {
+            break "length";
         }
 
         // P5: grow KV cache in 256-token chunks when capacity is about to overflow.
@@ -539,13 +570,17 @@ fn metal_generate(
         metal_async_eval(&new_pending)?;
 
         pending = new_pending;
-    }
+    };
 
     let elapsed = t0.elapsed().as_secs_f64();
     let tps = generated.len() as f64 / elapsed.max(1e-9);
     log::info!("  generated {} tokens  ({tps:.1} tok/s)", generated.len());
 
-    Ok(generated)
+    Ok(MetalGenerateOutput {
+        tokens: generated,
+        finish_reason,
+        ttft_ms,
+    })
 }
 
 #[cfg(all(feature = "metal", metal_fused_ops))]

@@ -51,6 +51,10 @@ pub struct SamplingParams {
 
     /// RNG seed for deterministic sampling. `None` = use the engine-level seed.
     pub seed: Option<u64>,
+
+    /// Optional override for the number of tokens to generate.
+    /// `None` means the backend should use its default.
+    pub max_new_tokens: Option<usize>,
 }
 
 impl Default for SamplingParams {
@@ -66,6 +70,7 @@ impl Default for SamplingParams {
             ignore_eos: false,
             stop_token_ids: vec![],
             seed: None,
+            max_new_tokens: None,
         }
     }
 }
@@ -160,6 +165,7 @@ pub fn sampling_params_from_request(
         ignore_eos: ignore_eos.unwrap_or(false),
         seed,
         stop_token_ids: stop_token_ids.unwrap_or_default(),
+        max_new_tokens: None,
     }
 }
 

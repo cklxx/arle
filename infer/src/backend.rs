@@ -42,6 +42,8 @@ pub struct GenerateResult {
     pub completion_tokens: usize,
     /// Why generation stopped (`"stop"`, `"length"`, …).
     pub finish_reason: String,
+    /// Time-to-first-token in milliseconds (0.0 if unknown).
+    pub ttft_ms: f64,
     /// Prompt throughput in tokens/s (0.0 if unknown).
     pub prompt_tps: f64,
     /// Generation throughput in tokens/s (0.0 if unknown).
