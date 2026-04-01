@@ -473,11 +473,7 @@ impl Qwen3Model {
             &mut bufs.gate_up_out,
         );
         // silu_mul directly from merged buffer (gate = first half, up = second half)
-        ops::silu_mul_fused_batch_into(
-            &self.ctx,
-            &bufs.gate_up_out,
-            &mut bufs.act_out,
-        )?;
+        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,

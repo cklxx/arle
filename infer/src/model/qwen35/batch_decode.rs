@@ -87,9 +87,9 @@ impl BatchDecodeBuffers35 {
         q_dim: usize,      // num_q_heads * 256
         kv_dim: usize,     // num_kv_heads * 256
         inter_dim: usize,
-        qkv_dim: usize,    // linear attention QKV dim
-        z_dim: usize,      // linear attention Z dim
-        b_dim: usize,      // linear attention B dim (num_value_heads)
+        qkv_dim: usize, // linear attention QKV dim
+        z_dim: usize,   // linear attention Z dim
+        b_dim: usize,   // linear attention B dim (num_value_heads)
         max_batch_size: usize,
         num_qheads: usize,
         max_total_pages: usize,
@@ -356,7 +356,12 @@ impl Qwen35Model {
         )?;
 
         // 2. QKV projections (batched GEMM)
-        ops::gemm_into(&self.ctx, &attn.q_proj, &bufs.normed, &mut bufs.q_full_batch);
+        ops::gemm_into(
+            &self.ctx,
+            &attn.q_proj,
+            &bufs.normed,
+            &mut bufs.q_full_batch,
+        );
         ops::gemm_into(&self.ctx, &attn.k_proj, &bufs.normed, &mut bufs.k_batch);
         ops::gemm_into(&self.ctx, &attn.v_proj, &bufs.normed, &mut bufs.v_batch);
 
@@ -454,24 +459,9 @@ impl Qwen35Model {
             &bufs.normed,
             &mut bufs.qkv_batch,
         );
-        ops::gemm_into(
-            &self.ctx,
-            &attn.in_proj_z,
-            &bufs.normed,
-            &mut bufs.z_batch,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &attn.in_proj_b,
-            &bufs.normed,
-            &mut bufs.b_batch,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &attn.in_proj_a,
-            &bufs.normed,
-            &mut bufs.a_batch,
-        );
+        ops::gemm_into(&self.ctx, &attn.in_proj_z, &bufs.normed, &mut bufs.z_batch);
+        ops::gemm_into(&self.ctx, &attn.in_proj_b, &bufs.normed, &mut bufs.b_batch);
+        ops::gemm_into(&self.ctx, &attn.in_proj_a, &bufs.normed, &mut bufs.a_batch);
 
         // 3. Per-request: conv1d + GDR (modifies per-request recurrent state)
         let qkv_dim = c.linear_attn_qkv_dim();
@@ -575,12 +565,7 @@ impl Qwen35Model {
         let eps = self.config.rms_norm_eps;
 
         // Residual 1: hidden_mid = hidden + attn_results
-        ops::add_batch_into(
-            &self.ctx,
-            hidden,
-            &bufs.attn_results,
-            &mut bufs.hidden_mid,
-        )?;
+        ops::add_batch_into(&self.ctx, hidden, &bufs.attn_results, &mut bufs.hidden_mid)?;
 
         // Post-attention RMSNorm (offset variant)
         ops::rms_norm_batch_offset_into(
@@ -613,7 +598,12 @@ impl Qwen35Model {
         );
 
         // Residual 2: hidden = hidden_mid + mlp_out
-        ops::add_batch_into(&self.ctx, &bufs.hidden_mid, &bufs.o_buf, &mut bufs.hidden_out)?;
+        ops::add_batch_into(
+            &self.ctx,
+            &bufs.hidden_mid,
+            &bufs.o_buf,
+            &mut bufs.hidden_out,
+        )?;
         std::mem::swap(hidden, &mut bufs.hidden_out);
 
         Ok(())

@@ -28,11 +28,7 @@ pub(crate) struct DecodeBuffers35 {
 }
 
 impl DecodeBuffers35 {
-    pub(crate) fn new(
-        ctx: &DeviceContext,
-        config: &Config35,
-        logits: &DeviceVec,
-    ) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, config: &Config35, logits: &DeviceVec) -> Result<Self> {
         let sample_probs: CudaSlice<f32> = ctx
             .stream
             .alloc_zeros(config.vocab_size)
