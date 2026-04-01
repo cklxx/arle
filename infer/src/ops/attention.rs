@@ -522,7 +522,8 @@ unsafe impl Send for FlashInferWorkspace {}
 
 impl FlashInferWorkspace {
     /// Default sizes matching FlashInfer's typical requirements.
-    const FLOAT_WORKSPACE_BYTES: usize = 128 * 1024 * 1024; // 128 MB
+    /// 512MB matches sglang's Qwen3-specific setting for split-KV temporaries.
+    const FLOAT_WORKSPACE_BYTES: usize = 512 * 1024 * 1024; // 512 MB
     const INT_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
     const PAGE_LOCKED_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
     const PLAN_INFO_BYTES: usize = 256;
@@ -831,6 +832,117 @@ pub fn flashinfer_plan(
     if ret != 0 {
         return Err(anyhow!(
             "flashinfer_batch_decode_plan failed with CUDA error {}",
+            ret
+        ));
+    }
+    Ok(())
+}
+
+/// FlashInfer tensor-core decode plan (uses prefill kernel for flat ITL).
+///
+/// Uses `PrefillPlan` instead of `DecodePlan`. For decode, each request has
+/// `qo_len=1`, so `qo_indptr = [0, 1, 2, ..., B]`.
+#[allow(clippy::too_many_arguments)]
+pub fn flashinfer_tc_plan(
+    ctx: &DeviceContext,
+    qo_indptr_h: &[i32],
+    kv_indptr_h: &[i32],
+    workspace: &mut FlashInferWorkspace,
+    batch_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    page_size: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
+    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
+
+    let ret = unsafe {
+        ffi::flashinfer_tc_decode_plan(
+            fw_ptr as *mut u8,
+            workspace.float_workspace_bytes,
+            iw_ptr as *mut u8,
+            workspace.page_locked_workspace,
+            workspace.int_workspace_bytes,
+            qo_indptr_h.as_ptr(),
+            kv_indptr_h.as_ptr(),
+            batch_size as i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            page_size as i32,
+            head_dim as i32,
+            workspace.plan_info as *mut u8,
+            ctx.stream.cu_stream(),
+        )
+    };
+    if ret != 0 {
+        return Err(anyhow!(
+            "flashinfer_tc_decode_plan failed with CUDA error {}",
+            ret
+        ));
+    }
+    Ok(())
+}
+
+/// FlashInfer tensor-core decode run (GPU kernel). Uses prefill kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn flashinfer_tc_run_layer(
+    ctx: &DeviceContext,
+    q_batch: &HiddenStates,
+    q_indptr_gpu: &CudaSlice<i32>,
+    kv_pool: &PagedKVPool,
+    layer_idx: usize,
+    kv_indptr_gpu: &CudaSlice<i32>,
+    kv_indices_gpu: &CudaSlice<i32>,
+    kv_last_page_len_gpu: &CudaSlice<i32>,
+    output: &mut HiddenStates,
+    workspace: &mut FlashInferWorkspace,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    page_size: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let batch_size = q_batch.seq_len;
+    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+
+    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
+    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
+    let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
+    let (qi_ptr, _gqi) = q_indptr_gpu.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (ind_ptr, _gind) = kv_indptr_gpu.device_ptr(&ctx.stream);
+    let (idx_ptr, _gidx) = kv_indices_gpu.device_ptr(&ctx.stream);
+    let (lp_ptr, _glp) = kv_last_page_len_gpu.device_ptr(&ctx.stream);
+    let (lse_ptr, _glse) = workspace.lse.device_ptr_mut(&ctx.stream);
+
+    let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
+    let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
+
+    let ret = unsafe {
+        ffi::flashinfer_tc_decode_run(
+            fw_ptr as *mut u8,
+            iw_ptr as *mut u8,
+            workspace.plan_info as *const u8,
+            q_ptr as *const ffi::Half,
+            qi_ptr as *const i32,
+            k_pool_ptr as *const ffi::Half,
+            v_pool_ptr as *const ffi::Half,
+            ind_ptr as *const i32,
+            idx_ptr as *const i32,
+            lp_ptr as *const i32,
+            o_ptr as *mut ffi::Half,
+            lse_ptr as *mut f32,
+            batch_size as i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            page_size as i32,
+            sm_scale,
+            ctx.stream.cu_stream(),
+        )
+    };
+    if ret != 0 {
+        return Err(anyhow!(
+            "flashinfer_tc_decode_run failed with CUDA error {}",
             ret
         ));
     }

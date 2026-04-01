@@ -194,14 +194,28 @@ impl Qwen3Model {
         if reallocated {
             bufs.graph_cache[batch_size - 1] = None;
         }
-        bufs.metadata.plan(
-            &self.ctx,
-            batch_size,
-            num_heads,
-            num_kv_heads,
-            page_size,
-            head_dim,
-        )?;
+        // Use tensor-core decode (prefill kernel) for GQA group_size >= 4.
+        // This tiles across KV chunks, keeping ITL flat at long contexts.
+        let use_tc_decode = num_heads / num_kv_heads >= 4;
+        if use_tc_decode {
+            bufs.metadata.tc_plan(
+                &self.ctx,
+                batch_size,
+                num_heads,
+                num_kv_heads,
+                page_size,
+                head_dim,
+            )?;
+        } else {
+            bufs.metadata.plan(
+                &self.ctx,
+                batch_size,
+                num_heads,
+                num_kv_heads,
+                page_size,
+                head_dim,
+            )?;
+        }
 
         bufs.embedding_out.seq_len = batch_size;
 
@@ -381,22 +395,42 @@ impl Qwen3Model {
             eps,
         )?;
 
-        // 4. FlashInfer batch decode attention (run only -- plan was called once before loop)
-        ops::flashinfer_run_layer(
-            &self.ctx,
-            &bufs.q_batch,
-            kv_pool,
-            layer_idx,
-            &bufs.metadata.kv_indptr,
-            &bufs.metadata.kv_indices,
-            &bufs.metadata.kv_last_page_len,
-            &mut bufs.attn_output,
-            &mut bufs.metadata.flashinfer_ws,
-            num_heads,
-            num_kv_heads,
-            page_size,
-            head_dim,
-        )?;
+        // 4. FlashInfer attention (run only -- plan was called once before loop)
+        let use_tc_decode = num_heads / num_kv_heads >= 4;
+        if use_tc_decode {
+            ops::flashinfer_tc_run_layer(
+                &self.ctx,
+                &bufs.q_batch,
+                &bufs.metadata.q_indptr,
+                kv_pool,
+                layer_idx,
+                &bufs.metadata.kv_indptr,
+                &bufs.metadata.kv_indices,
+                &bufs.metadata.kv_last_page_len,
+                &mut bufs.attn_output,
+                &mut bufs.metadata.flashinfer_ws,
+                num_heads,
+                num_kv_heads,
+                page_size,
+                head_dim,
+            )?;
+        } else {
+            ops::flashinfer_run_layer(
+                &self.ctx,
+                &bufs.q_batch,
+                kv_pool,
+                layer_idx,
+                &bufs.metadata.kv_indptr,
+                &bufs.metadata.kv_indices,
+                &bufs.metadata.kv_last_page_len,
+                &mut bufs.attn_output,
+                &mut bufs.metadata.flashinfer_ws,
+                num_heads,
+                num_kv_heads,
+                page_size,
+                head_dim,
+            )?;
+        }
 
         // 5. Batched O projection → bufs.o_buf [B, hidden_dim]
         ops::gemm_into(
