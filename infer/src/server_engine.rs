@@ -13,7 +13,9 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[cfg(feature = "cuda")]
-pub use crate::bootstrap::{EngineOptions, ModelType, detect_model_type, model_id_from_path};
+pub use crate::bootstrap::{
+    EngineOptions, ModelType, ServerRuntimeConfig, detect_model_type, model_id_from_path,
+};
 #[cfg(feature = "cuda")]
 use crate::model::{GenerationState, ModelForward, Qwen3Model, Qwen35Model};
 use crate::sampler::SamplingParams;
@@ -613,6 +615,12 @@ pub type RealServerEngine = GenericServerEngine<Qwen3Model>;
 pub type Qwen35ServerEngine = GenericServerEngine<Qwen35Model>;
 
 #[cfg(feature = "cuda")]
+pub enum LoadedServerEngine {
+    Qwen3(RealServerEngine),
+    Qwen35(Qwen35ServerEngine),
+}
+
+#[cfg(feature = "cuda")]
 impl RealServerEngine {
     pub fn load(model_path: &str, seed: u64) -> Result<Self> {
         Self::load_with_options(model_path, seed, EngineOptions::default())
@@ -630,6 +638,10 @@ impl RealServerEngine {
 
 #[cfg(feature = "cuda")]
 impl Qwen35ServerEngine {
+    pub fn load(model_path: &str, seed: u64) -> Result<Self> {
+        Self::load_with_options(model_path, seed, EngineOptions::default())
+    }
+
     pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
         let components = crate::bootstrap::load_qwen35_components(model_path, options)?;
         Self::from_model_components(components, seed)
@@ -637,6 +649,66 @@ impl Qwen35ServerEngine {
 
     pub fn vocab_size(&self) -> usize {
         self.tokenizer.vocab_size()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl LoadedServerEngine {
+    pub fn load(model_path: &str, seed: u64) -> Result<Self> {
+        Self::load_with_options(model_path, seed, EngineOptions::default())
+    }
+
+    pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
+        match detect_model_type(model_path)? {
+            ModelType::Qwen3 => Ok(Self::Qwen3(RealServerEngine::load_with_options(
+                model_path, seed, options,
+            )?)),
+            ModelType::Qwen35 => Ok(Self::Qwen35(Qwen35ServerEngine::load_with_options(
+                model_path, seed, options,
+            )?)),
+        }
+    }
+
+    pub fn model_type(&self) -> ModelType {
+        match self {
+            Self::Qwen3(_) => ModelType::Qwen3,
+            Self::Qwen35(_) => ModelType::Qwen35,
+        }
+    }
+
+    pub fn set_max_gpu_kv(&mut self, max_tokens: usize) {
+        match self {
+            Self::Qwen3(engine) => engine.set_max_gpu_kv(max_tokens),
+            Self::Qwen35(engine) => engine.set_max_gpu_kv(max_tokens),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl ServerEngine for LoadedServerEngine {
+    fn model_id(&self) -> &str {
+        match self {
+            Self::Qwen3(engine) => engine.model_id(),
+            Self::Qwen35(engine) => engine.model_id(),
+        }
+    }
+
+    fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput> {
+        match self {
+            Self::Qwen3(engine) => engine.complete(req),
+            Self::Qwen35(engine) => engine.complete(req),
+        }
+    }
+
+    fn complete_stream(
+        &mut self,
+        req: CompleteRequest,
+        tx: UnboundedSender<StreamDelta>,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen3(engine) => engine.complete_stream(req, tx),
+            Self::Qwen35(engine) => engine.complete_stream(req, tx),
+        }
     }
 }
 

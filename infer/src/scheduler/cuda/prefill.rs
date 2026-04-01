@@ -83,7 +83,7 @@ impl<M: ModelForward> Scheduler<M> {
             "Request {}: chunked prefill starting ({} effective tokens, chunk_size={})",
             req.id,
             effective.len(),
-            PREFILL_CHUNK_SIZE
+            self.prefill_chunk_size(false)
         );
 
         req.phase = Phase::Prefilling {
@@ -120,11 +120,7 @@ impl<M: ModelForward> Scheduler<M> {
         };
 
         let total = effective_tokens.len();
-        let chunk_size = if decode_active {
-            PREFILL_CHUNK_SIZE_WITH_DECODE
-        } else {
-            PREFILL_CHUNK_SIZE
-        };
+        let chunk_size = self.prefill_chunk_size(decode_active);
         let chunk_end = (*progress + chunk_size).min(total);
         let chunk = &effective_tokens[*progress..chunk_end];
 

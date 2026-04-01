@@ -3,6 +3,155 @@
 
 use serde_json::{Map, Value, json};
 
+const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+
+#[derive(Clone, Copy)]
+struct TaggedBlock {
+    open: &'static str,
+    close: &'static str,
+}
+
+impl TaggedBlock {
+    fn strip_and_collect<T>(
+        self,
+        text: &str,
+        mut parse_block: impl FnMut(&str) -> Option<T>,
+    ) -> (String, Vec<T>) {
+        let mut parsed = Vec::new();
+        let mut remaining = text;
+        let mut stripped = String::with_capacity(text.len());
+
+        while let Some(start) = remaining.find(self.open) {
+            stripped.push_str(&remaining[..start]);
+            remaining = &remaining[start + self.open.len()..];
+
+            if let Some(end) = remaining.find(self.close) {
+                let block = remaining[..end].trim();
+                if let Some(item) = parse_block(block) {
+                    parsed.push(item);
+                }
+                remaining = &remaining[end + self.close.len()..];
+            } else {
+                stripped.push_str(remaining);
+                remaining = "";
+            }
+        }
+
+        stripped.push_str(remaining);
+        (stripped, parsed)
+    }
+
+    fn strip_all(self, text: &str) -> String {
+        let (stripped, _) = self.strip_and_collect::<()>(text, |_| None);
+        stripped
+    }
+}
+
+const TOOL_CALL_BLOCK: TaggedBlock = TaggedBlock {
+    open: "<tool_call>",
+    close: "</tool_call>",
+};
+
+const THINK_BLOCK: TaggedBlock = TaggedBlock {
+    open: "<think>",
+    close: "</think>",
+};
+
+struct PromptRenderer<'a> {
+    prompt: String,
+    tool_block: &'a str,
+    system_injected: bool,
+}
+
+impl<'a> PromptRenderer<'a> {
+    fn new(tool_block: &'a str) -> Self {
+        Self {
+            prompt: String::new(),
+            tool_block,
+            system_injected: false,
+        }
+    }
+
+    fn push_message(&mut self, message: &ChatMessage) {
+        match &message.role {
+            ChatRole::System => self.push_system(&message.content),
+            ChatRole::User => self.push_user(&message.content),
+            ChatRole::Assistant => self.push_assistant(&message.content, &message.tool_calls),
+            ChatRole::Tool => self.push_tool(&message.content),
+            ChatRole::Other(role) => self.push_other(role, &message.content),
+        }
+    }
+
+    fn finish(mut self) -> String {
+        self.prompt.push_str("<|im_start|>assistant\n");
+        self.prompt
+    }
+
+    fn ensure_default_system_message(&mut self) {
+        if self.system_injected || self.tool_block.is_empty() {
+            return;
+        }
+
+        self.start_message(ChatRole::System.as_str());
+        self.prompt.push_str(DEFAULT_SYSTEM_PROMPT);
+        self.prompt.push_str(self.tool_block);
+        self.end_message();
+        self.system_injected = true;
+    }
+
+    fn start_message(&mut self, role: &str) {
+        self.prompt.push_str("<|im_start|>");
+        self.prompt.push_str(role);
+        self.prompt.push('\n');
+    }
+
+    fn end_message(&mut self) {
+        self.prompt.push_str("<|im_end|>\n");
+    }
+
+    fn push_system(&mut self, content: &str) {
+        self.start_message(ChatRole::System.as_str());
+        self.prompt.push_str(content);
+        if !self.tool_block.is_empty() {
+            self.prompt.push_str(self.tool_block);
+        }
+        self.end_message();
+        self.system_injected = true;
+    }
+
+    fn push_user(&mut self, content: &str) {
+        self.ensure_default_system_message();
+        self.start_message(ChatRole::User.as_str());
+        self.prompt.push_str(content);
+        self.end_message();
+    }
+
+    fn push_assistant(&mut self, content: &str, tool_calls: &[ToolCall]) {
+        self.start_message(ChatRole::Assistant.as_str());
+        self.prompt.push_str(content);
+        for tool_call in tool_calls {
+            self.prompt.push_str("\n<tool_call>\n");
+            self.prompt.push_str(&tool_call.prompt_payload());
+            self.prompt.push_str("\n</tool_call>");
+        }
+        self.end_message();
+    }
+
+    fn push_tool(&mut self, content: &str) {
+        self.start_message(ChatRole::Tool.as_str());
+        self.prompt.push_str("<tool_response>\n");
+        self.prompt.push_str(content);
+        self.prompt.push_str("\n</tool_response>");
+        self.end_message();
+    }
+
+    fn push_other(&mut self, role: &str, content: &str) {
+        self.start_message(role);
+        self.prompt.push_str(content);
+        self.end_message();
+    }
+}
+
 /// Structured tool definition used for prompt injection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolDefinition {
@@ -162,124 +311,34 @@ pub fn build_tool_block(tools: &[ToolDefinition]) -> String {
 
 /// Convert structured messages + tool definitions into a ChatML prompt.
 pub fn messages_to_prompt(messages: &[ChatMessage], tools: &[ToolDefinition]) -> String {
-    let mut prompt = String::new();
     let tool_block = build_tool_block(tools);
-    let mut system_injected = false;
-
+    let mut renderer = PromptRenderer::new(&tool_block);
     for message in messages {
-        match &message.role {
-            ChatRole::System => {
-                prompt.push_str("<|im_start|>system\n");
-                prompt.push_str(&message.content);
-                if !tool_block.is_empty() {
-                    prompt.push_str(&tool_block);
-                }
-                prompt.push_str("<|im_end|>\n");
-                system_injected = true;
-            }
-            ChatRole::User => {
-                if !system_injected && !tool_block.is_empty() {
-                    prompt.push_str("<|im_start|>system\n");
-                    prompt.push_str("You are a helpful assistant.");
-                    prompt.push_str(&tool_block);
-                    prompt.push_str("<|im_end|>\n");
-                    system_injected = true;
-                }
-                prompt.push_str("<|im_start|>user\n");
-                prompt.push_str(&message.content);
-                prompt.push_str("<|im_end|>\n");
-            }
-            ChatRole::Assistant => {
-                prompt.push_str("<|im_start|>assistant\n");
-                prompt.push_str(&message.content);
-                for tool_call in &message.tool_calls {
-                    prompt.push_str("\n<tool_call>\n");
-                    prompt.push_str(&tool_call.prompt_payload());
-                    prompt.push_str("\n</tool_call>");
-                }
-                prompt.push_str("<|im_end|>\n");
-            }
-            ChatRole::Tool => {
-                prompt.push_str("<|im_start|>tool\n<tool_response>\n");
-                prompt.push_str(&message.content);
-                prompt.push_str("\n</tool_response><|im_end|>\n");
-            }
-            ChatRole::Other(role) => {
-                prompt.push_str("<|im_start|>");
-                prompt.push_str(role);
-                prompt.push('\n');
-                prompt.push_str(&message.content);
-                prompt.push_str("<|im_end|>\n");
-            }
-        }
+        renderer.push_message(message);
     }
-
-    prompt.push_str("<|im_start|>assistant\n");
-    prompt
+    renderer.finish()
 }
 
 /// Parse `<tool_call>...</tool_call>` blocks from raw assistant output.
 pub fn parse_tool_calls(text: &str) -> ParsedAssistantResponse {
-    let mut tool_calls = Vec::new();
-    let mut remaining = text;
-    let mut stripped = String::with_capacity(text.len());
-
-    let open_tag = "<tool_call>";
-    let close_tag = "</tool_call>";
-
-    while let Some(start) = remaining.find(open_tag) {
-        stripped.push_str(&remaining[..start]);
-        remaining = &remaining[start + open_tag.len()..];
-
-        if let Some(end) = remaining.find(close_tag) {
-            let json_str = remaining[..end].trim();
-            if let Ok(value) = serde_json::from_str::<Value>(json_str) {
-                let name = value
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let arguments = value
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or(Value::Object(Map::default()));
-                tool_calls.push(ToolCall::new(name, arguments));
-            }
-            remaining = &remaining[end + close_tag.len()..];
-        } else {
-            stripped.push_str(remaining);
-            remaining = "";
-        }
-    }
-
-    stripped.push_str(remaining);
+    let (stripped, tool_calls) = TOOL_CALL_BLOCK.strip_and_collect(text, |json_str| {
+        let value = serde_json::from_str::<Value>(json_str).ok()?;
+        let name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let arguments = value
+            .get("arguments")
+            .cloned()
+            .unwrap_or(Value::Object(Map::default()));
+        Some(ToolCall::new(name, arguments))
+    });
 
     ParsedAssistantResponse {
-        content: strip_think_blocks(&stripped).trim().to_string(),
+        content: THINK_BLOCK.strip_all(&stripped).trim().to_string(),
         tool_calls,
     }
-}
-
-fn strip_think_blocks(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut remaining = text;
-
-    let open_tag = "<think>";
-    let close_tag = "</think>";
-
-    while let Some(start) = remaining.find(open_tag) {
-        out.push_str(&remaining[..start]);
-        remaining = &remaining[start + open_tag.len()..];
-
-        if let Some(end) = remaining.find(close_tag) {
-            remaining = &remaining[end + close_tag.len()..];
-        } else {
-            remaining = "";
-        }
-    }
-
-    out.push_str(remaining);
-    out
 }
 
 #[cfg(test)]

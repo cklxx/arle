@@ -67,6 +67,8 @@ pub fn run_agent(
             println!("\x1b[2m{}\x1b[0m", content);
         }
 
+        messages.push(Message::assistant(&output.text, tool_calls.clone()));
+
         // Show and execute tool calls
         println!();
         for tc in &tool_calls {
@@ -88,17 +90,8 @@ pub fn run_agent(
             println!();
 
             // Add tool result to conversation
-            // We add the assistant message with tool calls first, then each tool result
-            // But we need to add them in order, so we collect and add after the loop
-            // Actually, we add the assistant message once, then all tool results
             messages.push(Message::tool_result(&tc.name, &result));
         }
-
-        // Insert the assistant message with tool calls before the tool results
-        let tool_results_count = tool_calls.len();
-        let assistant_msg = Message::assistant(&output.text, tool_calls);
-        let insert_pos = messages.len() - tool_results_count;
-        messages.insert(insert_pos, assistant_msg);
     }
 
     // If we exhausted max_turns, return whatever we have

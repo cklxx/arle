@@ -40,8 +40,8 @@ impl<M: ModelForward> Scheduler<M> {
         // Process all new requests in one step to avoid multi-iteration admission delay.
         let new_t = std::time::Instant::now();
         loop {
-            let new_idx = (0..self.active.len())
-                .find(|&i| matches!(self.active[i].phase, Phase::New));
+            let new_idx =
+                (0..self.active.len()).find(|&i| matches!(self.active[i].phase, Phase::New));
             match new_idx {
                 Some(idx) => self.step_new(idx),
                 None => break,

@@ -21,7 +21,10 @@ use clap::Parser;
 
 /// Metal backend benchmark: TTFT, tok/s (mean/p50/p99), peak RSS.
 #[derive(Parser)]
-#[command(name = "metal_bench", about = "Metal/MLX inference benchmark (Apple Silicon)")]
+#[command(
+    name = "metal_bench",
+    about = "Metal/MLX inference benchmark (Apple Silicon)"
+)]
 struct Cli {
     /// Model path (local directory) or HuggingFace repo ID.
     #[arg(long, short)]
@@ -135,7 +138,11 @@ fn run_bench() -> Result<()> {
             );
         }
 
-        runs.push(Run { elapsed_s, tokens: result.completion_tokens, tps });
+        runs.push(Run {
+            elapsed_s,
+            tokens: result.completion_tokens,
+            tps,
+        });
     }
 
     // ── Statistics ───────────────────────────────────────────────────────────
@@ -178,10 +185,15 @@ fn run_bench() -> Result<()> {
         println!("=== Metal Benchmark: {} [{}] ===", cli.model, quant_hint);
         println!("  Warmup / timed  : {} / {}", cli.warmup, cli.runs);
         println!("  Avg tokens out  : {avg_tokens}");
-        println!("  Throughput      : {mean_tps:.1} tok/s mean  |  {p50_tps:.1} p50  |  {p99_tps:.1} p99");
+        println!(
+            "  Throughput      : {mean_tps:.1} tok/s mean  |  {p50_tps:.1} p50  |  {p99_tps:.1} p99"
+        );
         println!("  TTFT (wall)     : {mean_ttft_ms:.0}ms mean  |  {p50_ttft_ms:.0}ms p50");
         println!("  Peak RSS        : {peak_mb:.0}MB");
-        println!("==={}===", "=".repeat(cli.model.len() + quant_hint.len() + 4));
+        println!(
+            "==={}===",
+            "=".repeat(cli.model.len() + quant_hint.len() + 4)
+        );
     }
 
     Ok(())

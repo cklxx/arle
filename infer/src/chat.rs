@@ -62,40 +62,50 @@ pub struct FunctionDefinition {
 
 pub type ParsedToolCall = ToolCall;
 
-fn to_protocol_message(message: &ChatMessage) -> ProtocolChatMessage {
-    let tool_calls = message
-        .tool_calls
-        .iter()
-        .map(|tool_call| {
-            let arguments = serde_json::from_str::<Value>(&tool_call.function.arguments)
-                .unwrap_or_else(|_| Value::String(tool_call.function.arguments.clone()));
-            ToolCall::new(tool_call.function.name.clone(), arguments)
-        })
-        .collect();
-
-    ProtocolChatMessage {
-        role: ChatRole::from(message.role.as_str()),
-        content: message.content.clone().unwrap_or_default(),
-        tool_calls,
+impl From<&ToolCallObject> for ToolCall {
+    fn from(tool_call: &ToolCallObject) -> Self {
+        let arguments = serde_json::from_str::<Value>(&tool_call.function.arguments)
+            .unwrap_or_else(|_| Value::String(tool_call.function.arguments.clone()));
+        Self::new(tool_call.function.name.clone(), arguments)
     }
 }
 
-fn to_protocol_definition(tool: &ToolDefinition) -> ProtocolToolDefinition {
-    ProtocolToolDefinition::new(
-        tool.function.name.clone(),
-        tool.function.description.clone().unwrap_or_default(),
-        tool.function
-            .parameters
-            .clone()
-            .unwrap_or_else(|| json!({})),
-    )
+impl From<&ChatMessage> for ProtocolChatMessage {
+    fn from(message: &ChatMessage) -> Self {
+        let tool_calls = message.tool_calls.iter().map(ToolCall::from).collect();
+
+        Self {
+            role: ChatRole::from(message.role.as_str()),
+            content: message.content.clone().unwrap_or_default(),
+            tool_calls,
+        }
+    }
+}
+
+impl From<&ToolDefinition> for ProtocolToolDefinition {
+    fn from(tool: &ToolDefinition) -> Self {
+        Self::new(
+            tool.function.name.clone(),
+            tool.function.description.clone().unwrap_or_default(),
+            tool.function
+                .parameters
+                .clone()
+                .unwrap_or_else(|| json!({})),
+        )
+    }
 }
 
 /// Convert an OpenAI messages array + optional tool definitions into a
 /// ChatML prompt string ready for inference.
 pub fn messages_to_prompt(messages: &[ChatMessage], tools: &[ToolDefinition]) -> String {
-    let protocol_messages = messages.iter().map(to_protocol_message).collect::<Vec<_>>();
-    let protocol_tools = tools.iter().map(to_protocol_definition).collect::<Vec<_>>();
+    let protocol_messages = messages
+        .iter()
+        .map(ProtocolChatMessage::from)
+        .collect::<Vec<_>>();
+    let protocol_tools = tools
+        .iter()
+        .map(ProtocolToolDefinition::from)
+        .collect::<Vec<_>>();
     protocol_messages_to_prompt(&protocol_messages, &protocol_tools)
 }
 

@@ -13,9 +13,7 @@ use clap::Parser;
 use log::info;
 
 #[cfg(feature = "cuda")]
-use infer::server_engine::{
-    EngineOptions, ModelType, Qwen35ServerEngine, RealServerEngine, ServerEngine, detect_model_type,
-};
+use infer::server_engine::{EngineOptions, LoadedServerEngine, ServerEngine};
 
 #[cfg(feature = "cuda")]
 use crate::tools::builtin_tools;
@@ -137,50 +135,25 @@ fn main() -> Result<()> {
             enable_cuda_graph: !args.no_cuda_graph,
         };
 
-        let model_type = detect_model_type(&args.model_path)?;
-        info!("Detected model type: {}", model_type);
         info!("Loading model from: {}", args.model_path);
-
         let load_start = Instant::now();
+        let mut engine = LoadedServerEngine::load_with_options(&args.model_path, 42, options)?;
 
-        match model_type {
-            ModelType::Qwen3 => {
-                let mut engine =
-                    RealServerEngine::load_with_options(&args.model_path, 42, options)?;
-                if let Some(max_kv) = args.max_gpu_kv {
-                    info!(
-                        "Setting max GPU KV to {} tokens (offload test mode)",
-                        max_kv
-                    );
-                    engine.set_max_gpu_kv(max_kv);
-                }
-                info!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
-                run_repl(
-                    &mut engine,
-                    args.max_turns,
-                    args.max_tokens,
-                    args.temperature,
-                )?;
-            }
-            ModelType::Qwen35 => {
-                let mut engine =
-                    Qwen35ServerEngine::load_with_options(&args.model_path, 42, options)?;
-                if let Some(max_kv) = args.max_gpu_kv {
-                    info!(
-                        "Setting max GPU KV to {} tokens (offload test mode)",
-                        max_kv
-                    );
-                    engine.set_max_gpu_kv(max_kv);
-                }
-                info!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
-                run_repl(
-                    &mut engine,
-                    args.max_turns,
-                    args.max_tokens,
-                    args.temperature,
-                )?;
-            }
+        info!("Detected model type: {}", engine.model_type());
+        if let Some(max_kv) = args.max_gpu_kv {
+            info!(
+                "Setting max GPU KV to {} tokens (offload test mode)",
+                max_kv
+            );
+            engine.set_max_gpu_kv(max_kv);
         }
+        info!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
+        run_repl(
+            &mut engine,
+            args.max_turns,
+            args.max_tokens,
+            args.temperature,
+        )?;
 
         Ok(())
     }

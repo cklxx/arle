@@ -45,6 +45,20 @@ impl Default for SchedulerConfig {
 }
 
 impl SchedulerConfig {
+    /// Runtime-oriented defaults for the CUDA-backed serving scheduler.
+    ///
+    /// This keeps the existing `Default` implementation stable for the
+    /// CPU-only scheduling/accounting layer while making the serving defaults
+    /// explicit at the call site.
+    pub fn runtime_defaults(max_slots: usize) -> Self {
+        Self {
+            max_slots,
+            prefill_chunk_size: 4096,
+            max_waiting_requests: 256,
+            preemption_mode: PreemptionMode::Recompute,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.max_slots == 0 {
             anyhow::bail!("max_slots must be ≥ 1");

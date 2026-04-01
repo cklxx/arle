@@ -41,7 +41,11 @@ impl<M: ModelForward> Scheduler<M> {
                 // Log slow iterations (>50ms)
                 info!(
                     "Scheduler step: assign={}us step={}us cleanup={}us total={}us active={}",
-                    assign_us, step_us, clean_us, total_us, self.active.len()
+                    assign_us,
+                    step_us,
+                    clean_us,
+                    total_us,
+                    self.active.len()
                 );
             }
         }
@@ -81,12 +85,19 @@ impl<M: ModelForward> Scheduler<M> {
             if prefix_len > 0 {
                 info!(
                     "Request {} → slot {} (prompt={} tokens, prefix_reuse={}, queue={})",
-                    id, slot_idx, prompt_tokens.len(), prefix_len, self.waiting.len()
+                    id,
+                    slot_idx,
+                    prompt_tokens.len(),
+                    prefix_len,
+                    self.waiting.len()
                 );
             } else {
                 info!(
                     "Request {} → slot {} (prompt={} tokens, queue={})",
-                    id, slot_idx, prompt_tokens.len(), self.waiting.len()
+                    id,
+                    slot_idx,
+                    prompt_tokens.len(),
+                    self.waiting.len()
                 );
             }
 

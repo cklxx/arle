@@ -14,6 +14,7 @@ use axum::{
 };
 use futures_util::{StreamExt, stream};
 use log::{error, info, warn};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 /// Maximum wall-clock time allowed for a non-streaming request to complete.
@@ -21,9 +22,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 use crate::metrics::ServerMetrics;
-use crate::sampler::sampling_params_from_request;
+use crate::sampler::{SamplingParams, sampling_params_from_request};
 use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerHandle};
-#[cfg(test)]
 use crate::server_engine::StreamDelta;
 use crate::server_engine::{CompleteOutput, FinishReason, Usage};
 use openai_v1::{
@@ -34,6 +34,113 @@ use openai_v1::{
 struct AppState {
     handle: SchedulerHandle,
     metrics: ServerMetrics,
+}
+
+struct RequestExecutionOptions {
+    max_tokens: usize,
+    stream: bool,
+    include_usage: bool,
+    sampling: SamplingParams,
+    stop: Option<Vec<String>>,
+}
+
+impl RequestExecutionOptions {
+    fn from_completion(req: &CompletionRequest) -> Self {
+        Self {
+            max_tokens: req.max_tokens_or_default(),
+            stream: req.stream_or_default(),
+            include_usage: req.include_usage_or_default(),
+            sampling: sampling_params_from_request(
+                req.temperature,
+                req.top_p,
+                req.top_k,
+                req.min_p,
+                req.repetition_penalty,
+                req.frequency_penalty,
+                req.presence_penalty,
+                req.ignore_eos,
+                req.seed,
+                req.stop_token_ids.clone(),
+            ),
+            stop: req.stop.clone(),
+        }
+    }
+
+    fn from_chat(req: &ChatCompletionRequest) -> Self {
+        Self {
+            max_tokens: req.max_tokens_or_default(),
+            stream: req.stream_or_default(),
+            include_usage: req.include_usage_or_default(),
+            sampling: sampling_params_from_request(
+                req.temperature,
+                req.top_p,
+                req.top_k,
+                req.min_p,
+                req.repetition_penalty,
+                req.frequency_penalty,
+                req.presence_penalty,
+                req.ignore_eos,
+                req.seed,
+                req.stop_token_ids.clone(),
+            ),
+            stop: req.stop.clone(),
+        }
+    }
+
+    fn into_incoming_request(
+        self,
+        prompt: String,
+        delta_tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+    ) -> IncomingRequest {
+        IncomingRequest {
+            prompt,
+            max_tokens: self.max_tokens,
+            sampling: self.sampling,
+            stop: self.stop,
+            priority: RequestPriority::default(),
+            delta_tx,
+        }
+    }
+}
+
+struct BufferedResponse {
+    text: String,
+    finish_reason: FinishReason,
+    usage: Usage,
+}
+
+impl Default for BufferedResponse {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            finish_reason: FinishReason::Length,
+            usage: Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            },
+        }
+    }
+}
+
+impl BufferedResponse {
+    fn apply_delta(&mut self, delta: &StreamDelta) {
+        self.text.push_str(&delta.text_delta);
+        if let Some(reason) = delta.finish_reason {
+            self.finish_reason = reason;
+        }
+        if let Some(usage) = delta.usage {
+            self.usage = usage;
+        }
+    }
+
+    fn into_output(self) -> CompleteOutput {
+        CompleteOutput {
+            text: self.text,
+            finish_reason: self.finish_reason,
+            usage: self.usage,
+        }
+    }
 }
 
 fn now_secs() -> u64 {
@@ -50,6 +157,45 @@ fn now_secs() -> u64 {
 /// Returns the terminal `[DONE]` SSE event that ends every streaming response.
 fn sse_done_stream() -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
     stream::once(async { Ok::<_, Infallible>(Event::default().data("[DONE]")) })
+}
+
+async fn collect_buffered_response(
+    mut delta_rx: UnboundedReceiver<StreamDelta>,
+    request_kind: &str,
+) -> Result<BufferedResponse, StatusCode> {
+    let collect = async {
+        let mut buffered = BufferedResponse::default();
+        while let Some(delta) = delta_rx.recv().await {
+            buffered.apply_delta(&delta);
+        }
+        buffered
+    };
+
+    tokio::time::timeout(RESPONSE_TIMEOUT, collect)
+        .await
+        .map_err(|_| {
+            error!(
+                "Non-streaming {request_kind} timed out after {}s",
+                RESPONSE_TIMEOUT.as_secs()
+            );
+            StatusCode::GATEWAY_TIMEOUT
+        })
+}
+
+fn submit_request(
+    handle: &SchedulerHandle,
+    options: RequestExecutionOptions,
+    prompt: String,
+) -> Result<UnboundedReceiver<StreamDelta>, StatusCode> {
+    let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    let incoming = options.into_incoming_request(prompt, delta_tx);
+
+    if let Err(e) = handle.submit(incoming) {
+        error!("Scheduler unavailable or full: {e}");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    Ok(delta_rx)
 }
 
 /// Build the SSE event(s) for a single [`StreamDelta`].
@@ -92,9 +238,10 @@ async fn completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<Response, StatusCode> {
-    let max_tokens = req.max_tokens_or_default();
-    let stream = req.stream_or_default();
-    let include_usage = req.include_usage_or_default();
+    let options = RequestExecutionOptions::from_completion(&req);
+    let max_tokens = options.max_tokens;
+    let stream = options.stream;
+    let include_usage = options.include_usage;
     let model_id = state.handle.model_id().to_string();
 
     if req.prompt.trim().is_empty() {
@@ -109,32 +256,7 @@ async fn completions(
         stream,
     );
 
-    let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let incoming = IncomingRequest {
-        prompt: req.prompt,
-        max_tokens,
-        sampling: sampling_params_from_request(
-            req.temperature,
-            req.top_p,
-            req.top_k,
-            req.min_p,
-            req.repetition_penalty,
-            req.frequency_penalty,
-            req.presence_penalty,
-            req.ignore_eos,
-            req.seed,
-            req.stop_token_ids,
-        ),
-        stop: req.stop,
-        priority: RequestPriority::default(),
-        delta_tx,
-    };
-
-    if let Err(e) = state.handle.submit(incoming) {
-        error!("Scheduler unavailable or full: {e}");
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
+    let delta_rx = submit_request(&state.handle, options, req.prompt)?;
 
     if stream {
         let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
@@ -151,50 +273,15 @@ async fn completions(
 
         Ok(Sse::new(sse_stream.chain(sse_done_stream())).into_response())
     } else {
-        // Non-streaming: collect all deltas into a single response.
-        let mut text = String::new();
-        let mut finish_reason = FinishReason::Length;
-        let mut usage = Usage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-        };
-
-        let collect = async {
-            let mut rx = delta_rx;
-            while let Some(delta) = rx.recv().await {
-                text.push_str(&delta.text_delta);
-                if let Some(reason) = delta.finish_reason {
-                    finish_reason = reason;
-                }
-                if let Some(u) = delta.usage {
-                    usage = u;
-                }
-            }
-        };
-
-        if tokio::time::timeout(RESPONSE_TIMEOUT, collect)
-            .await
-            .is_err()
-        {
-            error!(
-                "Non-streaming request timed out after {}s",
-                RESPONSE_TIMEOUT.as_secs()
-            );
-            return Err(StatusCode::GATEWAY_TIMEOUT);
-        }
+        let buffered = collect_buffered_response(delta_rx, "request").await?;
 
         info!(
             "Request completed: prompt_tokens={}, completion_tokens={}",
-            usage.prompt_tokens, usage.completion_tokens
+            buffered.usage.prompt_tokens, buffered.usage.completion_tokens
         );
 
-        let output = CompleteOutput {
-            text,
-            finish_reason,
-            usage,
-        };
-        let response = CompletionResponse::from_output(model_id, now_secs(), output);
+        let response =
+            CompletionResponse::from_output(model_id, now_secs(), buffered.into_output());
         Ok(Json(response).into_response())
     }
 }
@@ -208,9 +295,10 @@ async fn chat_completions(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let max_tokens = req.max_tokens_or_default();
-    let do_stream = req.stream_or_default();
-    let include_usage = req.include_usage_or_default();
+    let options = RequestExecutionOptions::from_chat(&req);
+    let max_tokens = options.max_tokens;
+    let do_stream = options.stream;
+    let include_usage = options.include_usage;
     let model_id = state.handle.model_id().to_string();
 
     // Convert messages → ChatML prompt.
@@ -224,32 +312,7 @@ async fn chat_completions(
         do_stream,
     );
 
-    let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let incoming = IncomingRequest {
-        prompt,
-        max_tokens,
-        sampling: sampling_params_from_request(
-            req.temperature,
-            req.top_p,
-            req.top_k,
-            req.min_p,
-            req.repetition_penalty,
-            req.frequency_penalty,
-            req.presence_penalty,
-            req.ignore_eos,
-            req.seed,
-            req.stop_token_ids,
-        ),
-        stop: req.stop,
-        priority: RequestPriority::default(),
-        delta_tx,
-    };
-
-    if let Err(e) = state.handle.submit(incoming) {
-        error!("Scheduler unavailable or full: {e}");
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
+    let delta_rx = submit_request(&state.handle, options, prompt)?;
 
     if do_stream {
         let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -281,45 +344,15 @@ async fn chat_completions(
 
         Ok(Sse::new(full_stream).into_response())
     } else {
-        let mut text = String::new();
-        let mut finish_reason = FinishReason::Length;
-        let mut usage = Usage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-        };
-
-        let collect = async {
-            let mut rx = delta_rx;
-            while let Some(delta) = rx.recv().await {
-                text.push_str(&delta.text_delta);
-                if let Some(r) = delta.finish_reason {
-                    finish_reason = r;
-                }
-                if let Some(u) = delta.usage {
-                    usage = u;
-                }
-            }
-        };
-
-        if tokio::time::timeout(RESPONSE_TIMEOUT, collect)
-            .await
-            .is_err()
-        {
-            error!(
-                "Non-streaming chat request timed out after {}s",
-                RESPONSE_TIMEOUT.as_secs()
-            );
-            return Err(StatusCode::GATEWAY_TIMEOUT);
-        }
+        let buffered = collect_buffered_response(delta_rx, "chat request").await?;
 
         info!(
             "chat/completions done: prompt_tokens={}, completion_tokens={}",
-            usage.prompt_tokens, usage.completion_tokens
+            buffered.usage.prompt_tokens, buffered.usage.completion_tokens
         );
 
-        let response =
-            ChatCompletionResponse::from_output(model_id, now_secs(), &text, finish_reason, usage);
+        let output = buffered.into_output();
+        let response = ChatCompletionResponse::from_output(model_id, now_secs(), &output);
         Ok(Json(response).into_response())
     }
 }
