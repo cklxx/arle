@@ -705,7 +705,7 @@ fn find_mlx_include_dirs() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
 fn main() {
     // ── Metal C++ fused-ops shim (macOS only, requires `metal` feature) ────────
     if std::env::var("CARGO_FEATURE_METAL").is_ok() {
-        println!("cargo:rerun-if-changed=csrc/metal_fused_ops.cpp");
+        println!("cargo:rerun-if-changed=csrc/metal/metal_fused_ops.cpp");
         match find_mlx_include_dirs() {
             Some((cpp_hdr, c_hdr)) => {
                 let mut build = cc::Build::new();
@@ -718,7 +718,7 @@ fn main() {
                     .include(&cpp_hdr)
                     // mlx-c public headers (mlx_array typedef used in our ABI)
                     .include(&c_hdr)
-                    .file("csrc/metal_fused_ops.cpp");
+                    .file("csrc/metal/metal_fused_ops.cpp");
 
                 // On macOS, use clang++ and link frameworks
                 if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
@@ -773,9 +773,9 @@ fn main() {
 
     let replaced_cuda_files = BTreeSet::from(["activation.cu", "elementwise.cu", "embedding.cu"]);
 
-    let csrc_dir = Path::new("csrc");
+    let csrc_dir = Path::new("csrc/cuda");
     let cu_files: Vec<_> = std::fs::read_dir(csrc_dir)
-        .expect("Failed to read csrc/ directory")
+        .expect("Failed to read csrc/cuda/ directory")
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
