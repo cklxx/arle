@@ -49,6 +49,8 @@ pub(crate) struct Config35 {
     pub(crate) vocab_size: usize,
     pub(crate) rms_norm_eps: f32,
     pub(crate) eos_token_id: u32,
+    /// All stop token IDs (from generation_config.json or fallback to eos_token_id).
+    pub(crate) stop_token_ids: Vec<u32>,
 
     // Full attention params
     pub(crate) num_attention_heads: usize,
@@ -95,6 +97,7 @@ impl Config35 {
         );
 
         let rotary_dim = (t.head_dim as f64 * t.rope_parameters.partial_rotary_factor) as usize;
+        let stop_token_ids = Self::load_stop_token_ids(model_path, t.eos_token_id)?;
 
         Ok(Self {
             hidden_size: t.hidden_size,
@@ -103,6 +106,7 @@ impl Config35 {
             vocab_size: t.vocab_size,
             rms_norm_eps: t.rms_norm_eps as f32,
             eos_token_id: t.eos_token_id,
+            stop_token_ids,
             num_attention_heads: t.num_attention_heads,
             num_key_value_heads: t.num_key_value_heads,
             head_dim: t.head_dim,
@@ -115,6 +119,46 @@ impl Config35 {
             rotary_dim,
             layer_types,
         })
+    }
+
+    pub(crate) fn is_stop_token(&self, token_id: u32) -> bool {
+        self.stop_token_ids.contains(&token_id)
+    }
+
+    fn load_stop_token_ids(model_path: &str, fallback_eos_token_id: u32) -> Result<Vec<u32>> {
+        let generation_config_path = format!("{}/generation_config.json", model_path);
+        match fs::read_to_string(&generation_config_path) {
+            Ok(content) => {
+                let v: serde_json::Value = serde_json::from_str(&content)?;
+                let mut ids = Vec::new();
+                if let Some(eos) = v.get("eos_token_id") {
+                    match eos {
+                        serde_json::Value::Number(n) => {
+                            if let Some(id) = n.as_u64() {
+                                ids.push(id as u32);
+                            }
+                        }
+                        serde_json::Value::Array(arr) => {
+                            for item in arr {
+                                if let Some(id) = item.as_u64() {
+                                    ids.push(id as u32);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if ids.is_empty() {
+                    ids.push(fallback_eos_token_id);
+                }
+                ids.dedup();
+                Ok(ids)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(vec![fallback_eos_token_id])
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Number of full attention layers in the model.
