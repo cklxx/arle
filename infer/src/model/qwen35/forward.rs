@@ -164,6 +164,101 @@ impl ModelForward for Qwen35Model {
         &self.ctx
     }
 
+    fn forward_decode_batch(
+        &self,
+        tokens: &[u32],
+        states: &mut [Self::State],
+        slot_indices: &[usize],
+        paged_kv_pool: Option<&mut crate::paged_kv::PagedKVPool>,
+        decode_bufs_cache: &mut Option<Box<dyn std::any::Any + Send>>,
+        skip_logit_scatter: bool,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        match paged_kv_pool {
+            Some(pool) if !pool.k_buffers.is_empty() => {
+                use super::batch_decode::BatchDecodeBuffers35;
+
+                let bufs = match decode_bufs_cache {
+                    Some(cache) => cache
+                        .downcast_mut::<BatchDecodeBuffers35>()
+                        .expect("decode_bufs_cache type mismatch"),
+                    None => {
+                        let c = &self.config;
+                        let q_proj_dim = c.full_attn_q_proj_dim();
+                        let q_dim = c.full_attn_q_dim();
+                        let kv_dim = c.full_attn_kv_dim();
+                        let inter_dim = c.intermediate_size;
+                        let qkv_dim = c.linear_attn_qkv_dim();
+                        let z_dim = c.linear_attn_z_dim();
+                        let b_dim = c.linear_num_value_heads;
+                        let max_bs = states.len();
+                        let max_pages = pool.max_total_tokens;
+                        let b: Box<dyn std::any::Any + Send> = Box::new(
+                            BatchDecodeBuffers35::new(
+                                &self.ctx,
+                                c.hidden_size,
+                                q_proj_dim,
+                                q_dim,
+                                kv_dim,
+                                inter_dim,
+                                qkv_dim,
+                                z_dim,
+                                b_dim,
+                                max_bs,
+                                c.num_attention_heads,
+                                max_pages,
+                            )?,
+                        );
+                        *decode_bufs_cache = Some(b);
+                        decode_bufs_cache
+                            .as_mut()
+                            .unwrap()
+                            .downcast_mut::<BatchDecodeBuffers35>()
+                            .unwrap()
+                    }
+                };
+                self.decode_batch(tokens, states, slot_indices, skip_logit_scatter, pool, bufs)
+            }
+            _ => self.decode_batch_contiguous(tokens, states, slot_indices),
+        }
+    }
+
+    fn sample_batch_greedy(
+        &self,
+        slot_indices: &[usize],
+        decode_bufs_cache: &mut Option<Box<dyn std::any::Any + Send>>,
+    ) -> Result<Option<Vec<u32>>> {
+        use super::batch_decode::BatchDecodeBuffers35;
+        let bufs = match decode_bufs_cache {
+            Some(cache) => match cache.downcast_mut::<BatchDecodeBuffers35>() {
+                Some(b) => b,
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+        let logits = match bufs.logits_batch.as_ref() {
+            Some(l) if l.seq_len > 0 => l,
+            _ => return Ok(None),
+        };
+        let batch_size = slot_indices.len();
+        crate::ops::argmax_batch_launch(&self.ctx, logits, &mut bufs.argmax_out, batch_size)?;
+        self.ctx.sync()?;
+        crate::ops::argmax_batch_readback_into(
+            &self.ctx,
+            &bufs.argmax_out,
+            &mut bufs.argmax_host,
+            batch_size,
+        )?;
+        Ok(Some(
+            bufs.argmax_host[..batch_size]
+                .iter()
+                .map(|&x| x as u32)
+                .collect(),
+        ))
+    }
+
     fn select_tokens_batch(
         &self,
         states: &mut [Self::State],

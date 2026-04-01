@@ -1014,3 +1014,211 @@ pub fn flashinfer_run_layer(
     }
     Ok(())
 }
+
+// ============================================================================
+// HD256 variants for Qwen3.5 full attention (head_dim=256, partial RoPE, gate)
+// ============================================================================
+
+/// HD256 batched decode prep: QK-norm (1+w offset) + partial RoPE + paged KV write.
+///
+/// - `q_full_batch` [B, num_q_heads * 256 * 2]: Q with interleaved gate
+/// - `q_out_batch` [B, num_q_heads * 256]: output Q (normed + roped, no gate)
+/// - Writes K (normed + roped) and V (raw) to paged pool.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_prep_paged_hd256(
+    ctx: &DeviceContext,
+    q_full_batch: &HiddenStates,
+    q_out_batch: &mut HiddenStates,
+    k_batch: &HiddenStates,
+    v_batch: &HiddenStates,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    positions: &CudaSlice<i32>,
+    kv_pool: &PagedKVPool,
+    layer_idx: usize,
+    page_table_gpu: &CudaSlice<i32>,
+    page_indptr_gpu: &CudaSlice<i32>,
+    last_page_len_gpu: &CudaSlice<i32>,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    page_size: usize,
+    rotary_dim: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    let batch_size = q_full_batch.seq_len;
+    let stride_page = kv_pool.kv_dim;
+
+    let (qf_ptr, _g0) = q_full_batch.data.device_ptr(&ctx.stream);
+    let (qo_ptr, _g1) = q_out_batch.data.device_ptr_mut(&ctx.stream);
+    let (k_ptr, _g2) = k_batch.data.device_ptr(&ctx.stream);
+    let (v_ptr, _g3) = v_batch.data.device_ptr(&ctx.stream);
+    let (qn_ptr, _g4) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _g5) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _g6) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _g7) = sin_cache.data.device_ptr(&ctx.stream);
+    let (pos_ptr, _g8) = positions.device_ptr(&ctx.stream);
+    let (pt_ptr, _g9) = page_table_gpu.device_ptr(&ctx.stream);
+    let (pi_ptr, _g10) = page_indptr_gpu.device_ptr(&ctx.stream);
+    let (lp_ptr, _g11) = last_page_len_gpu.device_ptr(&ctx.stream);
+
+    let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
+    let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
+
+    unsafe {
+        ffi::decode_prep_paged_hd256_cuda(
+            qf_ptr as *const ffi::Half,
+            qo_ptr as *mut ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            pos_ptr as *const i32,
+            k_pool_ptr as *mut ffi::Half,
+            v_pool_ptr as *mut ffi::Half,
+            pt_ptr as *const i32,
+            pi_ptr as *const i32,
+            lp_ptr as *const i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            page_size as i32,
+            stride_page as i32,
+            batch_size as i32,
+            rotary_dim as i32,
+            rms_eps,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Apply sigmoid gate from Q's gate portion to attention output.
+/// `q_full_batch` has gate at [head * 2 * 256 + 256 .. head * 2 * 256 + 512].
+pub(crate) fn attention_gate_paged_hd256(
+    ctx: &DeviceContext,
+    q_full_batch: &HiddenStates,
+    attn_output: &mut HiddenStates,
+    num_q_heads: usize,
+) {
+    let batch_size = attn_output.seq_len;
+    let (qf_ptr, _g0) = q_full_batch.data.device_ptr(&ctx.stream);
+    let (ao_ptr, _g1) = attn_output.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::attention_gate_paged_hd256_cuda(
+            qf_ptr as *const ffi::Half,
+            ao_ptr as *mut ffi::Half,
+            num_q_heads as i32,
+            batch_size as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+}
+
+/// FlashInfer plan for HD256 decode (Qwen3.5 full attention).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flashinfer_plan_hd256(
+    ctx: &DeviceContext,
+    indptr_h: &[i32],
+    workspace: &mut FlashInferWorkspace,
+    batch_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    page_size: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
+    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
+
+    let ret = unsafe {
+        ffi::flashinfer_batch_decode_hd256_plan(
+            fw_ptr as *mut u8,
+            workspace.float_workspace_bytes,
+            iw_ptr as *mut u8,
+            workspace.page_locked_workspace,
+            workspace.int_workspace_bytes,
+            indptr_h.as_ptr(),
+            batch_size as i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            page_size as i32,
+            head_dim as i32,
+            workspace.plan_info as *mut u8,
+            ctx.stream.cu_stream(),
+        )
+    };
+    if ret != 0 {
+        return Err(anyhow!(
+            "flashinfer_batch_decode_hd256_plan failed with CUDA error {}",
+            ret
+        ));
+    }
+    Ok(())
+}
+
+/// FlashInfer HD256 run-layer: uses the pre-computed plan to run attention for one layer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flashinfer_run_layer_hd256(
+    ctx: &DeviceContext,
+    q_batch: &HiddenStates,
+    kv_pool: &PagedKVPool,
+    layer_idx: usize,
+    kv_indptr_gpu: &CudaSlice<i32>,
+    kv_indices_gpu: &CudaSlice<i32>,
+    kv_last_page_len_gpu: &CudaSlice<i32>,
+    output: &mut HiddenStates,
+    workspace: &mut FlashInferWorkspace,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    page_size: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let batch_size = q_batch.seq_len;
+    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+
+    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
+    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
+    let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (ind_ptr, _gind) = kv_indptr_gpu.device_ptr(&ctx.stream);
+    let (idx_ptr, _gidx) = kv_indices_gpu.device_ptr(&ctx.stream);
+    let (lp_ptr, _glp) = kv_last_page_len_gpu.device_ptr(&ctx.stream);
+    let (lse_ptr, _glse) = workspace.lse.device_ptr_mut(&ctx.stream);
+
+    let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
+    let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
+
+    let ret = unsafe {
+        ffi::flashinfer_batch_decode_hd256_run(
+            fw_ptr as *mut u8,
+            iw_ptr as *mut u8,
+            workspace.plan_info as *const u8,
+            q_ptr as *const ffi::Half,
+            k_pool_ptr as *const ffi::Half,
+            v_pool_ptr as *const ffi::Half,
+            ind_ptr as *const i32,
+            idx_ptr as *const i32,
+            lp_ptr as *const i32,
+            o_ptr as *mut ffi::Half,
+            lse_ptr as *mut f32,
+            batch_size as i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            page_size as i32,
+            head_dim as i32,
+            sm_scale,
+            ctx.stream.cu_stream(),
+        )
+    };
+    if ret != 0 {
+        return Err(anyhow!(
+            "flashinfer_batch_decode_hd256_run failed with CUDA error {}",
+            ret
+        ));
+    }
+    Ok(())
+}
