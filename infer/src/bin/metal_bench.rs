@@ -1,4 +1,4 @@
-//! Metal inference benchmark — TTFT, decode throughput (tok/s), peak RSS.
+//! Metal inference benchmark — prompt speed, TTFT, decode throughput, peak RSS.
 //!
 //! Requires the `metal` feature. Build with:
 //!   cargo build --release --no-default-features --features metal,no-cuda --bin metal_bench
@@ -19,7 +19,7 @@ use std::time::Instant;
 use anyhow::Result;
 use clap::Parser;
 
-/// Metal backend benchmark: TTFT, tok/s (mean/p50/p99), peak RSS.
+/// Metal backend benchmark: prompt speed, TTFT, decode throughput, peak RSS.
 #[derive(Parser)]
 #[command(
     name = "metal_bench",
@@ -78,12 +78,9 @@ fn run_bench() -> Result<()> {
                   Write a detailed explanation of how attention mechanisms work in transformers.\
                   <|im_end|>\n<|im_start|>assistant\n";
 
-    // Note: max_new_tokens is currently hardcoded in the Metal backend (512 tokens).
-    // The --max-tokens CLI flag is reserved for when the backend exposes it.
-    let _ = cli.max_tokens;
-
     let params = SamplingParams {
         temperature: 0.0, // greedy — deterministic runs
+        max_new_tokens: Some(cli.max_tokens),
         ..Default::default()
     };
 
@@ -116,8 +113,12 @@ fn run_bench() -> Result<()> {
     // ── Timed runs ───────────────────────────────────────────────────────────
     struct Run {
         elapsed_s: f64,
+        prompt_tokens: usize,
         tokens: usize,
-        tps: f64,
+        prompt_tps: f64,
+        generation_tps: f64,
+        ttft_ms: f64,
+        e2e_tps: f64,
     }
 
     let mut runs: Vec<Run> = Vec::with_capacity(cli.runs);
@@ -126,40 +127,62 @@ fn run_bench() -> Result<()> {
         let t0 = Instant::now();
         let result = backend.generate(prompt, &params)?;
         let elapsed_s = t0.elapsed().as_secs_f64();
-        let tps = result.completion_tokens as f64 / elapsed_s.max(1e-9);
+        let e2e_tps = result.completion_tokens as f64 / elapsed_s.max(1e-9);
 
         if cli.profile || !cli.json {
             eprintln!(
-                "  run {:2}: {:4} tok  {:.2}s  {:.1} tok/s",
+                "  run {:2}: prompt {:3} tok @ {:6.1} tok/s  gen {:4} tok @ {:6.1} tok/s  e2e {:6.1} tok/s  ttft {:6.1}ms",
                 i + 1,
+                result.prompt_tokens,
+                result.prompt_tps,
                 result.completion_tokens,
-                elapsed_s,
-                tps,
+                result.generation_tps,
+                e2e_tps,
+                result.ttft_ms,
             );
         }
 
         runs.push(Run {
             elapsed_s,
+            prompt_tokens: result.prompt_tokens,
             tokens: result.completion_tokens,
-            tps,
+            prompt_tps: result.prompt_tps,
+            generation_tps: result.generation_tps,
+            ttft_ms: result.ttft_ms,
+            e2e_tps,
         });
     }
 
     // ── Statistics ───────────────────────────────────────────────────────────
-    let mut tps_sorted: Vec<f64> = runs.iter().map(|r| r.tps).collect();
-    tps_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mean_tps = tps_sorted.iter().sum::<f64>() / tps_sorted.len() as f64;
-    let p50_tps = percentile(&tps_sorted, 50.0);
-    let p99_tps = percentile(&tps_sorted, 99.0);
+    let mut prompt_tps_sorted: Vec<f64> = runs.iter().map(|r| r.prompt_tps).collect();
+    prompt_tps_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean_prompt_tps = prompt_tps_sorted.iter().sum::<f64>() / prompt_tps_sorted.len() as f64;
+    let p50_prompt_tps = percentile(&prompt_tps_sorted, 50.0);
+    let p99_prompt_tps = percentile(&prompt_tps_sorted, 99.0);
 
-    // Wall-time elapsed is a proxy for TTFT when running greedy with few tokens;
-    // for a more accurate TTFT the backend would need to expose it directly.
-    let mut ttft_sorted: Vec<f64> = runs.iter().map(|r| r.elapsed_s * 1000.0).collect();
+    let mut generation_tps_sorted: Vec<f64> = runs.iter().map(|r| r.generation_tps).collect();
+    generation_tps_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean_generation_tps =
+        generation_tps_sorted.iter().sum::<f64>() / generation_tps_sorted.len() as f64;
+    let p50_generation_tps = percentile(&generation_tps_sorted, 50.0);
+    let p99_generation_tps = percentile(&generation_tps_sorted, 99.0);
+
+    let mut e2e_tps_sorted: Vec<f64> = runs.iter().map(|r| r.e2e_tps).collect();
+    e2e_tps_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean_e2e_tps = e2e_tps_sorted.iter().sum::<f64>() / e2e_tps_sorted.len() as f64;
+    let p50_e2e_tps = percentile(&e2e_tps_sorted, 50.0);
+    let p99_e2e_tps = percentile(&e2e_tps_sorted, 99.0);
+
+    let mut ttft_sorted: Vec<f64> = runs.iter().map(|r| r.ttft_ms).collect();
     ttft_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mean_ttft_ms = ttft_sorted.iter().sum::<f64>() / ttft_sorted.len() as f64;
     let p50_ttft_ms = percentile(&ttft_sorted, 50.0);
+    let p99_ttft_ms = percentile(&ttft_sorted, 99.0);
 
     let avg_tokens = runs.iter().map(|r| r.tokens).sum::<usize>() / runs.len().max(1);
+    let prompt_tokens = runs.first().map_or(0, |r| r.prompt_tokens);
+    let mean_elapsed_ms =
+        runs.iter().map(|r| r.elapsed_s).sum::<f64>() / runs.len() as f64 * 1000.0;
 
     let peak_mb = peak_rss_kb() as f64 / 1024.0;
 
@@ -174,9 +197,13 @@ fn run_bench() -> Result<()> {
                 "warmup_runs": cli.warmup,
                 "timed_runs": cli.runs,
                 "load_ms": load_ms,
+                "prompt_tokens": prompt_tokens,
                 "avg_tokens": avg_tokens,
-                "tps": { "mean": mean_tps, "p50": p50_tps, "p99": p99_tps },
-                "ttft_ms": { "mean": mean_ttft_ms, "p50": p50_ttft_ms },
+                "prompt_tps": { "mean": mean_prompt_tps, "p50": p50_prompt_tps, "p99": p99_prompt_tps },
+                "generation_tps": { "mean": mean_generation_tps, "p50": p50_generation_tps, "p99": p99_generation_tps },
+                "e2e_tps": { "mean": mean_e2e_tps, "p50": p50_e2e_tps, "p99": p99_e2e_tps },
+                "ttft_ms": { "mean": mean_ttft_ms, "p50": p50_ttft_ms, "p99": p99_ttft_ms },
+                "elapsed_ms": { "mean": mean_elapsed_ms },
                 "peak_rss_mb": peak_mb,
             })
         );
@@ -184,11 +211,20 @@ fn run_bench() -> Result<()> {
         println!();
         println!("=== Metal Benchmark: {} [{}] ===", cli.model, quant_hint);
         println!("  Warmup / timed  : {} / {}", cli.warmup, cli.runs);
+        println!("  Prompt tokens   : {prompt_tokens}");
         println!("  Avg tokens out  : {avg_tokens}");
         println!(
-            "  Throughput      : {mean_tps:.1} tok/s mean  |  {p50_tps:.1} p50  |  {p99_tps:.1} p99"
+            "  Prompt speed    : {mean_prompt_tps:.1} tok/s mean  |  {p50_prompt_tps:.1} p50  |  {p99_prompt_tps:.1} p99"
         );
-        println!("  TTFT (wall)     : {mean_ttft_ms:.0}ms mean  |  {p50_ttft_ms:.0}ms p50");
+        println!(
+            "  Generation      : {mean_generation_tps:.1} tok/s mean  |  {p50_generation_tps:.1} p50  |  {p99_generation_tps:.1} p99"
+        );
+        println!(
+            "  End-to-end      : {mean_e2e_tps:.1} tok/s mean  |  {p50_e2e_tps:.1} p50  |  {p99_e2e_tps:.1} p99"
+        );
+        println!(
+            "  TTFT            : {mean_ttft_ms:.0}ms mean  |  {p50_ttft_ms:.0}ms p50  |  {p99_ttft_ms:.0}ms p99"
+        );
         println!("  Peak RSS        : {peak_mb:.0}MB");
         println!(
             "==={}===",
