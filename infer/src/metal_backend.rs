@@ -366,6 +366,7 @@ impl InferenceBackend for MetalBackend {
                 ttft_ms: generated.ttft_ms,
                 prompt_tps,
                 generation_tps,
+                total_time_ms: generated.total_time_ms,
             });
         }
 
@@ -420,6 +421,7 @@ struct MetalGenerateOutput {
     tokens: Vec<u32>,
     finish_reason: &'static str,
     ttft_ms: f64,
+    total_time_ms: f64,
 }
 
 // GPU required: all tensor operations use mlx-rs Arrays on Metal unified memory.
@@ -439,6 +441,7 @@ fn metal_generate(
             tokens: Vec::new(),
             finish_reason: "length",
             ttft_ms: 0.0,
+            total_time_ms: 0.0,
         });
     }
 
@@ -573,13 +576,16 @@ fn metal_generate(
     };
 
     let elapsed = t0.elapsed().as_secs_f64();
-    let tps = generated.len() as f64 / elapsed.max(1e-9);
+    let total_time_ms = elapsed * 1000.0;
+    let decode_elapsed = (elapsed - ttft_ms / 1000.0).max(1e-9);
+    let tps = generated.len() as f64 / decode_elapsed;
     log::info!("  generated {} tokens  ({tps:.1} tok/s)", generated.len());
 
     Ok(MetalGenerateOutput {
         tokens: generated,
         finish_reason,
         ttft_ms,
+        total_time_ms,
     })
 }
 
@@ -1277,15 +1283,16 @@ mod tests {
         let _ = backend.generate(prompt, &params).expect("warmup");
 
         // Timed pass
-        let t0 = std::time::Instant::now();
         let result = backend.generate(prompt, &params).expect("generate");
-        let elapsed = t0.elapsed().as_secs_f64();
 
         println!("\n=== Metal Benchmark: {label} ===");
         println!("Model:      {}", model_dir.display());
+        println!("Prompt TPS: {:.1} tok/s", result.prompt_tps);
+        println!("TTFT:       {:.1}ms", result.ttft_ms);
         println!("Tokens out: {}", result.completion_tokens);
-        println!("Elapsed:    {elapsed:.2}s");
-        println!("Throughput: {:.1} tok/s", result.generation_tps);
+        println!("Elapsed:    {:.2}s", result.total_time_ms / 1000.0);
+        println!("Gen TPS:    {:.1} tok/s", result.generation_tps);
+        println!("Finished:   {}", result.finish_reason);
         println!(
             "Output:     {:?}",
             &result.text[..result.text.len().min(200)]
