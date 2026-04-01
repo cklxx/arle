@@ -2,7 +2,7 @@ use super::*;
 
 impl<M: ModelForward> Scheduler<M> {
     /// Compute prefix cache for a new request and begin chunked prefill.
-    fn step_new(&mut self, idx: usize) {
+    pub(super) fn step_new(&mut self, idx: usize) {
         let req = &mut self.active[idx];
         if req.delta_tx.is_closed() {
             req.phase = Phase::Finished;
@@ -94,7 +94,7 @@ impl<M: ModelForward> Scheduler<M> {
 
     /// Process one chunk of a prefill. When all chunks are done, sample the
     /// first token and transition to Decoding.
-    fn step_prefill_chunk(&mut self, idx: usize, decode_active: bool) {
+    pub(super) fn step_prefill_chunk(&mut self, idx: usize, decode_active: bool) {
         let Self {
             model,
             tokenizer,

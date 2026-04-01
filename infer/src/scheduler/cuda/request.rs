@@ -1,7 +1,7 @@
 use super::*;
 
 /// Newly assigned, needs prefix cache check.
-pub(super) enum Phase {
+pub(crate) enum Phase {
     New,
     /// Prefilling in chunks. Decode takes priority between chunks.
     Prefilling {
@@ -14,22 +14,22 @@ pub(super) enum Phase {
     Finished,
 }
 
-pub(super) struct ActiveRequest {
-    pub(super) id: u64,
-    pub(super) slot_idx: usize,
-    pub(super) prompt_tokens: Vec<u32>,
-    pub(super) generated_tokens: Vec<u32>,
-    pub(super) max_tokens: usize,
-    pub(super) sampling: crate::sampler::SamplingParams,
-    pub(super) stop: Option<Vec<String>>,
-    pub(super) delta_tx: mpsc::UnboundedSender<StreamDelta>,
+pub(crate) struct ActiveRequest {
+    pub(crate) id: u64,
+    pub(crate) slot_idx: usize,
+    pub(crate) prompt_tokens: Vec<u32>,
+    pub(crate) generated_tokens: Vec<u32>,
+    pub(crate) max_tokens: usize,
+    pub(crate) sampling: crate::sampler::SamplingParams,
+    pub(crate) stop: Option<Vec<String>>,
+    pub(crate) delta_tx: mpsc::UnboundedSender<StreamDelta>,
     /// Full decoded text, maintained incrementally.
-    pub(super) full_decoded: String,
+    pub(crate) full_decoded: String,
     /// Number of tokens already decoded into full_decoded.
-    pub(super) decoded_token_count: usize,
+    pub(crate) decoded_token_count: usize,
     /// Number of characters already sent to the client.
-    pub(super) sent_len: usize,
-    pub(super) phase: Phase,
+    pub(crate) sent_len: usize,
+    pub(crate) phase: Phase,
 }
 
 impl ActiveRequest {
@@ -38,7 +38,7 @@ impl ActiveRequest {
     /// Uses incremental decode: only re-decodes a small suffix (4 tokens)
     /// to handle multi-byte character boundaries, instead of all tokens.
     /// Cost per call: O(1) instead of O(N) where N = generated token count.
-    pub(super) fn emit_delta(&mut self, tokenizer: &Tokenizer) {
+    pub(crate) fn emit_delta(&mut self, tokenizer: &Tokenizer) {
         let n = self.generated_tokens.len();
         if n == 0 {
             return;
@@ -99,7 +99,7 @@ impl ActiveRequest {
     }
 
     /// Flush remaining buffered text and send the final finish delta.
-    pub(super) fn finish(&mut self, reason: FinishReason, tokenizer: &Tokenizer) {
+    pub(crate) fn finish(&mut self, reason: FinishReason, tokenizer: &Tokenizer) {
         if matches!(self.phase, Phase::Finished) {
             return;
         }
@@ -142,7 +142,7 @@ impl ActiveRequest {
 }
 
 /// Result of scanning decoded text for stop sequences.
-pub(super) enum StopCheckResult {
+pub(crate) enum StopCheckResult {
     /// No stop found. Safe to emit text up to `safe_len` (holds back
     /// `max_stop_len` bytes to avoid splitting a partially-matched stop).
     NoStop { safe_len: usize },
@@ -156,7 +156,7 @@ pub(super) enum StopCheckResult {
 /// When no stop is found, returns `NoStop` with a safe emit length that
 /// withholds `max_stop_len` bytes from the tail (in case a stop sequence
 /// straddles the boundary of text decoded so far).
-pub(super) fn check_stop_sequences(text: &str, stops: &[String]) -> StopCheckResult {
+pub(crate) fn check_stop_sequences(text: &str, stops: &[String]) -> StopCheckResult {
     for stop in stops {
         if stop.is_empty() {
             continue;

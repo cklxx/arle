@@ -1,7 +1,7 @@
 use super::*;
 
 impl<M: ModelForward> Scheduler<M> {
-    fn step(&mut self) {
+    pub(super) fn step(&mut self) {
         let num = self.active.len();
         if num == 0 {
             return;

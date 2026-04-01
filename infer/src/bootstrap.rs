@@ -169,7 +169,7 @@ pub fn spawn_scheduler_handle_from_path(
 }
 
 #[cfg(feature = "cuda")]
-fn spawn_scheduler_for_model<M: ModelForward>(
+fn spawn_scheduler_for_model<M: ModelForward + 'static>(
     components: ModelComponents<M>,
     num_slots: usize,
     seed: u64,
