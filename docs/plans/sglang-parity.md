@@ -1,7 +1,8 @@
 # Plan: 追平 sglang 0.5.9 (Qwen3-8B · A100-40GB · 同配置)
 
-> Status: **Planning**
+> Status: **Done** — Steps 1-4 complete. C=4 exceeds sglang. C=1 gap is kernel-bound.
 > Created: 2026-04-01
+> Updated: 2026-04-01
 > Goal: 在相同硬件和模型下，匹配或超越 sglang 0.5.9 的默认配置吞吐量
 
 ---

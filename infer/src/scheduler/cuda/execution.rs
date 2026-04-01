@@ -36,44 +36,40 @@ impl<M: ModelForward> Scheduler<M> {
             0
         };
 
-        // Phase 3: Prefill chunks
-        let prefill_t = std::time::Instant::now();
-        let mut did_prefill = true;
-        while did_prefill {
-            did_prefill = false;
-            for idx in 0..self.active.len() {
-                if matches!(self.active[idx].phase, Phase::Prefilling { .. }) {
-                    self.step_prefill_chunk(idx, has_decode);
-                    did_prefill = true;
-                    break;
-                }
+        // Phase 3: Accept ALL new requests (prefix cache + start prefill)
+        // Process all new requests in one step to avoid multi-iteration admission delay.
+        let new_t = std::time::Instant::now();
+        loop {
+            let new_idx = (0..self.active.len())
+                .find(|&i| matches!(self.active[i].phase, Phase::New));
+            match new_idx {
+                Some(idx) => self.step_new(idx),
+                None => break,
             }
-            if did_prefill {
-                let still_prefilling = self
-                    .active
-                    .iter()
-                    .any(|r| matches!(r.phase, Phase::Prefilling { .. }));
-                if still_prefilling {
-                    break;
-                }
+        }
+        let new_us = new_t.elapsed().as_micros();
+
+        // Phase 4: Prefill chunks — process all pending prefill requests,
+        // one chunk each, to maximize prefill throughput while still yielding
+        // to the next decode step.
+        let prefill_t = std::time::Instant::now();
+        let prefill_indices: Vec<usize> = (0..self.active.len())
+            .filter(|&i| matches!(self.active[i].phase, Phase::Prefilling { .. }))
+            .collect();
+        for idx in prefill_indices {
+            // Re-check phase since step_prefill_chunk may transition to Decoding/Finished
+            if matches!(self.active[idx].phase, Phase::Prefilling { .. }) {
+                self.step_prefill_chunk(idx, has_decode);
             }
         }
         let prefill_us = prefill_t.elapsed().as_micros();
 
-        // Phase 4: Accept new requests
-        for idx in 0..num {
-            if matches!(self.active[idx].phase, Phase::New) {
-                self.step_new(idx);
-                return;
-            }
-        }
-
         // Log slow steps for profiling
-        let total_us = emit_us + decode_us + prefill_us;
+        let total_us = emit_us + decode_us + new_us + prefill_us;
         if total_us > 100_000 {
             info!(
-                "step breakdown: emit={}us decode={}us prefill={}us total={}us batch={}",
-                emit_us, decode_us, prefill_us, total_us, num
+                "step breakdown: emit={}us decode={}us new={}us prefill={}us total={}us batch={}",
+                emit_us, decode_us, new_us, prefill_us, total_us, num
             );
         }
     }
