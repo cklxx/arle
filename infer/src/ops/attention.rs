@@ -76,21 +76,26 @@ pub fn prefill_attention_batch(
                 ctx.stream.cu_stream(),
             );
 
-            // Step 3: FlashAttention-2 (Triton) — reads normed Q and KV cache
-            ffi::flash_attention_prefill_cuda(
-                q_ptr as *const ffi::Half,
-                kc_ptr as *const ffi::Half,
-                vc_ptr as *const ffi::Half,
+            // Step 3: FlashInfer single prefill — reads normed Q and KV cache
+            let kv_len = start_pos + seq_len;
+            let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+            let ret = ffi::flashinfer_single_prefill(
+                q_ptr as *mut ffi::Half,
+                kc_ptr as *mut ffi::Half,
+                vc_ptr as *mut ffi::Half,
                 o_ptr as *mut ffi::Half,
                 num_q_heads as i32,
                 num_kv_heads as i32,
-                gqa_ratio as i32,
                 seq_len as i32,
-                start_pos as i32,
+                kv_len as i32,
                 max_seq_len as i32,
-                q_dim as i32,
+                sm_scale,
+                std::ptr::null_mut(),
                 ctx.stream.cu_stream(),
             );
+            if ret != 0 {
+                return Err(anyhow!("flashinfer_single_prefill failed: CUDA error {}", ret));
+            }
         }
     }
 
