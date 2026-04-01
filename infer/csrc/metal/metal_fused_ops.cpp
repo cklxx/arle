@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -221,6 +222,36 @@ mlx_array metal_categorical_sample(mlx_array scaled_logits_h) {
     auto probs   = mlx::core::softmax(scaled, std::vector<int>{-1});
     auto result  = mlx::core::random::categorical(probs);
     return arr_own(std::move(result));
+}
+
+// ── metal_clear_cache ─────────────────────────────────────────────────────────
+// Release accumulated temporary Metal buffer allocations from MLX's internal cache.
+// Call every ~256 decode steps to prevent unbounded memory growth (P5).
+void metal_clear_cache() {
+    mlx::core::clear_cache();
+}
+
+// ── metal_kv_extend ───────────────────────────────────────────────────────────
+// Grow a KV cache buffer from [1, n_kv_heads, old_cap, head_dim] to
+// [1, n_kv_heads, new_cap, head_dim] by concatenating a zero-filled extension
+// along axis 2.  The existing filled prefix is preserved.
+//
+// new_cap must be > old_cap (typically old_cap + 256).
+void metal_kv_extend(
+    mlx_array* cache_h,   // in/out: updated in-place
+    int n_kv_heads,
+    int head_dim,
+    int new_cap)
+{
+    using namespace mlx::core;
+    array& cache = arr_ref(*cache_h);
+    int old_cap = cache.shape(2);
+    if (new_cap <= old_cap) return;
+    // Zero extension for new slots, same dtype as cache
+    array extra = zeros({1, n_kv_heads, new_cap - old_cap, head_dim}, cache.dtype());
+    // Concatenate along sequence axis (axis 2)
+    array grown = concatenate({cache, extra}, 2);
+    *cache_h = arr_own(std::move(grown));
 }
 
 } // extern "C"
