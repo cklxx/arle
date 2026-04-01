@@ -198,6 +198,154 @@ impl WeightTensor {
             WeightTensor::Quantized { scales, .. } => scales.dtype(),
         }
     }
+
+    /// Logical output width of the projection.
+    ///
+    /// Dense tensors are stored transposed as `[in, out]`; quantized tensors
+    /// keep MLX packed layout `[out, packed_in]`.
+    pub fn output_dim(&self) -> Result<i32> {
+        let shape = match self {
+            WeightTensor::Dense(w_t) => w_t.shape(),
+            WeightTensor::Quantized { w, .. } => w.shape(),
+        };
+
+        match self {
+            WeightTensor::Dense(_) => shape
+                .get(1)
+                .copied()
+                .context("dense projection missing output dimension"),
+            WeightTensor::Quantized { .. } => shape
+                .first()
+                .copied()
+                .context("quantized projection missing output dimension"),
+        }
+    }
+}
+
+/// Attention input projections for one transformer layer.
+#[cfg(feature = "metal")]
+pub enum AttentionInputProjection {
+    /// Dense/non-merged path. Required by the fused C++ block path.
+    Split {
+        q_proj: WeightTensor,
+        k_proj: WeightTensor,
+        v_proj: WeightTensor,
+    },
+    /// Quantized fallback path with a single `qkv` matmul.
+    MergedQuantized {
+        qkv_proj: WeightTensor,
+        q_dim: i32,
+        k_dim: i32,
+        v_dim: i32,
+    },
+}
+
+#[cfg(feature = "metal")]
+impl AttentionInputProjection {
+    fn kv_dtype(&self) -> mlx_rs::Dtype {
+        match self {
+            Self::Split { k_proj, .. } => k_proj.dtype(),
+            Self::MergedQuantized { qkv_proj, .. } => qkv_proj.dtype(),
+        }
+    }
+
+    fn fused_dense_parts(&self) -> Option<(&Array, &Array, &Array)> {
+        match self {
+            Self::Split {
+                q_proj: WeightTensor::Dense(q_proj_t),
+                k_proj: WeightTensor::Dense(k_proj_t),
+                v_proj: WeightTensor::Dense(v_proj_t),
+            } => Some((q_proj_t, k_proj_t, v_proj_t)),
+            _ => None,
+        }
+    }
+
+    fn project(&self, x: &Array) -> Result<(Array, Array, Array)> {
+        use mlx_rs::ops::split_sections;
+
+        match self {
+            Self::Split {
+                q_proj,
+                k_proj,
+                v_proj,
+            } => Ok((
+                linear(x, q_proj).context("q_proj")?,
+                linear(x, k_proj).context("k_proj")?,
+                linear(x, v_proj).context("v_proj")?,
+            )),
+            Self::MergedQuantized {
+                qkv_proj,
+                q_dim,
+                k_dim,
+                v_dim,
+            } => {
+                let qkv = linear(x, qkv_proj).context("qkv_proj")?;
+                let split_at = [*q_dim, *q_dim + *k_dim];
+                let parts = split_sections(&qkv, &split_at, -1).context("split qkv")?;
+                let [q_raw, k_raw, v_raw] = <[Array; 3]>::try_from(parts).map_err(|parts| {
+                    anyhow::anyhow!("expected 3 qkv splits, got {}", parts.len())
+                })?;
+                debug_assert_eq!(q_raw.shape()[1], *q_dim);
+                debug_assert_eq!(k_raw.shape()[1], *k_dim);
+                debug_assert_eq!(v_raw.shape()[1], *v_dim);
+                Ok((q_raw, k_raw, v_raw))
+            }
+        }
+    }
+}
+
+/// MLP input projections for one transformer layer.
+#[cfg(feature = "metal")]
+pub enum MlpInputProjection {
+    /// Dense/non-merged path, preserving the fused dense block assumptions.
+    Split {
+        gate_proj: WeightTensor,
+        up_proj: WeightTensor,
+    },
+    /// Quantized fallback path with a single `gate+up` matmul.
+    MergedQuantized {
+        gate_up_proj: WeightTensor,
+        gate_dim: i32,
+        up_dim: i32,
+    },
+}
+
+#[cfg(feature = "metal")]
+impl MlpInputProjection {
+    fn fused_dense_parts(&self) -> Option<(&Array, &Array)> {
+        match self {
+            Self::Split {
+                gate_proj: WeightTensor::Dense(gate_proj_t),
+                up_proj: WeightTensor::Dense(up_proj_t),
+            } => Some((gate_proj_t, up_proj_t)),
+            _ => None,
+        }
+    }
+
+    fn project(&self, x: &Array) -> Result<(Array, Array)> {
+        use mlx_rs::ops::split_sections;
+
+        match self {
+            Self::Split { gate_proj, up_proj } => Ok((
+                linear(x, gate_proj).context("gate_proj")?,
+                linear(x, up_proj).context("up_proj")?,
+            )),
+            Self::MergedQuantized {
+                gate_up_proj,
+                gate_dim,
+                up_dim,
+            } => {
+                let gate_up = linear(x, gate_up_proj).context("gate_up_proj")?;
+                let parts = split_sections(&gate_up, &[*gate_dim], -1).context("split gate_up")?;
+                let [gate_raw, up_raw] = <[Array; 2]>::try_from(parts).map_err(|parts| {
+                    anyhow::anyhow!("expected 2 gate/up splits, got {}", parts.len())
+                })?;
+                debug_assert_eq!(gate_raw.shape()[1], *gate_dim);
+                debug_assert_eq!(up_raw.shape()[1], *up_dim);
+                Ok((gate_raw, up_raw))
+            }
+        }
+    }
 }
 
 /// Weight tensors loaded from safetensors shards into Metal unified memory.
@@ -218,14 +366,11 @@ pub struct MetalWeights {
 // GPU required: all fields are mlx-rs Arrays or WeightTensors.
 #[cfg(feature = "metal")]
 pub struct MetalLayerWeights {
-    // Self-attention projections (possibly quantized)
-    pub q_proj: WeightTensor,
-    pub k_proj: WeightTensor,
-    pub v_proj: WeightTensor,
+    // Self-attention input projections (possibly merged for quantized layers).
+    pub attention_inputs: AttentionInputProjection,
     pub o_proj: WeightTensor,
-    // MLP projections (possibly quantized)
-    pub gate_proj: WeightTensor,
-    pub up_proj: WeightTensor,
+    // MLP input projections (possibly merged for quantized layers).
+    pub mlp_inputs: MlpInputProjection,
     pub down_proj: WeightTensor,
     // Per-head QK norms (always float)
     pub q_norm: Array,
@@ -458,10 +603,10 @@ fn metal_generate(
     // In the fused path all intermediate Arrays are C++-scoped; Rust holds only
     // the per-layer input/output handles.
     let use_fused = METAL_FUSED_OPS_AVAILABLE
-        && weights
-            .layers
-            .iter()
-            .all(|l| matches!(l.q_proj, WeightTensor::Dense(_)));
+        && weights.layers.iter().all(|layer| {
+            layer.attention_inputs.fused_dense_parts().is_some()
+                && layer.mlp_inputs.fused_dense_parts().is_some()
+        });
 
     // P5: KV cache starts at the next 256-token boundary above the prefill length,
     // plus one chunk for initial decode steps.  Grown lazily in KV_CACHE_CHUNK steps.
@@ -469,7 +614,7 @@ fn metal_generate(
     let initial_cap = ((prefill_len + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK + 1) * KV_CACHE_CHUNK;
     let mut kv_capacity = initial_cap;
 
-    let kv_dtype = weights.layers[0].k_proj.dtype();
+    let kv_dtype = weights.layers[0].attention_inputs.kv_dtype();
     let cache_shape = [1i32, n_kv_heads, initial_cap, head_dim];
     let mut k_caches: Vec<Array> = (0..n_layers)
         .map(|_| zeros_dtype_device(&cache_shape, kv_dtype, StreamOrDevice::default()))
@@ -685,22 +830,19 @@ fn build_forward_graph(
         // P2 + P7: one C++ FFI call per layer; all intermediate Arrays are C++-scoped.
         // Rust only holds the layer input (x) and output (x_next) Array handles.
         for (li, layer) in weights.layers.iter().enumerate() {
-            let (
-                WeightTensor::Dense(q_proj_t),
-                WeightTensor::Dense(k_proj_t),
-                WeightTensor::Dense(v_proj_t),
-                WeightTensor::Dense(o_proj_t),
-            ) = (&layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj)
-            else {
-                unreachable!("use_fused only when all layers are Dense")
+            let (q_proj_t, k_proj_t, v_proj_t) = layer
+                .attention_inputs
+                .fused_dense_parts()
+                .expect("use_fused only when attention inputs are Dense");
+            let (gate_proj_t, up_proj_t) = layer
+                .mlp_inputs
+                .fused_dense_parts()
+                .expect("use_fused only when mlp inputs are Dense");
+            let WeightTensor::Dense(o_proj_t) = &layer.o_proj else {
+                unreachable!("use_fused only when o_proj is Dense")
             };
-            let (
-                WeightTensor::Dense(gate_proj_t),
-                WeightTensor::Dense(up_proj_t),
-                WeightTensor::Dense(down_proj_t),
-            ) = (&layer.gate_proj, &layer.up_proj, &layer.down_proj)
-            else {
-                unreachable!("use_fused only when all layers are Dense")
+            let WeightTensor::Dense(down_proj_t) = &layer.down_proj else {
+                unreachable!("use_fused only when down_proj is Dense")
             };
 
             x = fused_transformer_layer(
@@ -862,9 +1004,7 @@ fn rust_transformer_layer(
     let x = fast::rms_norm(&x, &layer.input_layernorm, eps).context("input_layernorm")?;
 
     // 2. QKV projections
-    let q_raw = linear(&x, &layer.q_proj)?;
-    let k_raw = linear(&x, &layer.k_proj)?;
-    let v_raw = linear(&x, &layer.v_proj)?;
+    let (q_raw, k_raw, v_raw) = layer.attention_inputs.project(&x)?;
 
     // 3. Per-head QK norm
     let q_raw = apply_head_norm(&q_raw, seq, n_heads, head_dim, &layer.q_norm, eps)?;
@@ -921,8 +1061,8 @@ fn rust_transformer_layer(
     let residual2 = x.clone();
     let xn =
         fast::rms_norm(&x, &layer.post_attention_layernorm, eps).context("post_attn_layernorm")?;
-    let gate = silu(&linear(&xn, &layer.gate_proj)?).context("silu gate")?;
-    let up = linear(&xn, &layer.up_proj)?;
+    let (gate_raw, up) = layer.mlp_inputs.project(&xn)?;
+    let gate = silu(&gate_raw).context("silu gate")?;
     let mlp = linear(
         &ops::multiply(&gate, &up).context("gate*up")?,
         &layer.down_proj,
@@ -1017,6 +1157,123 @@ fn apply_head_norm(
     let x3 = reshape(x, &[seq, n_heads, head_dim]).context("reshape for head_norm")?;
     let x3 = fast::rms_norm(&x3, norm_weight, eps).context("head rms_norm")?;
     reshape(&x3, &[seq, n_heads * head_dim]).context("reshape after head_norm")
+}
+
+#[cfg(feature = "metal")]
+fn merge_quantized_projection_rows(weights: &[&WeightTensor]) -> Result<Option<WeightTensor>> {
+    use mlx_rs::{ops::concatenate_axis, transforms::eval};
+
+    if weights.is_empty() {
+        return Ok(None);
+    }
+
+    let mut ws = Vec::with_capacity(weights.len());
+    let mut scales = Vec::with_capacity(weights.len());
+    let mut biases = Vec::with_capacity(weights.len());
+    let mut expected_w_dtype = None;
+    let mut expected_scales_dtype = None;
+    let mut expected_biases_dtype = None;
+    let mut expected_group_size = None;
+    let mut expected_bits = None;
+    let mut expected_packed_in = None;
+    let mut expected_group_cols = None;
+
+    for weight in weights {
+        let WeightTensor::Quantized {
+            w,
+            scales: scale,
+            biases: bias,
+            group_size,
+            bits,
+        } = weight
+        else {
+            return Ok(None);
+        };
+
+        let packed_in = w
+            .shape()
+            .get(1)
+            .copied()
+            .context("quantized projection missing packed input dimension")?;
+        let group_cols = scale
+            .shape()
+            .get(1)
+            .copied()
+            .context("quantized projection missing scale group dimension")?;
+
+        if let Some(expected) = expected_group_size {
+            if *group_size != expected {
+                return Ok(None);
+            }
+        } else {
+            expected_group_size = Some(*group_size);
+        }
+
+        if let Some(expected) = expected_bits {
+            if *bits != expected {
+                return Ok(None);
+            }
+        } else {
+            expected_bits = Some(*bits);
+        }
+
+        if let Some(expected) = expected_packed_in {
+            if packed_in != expected {
+                return Ok(None);
+            }
+        } else {
+            expected_packed_in = Some(packed_in);
+        }
+
+        if let Some(expected) = expected_group_cols {
+            if group_cols != expected {
+                return Ok(None);
+            }
+        } else {
+            expected_group_cols = Some(group_cols);
+        }
+
+        if let Some(expected) = expected_w_dtype {
+            if w.dtype() != expected {
+                return Ok(None);
+            }
+        } else {
+            expected_w_dtype = Some(w.dtype());
+        }
+
+        if let Some(expected) = expected_scales_dtype {
+            if scale.dtype() != expected {
+                return Ok(None);
+            }
+        } else {
+            expected_scales_dtype = Some(scale.dtype());
+        }
+
+        if let Some(expected) = expected_biases_dtype {
+            if bias.dtype() != expected {
+                return Ok(None);
+            }
+        } else {
+            expected_biases_dtype = Some(bias.dtype());
+        }
+
+        ws.push(w.clone());
+        scales.push(scale.clone());
+        biases.push(bias.clone());
+    }
+
+    let merged_w = concatenate_axis(&ws, 0).context("concat quantized rows")?;
+    let merged_scales = concatenate_axis(&scales, 0).context("concat quantized scales")?;
+    let merged_biases = concatenate_axis(&biases, 0).context("concat quantized biases")?;
+    eval([&merged_w, &merged_scales, &merged_biases]).context("eval merged quantized rows")?;
+
+    Ok(Some(WeightTensor::Quantized {
+        w: merged_w,
+        scales: merged_scales,
+        biases: merged_biases,
+        group_size: expected_group_size.unwrap_or_default(),
+        bits: expected_bits.unwrap_or_default(),
+    }))
 }
 
 // ── Config loading ─────────────────────────────────────────────────────────────
@@ -1215,13 +1472,48 @@ fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<Met
     let mut layers = Vec::with_capacity(n);
     for i in 0..n {
         let p = |s: &str| format!("model.layers.{i}.{s}");
+        let q_proj = load_proj(&p("self_attn.q_proj"))?;
+        let k_proj = load_proj(&p("self_attn.k_proj"))?;
+        let v_proj = load_proj(&p("self_attn.v_proj"))?;
+        let q_dim = q_proj.output_dim()?;
+        let k_dim = k_proj.output_dim()?;
+        let v_dim = v_proj.output_dim()?;
+        let attention_inputs = if let Some(qkv_proj) =
+            merge_quantized_projection_rows(&[&q_proj, &k_proj, &v_proj])?
+        {
+            AttentionInputProjection::MergedQuantized {
+                qkv_proj,
+                q_dim,
+                k_dim,
+                v_dim,
+            }
+        } else {
+            AttentionInputProjection::Split {
+                q_proj,
+                k_proj,
+                v_proj,
+            }
+        };
+
+        let gate_proj = load_proj(&p("mlp.gate_proj"))?;
+        let up_proj = load_proj(&p("mlp.up_proj"))?;
+        let gate_dim = gate_proj.output_dim()?;
+        let up_dim = up_proj.output_dim()?;
+        let mlp_inputs =
+            if let Some(gate_up_proj) = merge_quantized_projection_rows(&[&gate_proj, &up_proj])? {
+                MlpInputProjection::MergedQuantized {
+                    gate_up_proj,
+                    gate_dim,
+                    up_dim,
+                }
+            } else {
+                MlpInputProjection::Split { gate_proj, up_proj }
+            };
+
         layers.push(MetalLayerWeights {
-            q_proj: load_proj(&p("self_attn.q_proj"))?,
-            k_proj: load_proj(&p("self_attn.k_proj"))?,
-            v_proj: load_proj(&p("self_attn.v_proj"))?,
+            attention_inputs,
             o_proj: load_proj(&p("self_attn.o_proj"))?,
-            gate_proj: load_proj(&p("mlp.gate_proj"))?,
-            up_proj: load_proj(&p("mlp.up_proj"))?,
+            mlp_inputs,
             down_proj: load_proj(&p("mlp.down_proj"))?,
             q_norm: get(&p("self_attn.q_norm.weight"))?,
             k_norm: get(&p("self_attn.k_norm.weight"))?,

@@ -74,3 +74,37 @@ Why this is next:
 - the 4-bit path never uses the dense fused C++ block
 - current fallback issues 5 separate quantized projection matmuls per layer
 - collapsing that to 2 matmuls is the smallest likely throughput win without changing model semantics
+
+## Step 2: Merge Quantized Projections In The Metal Fallback
+
+Changes:
+
+- `metal_backend.rs` now models layer input projections explicitly:
+  - attention input projections are either split (`q/k/v`) or merged (`qkv`)
+  - MLP input projections are either split (`gate/up`) or merged (`gate_up`)
+- quantized layer loading now merges compatible rows at load time:
+  - `q_proj + k_proj + v_proj -> qkv_proj`
+  - `gate_proj + up_proj -> gate_up_proj`
+- the quantized Rust fallback now projects once and splits outputs with `split_sections`
+- dense weights and the fused C++ path are unchanged
+
+Benchmark (`mlx-community/Qwen3-0.6B-4bit`, `warmup=1`, `runs=3`, `max_tokens=512`):
+
+| Metric | Before step 2 | After step 2 | Delta |
+| --- | ---: | ---: | ---: |
+| Prompt speed | `~1031.2 tok/s` | `~1426.1 tok/s` | `+38.3%` |
+| Generation speed | `~151.6 tok/s` | `~161.3 tok/s` | `+6.4%` |
+| E2E speed | `~150.5 tok/s` | `~160.6 tok/s` | `+6.7%` |
+| TTFT | `~25.8ms` | `~14.5ms` | `-43.8%` |
+| Total wall | `~3439ms` | `~3355ms` | `-2.5%` |
+
+What this improved:
+
+- the 4-bit decode path now launches fewer quantized matmuls per layer
+- the optimization is isolated to the quantized Metal fallback
+- code structure now matches the intended architecture more closely: merged projections are explicit types, not an implicit future idea
+
+Remaining gap:
+
+- this still trails local `mlx_lm` generation throughput (`~316 tok/s`)
+- benchmark parity can be tightened further by benchmarking exact token-count prompts and ignoring EOS, matching `mlx_lm` more closely
