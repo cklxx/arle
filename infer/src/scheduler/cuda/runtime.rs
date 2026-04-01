@@ -24,9 +24,26 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
 
+            let step_start = std::time::Instant::now();
             self.assign_slots();
+            let assign_us = step_start.elapsed().as_micros();
+
+            let step_t = std::time::Instant::now();
             self.step();
+            let step_us = step_t.elapsed().as_micros();
+
+            let clean_t = std::time::Instant::now();
             self.cleanup();
+            let clean_us = clean_t.elapsed().as_micros();
+
+            let total_us = step_start.elapsed().as_micros();
+            if total_us > 50_000 {
+                // Log slow iterations (>50ms)
+                info!(
+                    "Scheduler step: assign={}us step={}us cleanup={}us total={}us active={}",
+                    assign_us, step_us, clean_us, total_us, self.active.len()
+                );
+            }
         }
     }
 

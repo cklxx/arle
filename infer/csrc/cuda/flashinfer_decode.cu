@@ -190,7 +190,7 @@ extern "C" int flashinfer_batch_decode_run(
 
     cudaError_t err = flashinfer::BatchDecodeWithPagedKVCacheDispatched<
         HEAD_DIM, POS_MODE, Variant, Params>(
-        params, tmp_v, tmp_s, stream);
+        params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
 
     return (int)err;
 }

@@ -7,6 +7,8 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
+        // Phase 1: Flush deferred deltas (CPU tokenizer decode)
+        let emit_t = std::time::Instant::now();
         {
             let Self {
                 active, tokenizer, ..
@@ -19,15 +21,23 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
         }
+        let emit_us = emit_t.elapsed().as_micros();
 
+        // Phase 2: Batched decode (GPU forward pass)
         let has_decode = self
             .active
             .iter()
             .any(|r| matches!(r.phase, Phase::Decoding));
-        if has_decode {
+        let decode_us = if has_decode {
+            let t = std::time::Instant::now();
             self.step_decode_batch();
-        }
+            t.elapsed().as_micros()
+        } else {
+            0
+        };
 
+        // Phase 3: Prefill chunks
+        let prefill_t = std::time::Instant::now();
         let mut did_prefill = true;
         while did_prefill {
             did_prefill = false;
@@ -48,12 +58,23 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
         }
+        let prefill_us = prefill_t.elapsed().as_micros();
 
+        // Phase 4: Accept new requests
         for idx in 0..num {
             if matches!(self.active[idx].phase, Phase::New) {
                 self.step_new(idx);
                 return;
             }
+        }
+
+        // Log slow steps for profiling
+        let total_us = emit_us + decode_us + prefill_us;
+        if total_us > 100_000 {
+            info!(
+                "step breakdown: emit={}us decode={}us prefill={}us total={}us batch={}",
+                emit_us, decode_us, prefill_us, total_us, num
+            );
         }
     }
 }
