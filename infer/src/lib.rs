@@ -1,5 +1,7 @@
 // CUDA-only modules — excluded when `no-cuda` feature is active.
 #[cfg(feature = "cuda")]
+pub mod bootstrap;
+#[cfg(feature = "cuda")]
 mod ffi;
 #[cfg(feature = "cuda")]
 pub(crate) mod flashinfer_metadata;
@@ -18,6 +20,7 @@ pub mod weight_loader;
 pub mod backend;
 pub mod block_manager;
 pub mod chat;
+pub mod chat_protocol;
 pub mod cuda_graph_pool;
 pub mod hf_hub;
 pub mod http_server;

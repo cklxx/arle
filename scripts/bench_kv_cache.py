@@ -90,7 +90,7 @@ class BenchmarkResult:
 
         lines = []
         lines.append("=" * 70)
-        lines.append("KV Cache Benchmark Results (Dynamo + Infer)")
+        lines.append("KV Cache Benchmark Results")
         lines.append("=" * 70)
 
         # Per-conversation stats

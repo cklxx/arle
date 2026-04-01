@@ -1,8 +1,4 @@
 #[cfg(feature = "cuda")]
-use std::fmt;
-#[cfg(feature = "cuda")]
-use std::path::Path;
-#[cfg(feature = "cuda")]
 use std::time::Instant;
 
 use anyhow::Result;
@@ -17,7 +13,9 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[cfg(feature = "cuda")]
-use crate::model::{GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model};
+pub use crate::bootstrap::{EngineOptions, ModelType, detect_model_type, model_id_from_path};
+#[cfg(feature = "cuda")]
+use crate::model::{GenerationState, ModelForward, Qwen3Model, Qwen35Model};
 use crate::sampler::SamplingParams;
 #[cfg(feature = "cuda")]
 use crate::tokenizer::Tokenizer;
@@ -129,60 +127,6 @@ pub trait ServerEngine: Send {
         req: CompleteRequest,
         tx: UnboundedSender<StreamDelta>,
     ) -> Result<()>;
-}
-
-// ============================================================================
-// Model type detection (CUDA-only — requires model weights + GPU)
-// ============================================================================
-
-#[cfg(feature = "cuda")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ModelType {
-    Qwen3,
-    Qwen35,
-}
-
-#[cfg(feature = "cuda")]
-impl fmt::Display for ModelType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Qwen3 => write!(f, "Qwen3"),
-            Self::Qwen35 => write!(f, "Qwen3.5"),
-        }
-    }
-}
-
-/// Detect model type from config.json.
-#[cfg(feature = "cuda")]
-pub fn detect_model_type(model_path: &str) -> Result<ModelType> {
-    let config_path = format!("{}/config.json", model_path);
-    let content = std::fs::read_to_string(&config_path)?;
-    let json: serde_json::Value = serde_json::from_str(&content)?;
-
-    if json.get("text_config").is_some() {
-        return Ok(ModelType::Qwen35);
-    }
-
-    Ok(ModelType::Qwen3)
-}
-
-// ============================================================================
-// Engine options
-// ============================================================================
-
-#[cfg(feature = "cuda")]
-#[derive(Clone, Copy, Debug)]
-pub struct EngineOptions {
-    pub enable_cuda_graph: bool,
-}
-
-#[cfg(feature = "cuda")]
-impl Default for EngineOptions {
-    fn default() -> Self {
-        Self {
-            enable_cuda_graph: true,
-        }
-    }
 }
 
 // ============================================================================
@@ -383,6 +327,27 @@ pub struct GenericServerEngine<M: ModelForward> {
 
 #[cfg(feature = "cuda")]
 impl<M: ModelForward> GenericServerEngine<M> {
+    fn from_model_components(
+        components: crate::bootstrap::ModelComponents<M>,
+        seed: u64,
+    ) -> Result<Self> {
+        let crate::bootstrap::ModelComponents {
+            model_id,
+            tokenizer,
+            model,
+        } = components;
+        let state = model.create_state()?;
+        let rng = StdRng::seed_from_u64(seed);
+        Ok(Self {
+            model_id,
+            model,
+            state,
+            tokenizer,
+            rng,
+            cached_prompt: Vec::new(),
+        })
+    }
+
     /// Set the maximum KV cache tokens to keep on GPU.
     /// Tokens beyond this are offloaded to CPU. Used to simulate memory pressure.
     pub fn set_max_gpu_kv(&mut self, max_tokens: usize) {
@@ -643,15 +608,6 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
 // ============================================================================
 
 #[cfg(feature = "cuda")]
-pub fn model_id_from_path(model_path: &str) -> String {
-    Path::new(model_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(model_path)
-        .to_string()
-}
-
-#[cfg(feature = "cuda")]
 pub type RealServerEngine = GenericServerEngine<Qwen3Model>;
 #[cfg(feature = "cuda")]
 pub type Qwen35ServerEngine = GenericServerEngine<Qwen35Model>;
@@ -663,23 +619,8 @@ impl RealServerEngine {
     }
 
     pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
-        let tokenizer = Tokenizer::from_file(model_path)?;
-        let model = Qwen3Model::from_safetensors_with_runtime(
-            model_path,
-            ModelRuntimeConfig {
-                enable_cuda_graph: options.enable_cuda_graph,
-            },
-        )?;
-        let state = model.create_state()?;
-        let rng = StdRng::seed_from_u64(seed);
-        Ok(Self {
-            model_id: model_id_from_path(model_path),
-            model,
-            state,
-            tokenizer,
-            rng,
-            cached_prompt: Vec::new(),
-        })
+        let components = crate::bootstrap::load_qwen3_components(model_path, options)?;
+        Self::from_model_components(components, seed)
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -690,19 +631,8 @@ impl RealServerEngine {
 #[cfg(feature = "cuda")]
 impl Qwen35ServerEngine {
     pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
-        let tokenizer = Tokenizer::from_file(model_path)?;
-        let model =
-            Qwen35Model::from_safetensors_with_options(model_path, options.enable_cuda_graph)?;
-        let state = model.create_state()?;
-        let rng = StdRng::seed_from_u64(seed);
-        Ok(Self {
-            model_id: model_id_from_path(model_path),
-            model,
-            state,
-            tokenizer,
-            rng,
-            cached_prompt: Vec::new(),
-        })
+        let components = crate::bootstrap::load_qwen35_components(model_path, options)?;
+        Self::from_model_components(components, seed)
     }
 
     pub fn vocab_size(&self) -> usize {

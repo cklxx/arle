@@ -120,9 +120,6 @@ cargo build --release
 # Build with CUDA
 CUDA_HOME=/usr/local/cuda cargo build --release
 
-# Build with Dynamo integration
-cargo build --release --features dynamo
-
 # All tests
 cargo test --workspace
 
@@ -180,7 +177,6 @@ agent-infer/          ← top-level Cargo workspace
 │   │   └── server_engine.rs ← Single-request inference façade
 │   ├── csrc/            ← CUDA C kernels
 │   └── tools/triton/    ← Triton Python kernels (AOT compiled)
-├── dynamo/           ← Dynamo distributed runtime (submodule)
 └── scripts/          ← Benchmark + utility scripts
 ```
 
@@ -248,7 +244,6 @@ FFI bindings are declared in `infer/src/ffi.rs`.
 | Tensor parallel config + sharding math | ✅ (CPU, NCCL stubs) |
 | Rust agent binary (tool calling) | ✅ |
 | Python agent (async HTTP) | ✅ |
-| Dynamo distributed runtime integration | ✅ (optional feature) |
 | FlashInfer batched decode attention | ✅ |
 | Batched GEMM decode (multi-request) | ✅ |
 | CUDA Graph for batched decode | ✅ |

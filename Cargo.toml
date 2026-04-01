@@ -7,15 +7,12 @@ edition = "2024"
 # Enable CUDA (mirrors infer's cuda feature). Default on, like infer.
 default = ["cuda"]
 cuda = ["infer/cuda"]
-dynamo = ["dep:dynamo-runtime", "dep:tokio"]
 # Marker feature for CPU-only builds (CI, macOS). Pass --no-default-features --features no-cuda.
 no-cuda = ["infer/no-cuda"]
 # Metal backend via mlx-rs (Apple Silicon). Use with --no-default-features --features metal,no-cuda.
 metal = ["infer/metal"]
 
 [dependencies]
-dynamo-runtime = { path = "dynamo/lib/runtime", optional = true }
-tokio = { version = "1", features = ["full"], optional = true }
 infer = { path = "infer", default-features = false }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -24,4 +21,3 @@ clap = { version = "4", features = ["derive"] }
 log = "0.4"
 logforth = { version = "0.29", features = ["starter-log", "layout-text"] }
 rand = "0.10"
-regex = "1"

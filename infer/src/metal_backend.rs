@@ -318,12 +318,11 @@ fn metal_generate(
     t0: Instant,
 ) -> Result<Vec<u32>> {
     use mlx_rs::{
-        fast,
+        StreamOrDevice, fast,
         nn::silu,
-        ops::indexing::{take_axis, TryIndexMutOp, TryIndexOp},
+        ops::indexing::{TryIndexMutOp, TryIndexOp, take_axis},
         ops::{self, reshape, transpose_axes, zeros_dtype_device},
         transforms::eval,
-        StreamOrDevice,
     };
 
     let n_layers = config.num_hidden_layers;
@@ -502,7 +501,13 @@ fn linear(x: &Array, weight: &WeightTensor) -> Result<Array> {
             let w_t = transpose(w).context("weight transpose")?;
             mlx_rs::ops::matmul(x, &w_t).context("matmul")
         }
-        WeightTensor::Quantized { w, scales, biases, group_size, bits } => {
+        WeightTensor::Quantized {
+            w,
+            scales,
+            biases,
+            group_size,
+            bits,
+        } => {
             // w stored as [out, in] packed uint32; transpose=true → x @ w.T
             mlx_rs::ops::quantized_matmul(
                 x,
@@ -652,17 +657,19 @@ fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         group_size: q
             .get("group_size")
             .and_then(serde_json::Value::as_i64)
-            .map(|n| n as i32)
-            .unwrap_or(64),
+            .map_or(64, |n| n as i32),
         bits: q
             .get("bits")
             .and_then(serde_json::Value::as_i64)
-            .map(|n| n as i32)
-            .unwrap_or(4),
+            .map_or(4, |n| n as i32),
     });
 
     if let Some(qc) = quantization {
-        log::info!("  quantization: {} bits, group_size={}", qc.bits, qc.group_size);
+        log::info!(
+            "  quantization: {} bits, group_size={}",
+            qc.bits,
+            qc.group_size
+        );
     }
 
     let hidden_size = get_usize("hidden_size", 2048);
@@ -785,12 +792,13 @@ fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<Met
     let norm = get("model.norm.weight")?;
 
     // lm_head may be weight-tied to embed_tokens; handle both dense and quantized.
-    let lm_head = if tensors.contains_key("lm_head.weight") || tensors.contains_key("lm_head.scales") {
-        load_proj("lm_head")?
-    } else {
-        // Weight-tied: share the (already-dequantized) embed_tokens matrix
-        WeightTensor::Dense(embed_tokens.clone())
-    };
+    let lm_head =
+        if tensors.contains_key("lm_head.weight") || tensors.contains_key("lm_head.scales") {
+            load_proj("lm_head")?
+        } else {
+            // Weight-tied: share the (already-dequantized) embed_tokens matrix
+            WeightTensor::Dense(embed_tokens.clone())
+        };
 
     let n = config.num_hidden_layers;
     let mut layers = Vec::with_capacity(n);
@@ -856,7 +864,10 @@ mod tests {
 
         let prompt = "<|im_start|>user\nWrite a short poem about systems programming.\
                       <|im_end|>\n<|im_start|>assistant\n";
-        let params = SamplingParams { temperature: 0.0, ..Default::default() };
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
 
         // Warm-up pass (fills KV cache, JIT compiles Metal kernels)
         let _ = backend.generate(prompt, &params).expect("warmup");
@@ -871,10 +882,16 @@ mod tests {
         println!("Tokens out: {}", result.completion_tokens);
         println!("Elapsed:    {elapsed:.2}s");
         println!("Throughput: {:.1} tok/s", result.generation_tps);
-        println!("Output:     {:?}", &result.text[..result.text.len().min(200)]);
+        println!(
+            "Output:     {:?}",
+            &result.text[..result.text.len().min(200)]
+        );
         println!("=================={}===\n", "=".repeat(label.len()));
 
-        assert!(result.completion_tokens > 0, "should generate at least one token");
+        assert!(
+            result.completion_tokens > 0,
+            "should generate at least one token"
+        );
     }
 
     /// Throughput benchmark for a 4-bit quantized MLX model.
@@ -886,8 +903,8 @@ mod tests {
     #[test]
     #[ignore = "requires Metal GPU + model weights at models/Qwen3-0.6B-4bit"]
     fn bench_4bit() {
-        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("models/Qwen3-0.6B-4bit");
+        let model_dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/Qwen3-0.6B-4bit");
         run_bench(&model_dir, "Qwen3-0.6B 4-bit");
     }
 
@@ -900,8 +917,8 @@ mod tests {
     #[test]
     #[ignore = "requires Metal GPU + model weights at models/Qwen3-0.6B-bf16"]
     fn bench_bf16() {
-        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("models/Qwen3-0.6B-bf16");
+        let model_dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/Qwen3-0.6B-bf16");
         run_bench(&model_dir, "Qwen3-0.6B BF16");
     }
 }

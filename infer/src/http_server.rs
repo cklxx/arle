@@ -372,16 +372,15 @@ mod tests {
     use tower::util::ServiceExt;
 
     fn mock_scheduler(model_id: &str) -> SchedulerHandle {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<IncomingRequest>();
-
-        tokio::spawn(async move {
-            while let Some(req) = rx.recv().await {
-                let _ = req.delta_tx.send(StreamDelta {
-                    text_delta: format!("ok:{}", req.prompt),
+        mock_scheduler_with_deltas(
+            model_id,
+            vec![
+                StreamDelta {
+                    text_delta: String::new(),
                     finish_reason: None,
                     usage: None,
-                });
-                let _ = req.delta_tx.send(StreamDelta {
+                },
+                StreamDelta {
                     text_delta: String::new(),
                     finish_reason: Some(FinishReason::Stop),
                     usage: Some(Usage {
@@ -389,11 +388,38 @@ mod tests {
                         completion_tokens: 1,
                         total_tokens: 2,
                     }),
-                });
+                },
+            ],
+            true,
+        )
+    }
+
+    fn mock_scheduler_with_deltas(
+        model_id: &str,
+        deltas: Vec<StreamDelta>,
+        prefix_prompt_on_first_delta: bool,
+    ) -> SchedulerHandle {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<IncomingRequest>();
+        let model_id = model_id.to_string();
+
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                for (index, delta) in deltas.iter().enumerate() {
+                    let text_delta = if prefix_prompt_on_first_delta && index == 0 {
+                        format!("ok:{}{}", req.prompt, delta.text_delta)
+                    } else {
+                        delta.text_delta.clone()
+                    };
+                    let _ = req.delta_tx.send(StreamDelta {
+                        text_delta,
+                        finish_reason: delta.finish_reason,
+                        usage: delta.usage,
+                    });
+                }
             }
         });
 
-        SchedulerHandle::from_parts(tx, model_id)
+        SchedulerHandle::from_parts(tx, &model_id)
     }
 
     #[tokio::test]
@@ -632,6 +658,57 @@ mod tests {
         assert!(
             payload.contains(r#""prompt_tokens":1"#),
             "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_returns_structured_tool_calls() {
+        let app = build_app(mock_scheduler_with_deltas(
+            "Qwen3-4B",
+            vec![
+                StreamDelta {
+                    text_delta:
+                        "\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>"
+                            .to_string(),
+                    finish_reason: None,
+                    usage: None,
+                },
+                StreamDelta {
+                    text_delta: String::new(),
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: Some(Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                    }),
+                },
+            ],
+            false,
+        ));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(payload["choices"][0]["finish_reason"], "tool_calls");
+        assert!(payload["choices"][0]["message"]["content"].is_null());
+        assert_eq!(
+            payload["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "shell"
+        );
+        assert_eq!(
+            payload["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            serde_json::json!({"command":"pwd"}).to_string()
         );
     }
 }

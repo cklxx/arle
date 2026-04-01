@@ -1,0 +1,170 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use anyhow::Result;
+use tokio::sync::mpsc;
+
+use crate::sampler::SamplingParams;
+use crate::server_engine::StreamDelta;
+
+/// Preemption strategy when GPU memory is exhausted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum PreemptionMode {
+    /// Evict request KV cache and recompute from scratch when resumed.
+    /// Cheaper in GPU memory, more expensive when rescheduled.
+    #[default]
+    Recompute,
+    /// Swap KV cache to CPU memory and swap back in when resumed.
+    /// Preserves decoded state at the cost of CPU memory.
+    Swap,
+}
+
+/// Scheduler configuration.
+#[derive(Clone, Debug)]
+pub struct SchedulerConfig {
+    /// Maximum number of concurrently active request slots.
+    pub max_slots: usize,
+    /// Chunked prefill chunk size (tokens per prefill step).
+    pub prefill_chunk_size: usize,
+    /// Maximum requests allowed in the waiting queue.
+    /// `submit()` returns `Err(SchedulerFull)` when the queue is at capacity.
+    pub max_waiting_requests: usize,
+    /// Strategy to use when a running request must be preempted.
+    pub preemption_mode: PreemptionMode,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            max_slots: 4,
+            prefill_chunk_size: 512,
+            max_waiting_requests: 256,
+            preemption_mode: PreemptionMode::Recompute,
+        }
+    }
+}
+
+impl SchedulerConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.max_slots == 0 {
+            anyhow::bail!("max_slots must be ≥ 1");
+        }
+        if self.prefill_chunk_size == 0 {
+            anyhow::bail!("prefill_chunk_size must be ≥ 1");
+        }
+        Ok(())
+    }
+}
+
+/// Request priority level. Higher-priority requests are scheduled first
+/// when multiple requests are waiting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]
+pub enum RequestPriority {
+    /// Below-normal priority (background batch jobs).
+    Low = 0,
+    /// Standard priority (default for API requests).
+    #[default]
+    Normal = 1,
+    /// Above-normal priority (interactive / SLA-sensitive requests).
+    High = 2,
+}
+
+/// Request sent from HTTP handler to scheduler.
+pub struct IncomingRequest {
+    pub prompt: String,
+    pub max_tokens: usize,
+    pub sampling: SamplingParams,
+    pub stop: Option<Vec<String>>,
+    /// Scheduling priority. Higher-priority requests are served first.
+    pub priority: RequestPriority,
+    /// Channel to send streaming deltas back to the HTTP handler.
+    pub delta_tx: mpsc::UnboundedSender<StreamDelta>,
+}
+
+/// Error returned when the scheduler's waiting queue is full.
+#[derive(Debug)]
+pub struct SchedulerFull;
+
+impl std::fmt::Display for SchedulerFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "scheduler waiting queue is full")
+    }
+}
+
+impl std::error::Error for SchedulerFull {}
+
+/// Handle for submitting requests to the scheduler. Cloneable and Send.
+#[derive(Clone)]
+pub struct SchedulerHandle {
+    tx: mpsc::UnboundedSender<IncomingRequest>,
+    model_id: Arc<str>,
+    /// Shared count of items currently in the waiting channel.
+    waiting_count: Arc<AtomicUsize>,
+    /// Maximum allowed waiting requests (0 = unlimited).
+    max_waiting: usize,
+}
+
+impl SchedulerHandle {
+    /// Create a handle from raw parts (useful for testing).
+    pub fn from_parts(tx: mpsc::UnboundedSender<IncomingRequest>, model_id: &str) -> Self {
+        Self {
+            tx,
+            model_id: Arc::from(model_id),
+            waiting_count: Arc::new(AtomicUsize::new(0)),
+            max_waiting: 0,
+        }
+    }
+
+    /// Create a handle with a maximum waiting queue size.
+    pub fn with_max_waiting(
+        tx: mpsc::UnboundedSender<IncomingRequest>,
+        model_id: &str,
+        max_waiting: usize,
+    ) -> Self {
+        Self {
+            tx,
+            model_id: Arc::from(model_id),
+            waiting_count: Arc::new(AtomicUsize::new(0)),
+            max_waiting,
+        }
+    }
+
+    /// Submit a request to the scheduler.
+    ///
+    /// Returns `Ok(())` on success.
+    /// Returns `Err(SchedulerFull)` if the waiting queue is at capacity.
+    /// Returns `Err(SchedulerFull)` if the scheduler has shut down.
+    pub fn submit(&self, req: IncomingRequest) -> std::result::Result<(), SchedulerFull> {
+        if self.max_waiting > 0 {
+            let current = self.waiting_count.load(Ordering::Relaxed);
+            if current >= self.max_waiting {
+                return Err(SchedulerFull);
+            }
+        }
+        self.waiting_count.fetch_add(1, Ordering::Relaxed);
+        self.tx.send(req).map_err(|_| {
+            self.waiting_count.fetch_sub(1, Ordering::Relaxed);
+            SchedulerFull
+        })
+    }
+
+    /// Decrement the waiting count (called by the scheduler when it consumes a request).
+    pub fn consume_one(&self) {
+        self.waiting_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Current number of requests in the waiting channel.
+    pub fn waiting_count(&self) -> usize {
+        self.waiting_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the model identifier string for this scheduler.
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    /// Whether the queue is currently full.
+    pub fn is_full(&self) -> bool {
+        self.max_waiting > 0 && self.waiting_count() >= self.max_waiting
+    }
+}
