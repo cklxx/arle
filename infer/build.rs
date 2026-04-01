@@ -907,8 +907,8 @@ fn main() {
         nvcc_args.extend(arch_args.clone());
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
 
-        // FlashInfer headers for flashinfer_decode.cu and flashinfer_prefill.cu
-        if stem == "flashinfer_decode" || stem == "flashinfer_prefill" {
+        // FlashInfer headers for flashinfer_*.cu files
+        if stem.starts_with("flashinfer_") {
             let fi_include = find_flashinfer_include();
             if let Some(ref inc) = fi_include {
                 nvcc_args.extend([

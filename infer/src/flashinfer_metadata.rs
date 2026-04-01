@@ -21,6 +21,8 @@ pub(crate) struct FlashInferDecodeMetadata {
     pub kv_indices: CudaSlice<i32>,
     pub kv_indptr: CudaSlice<i32>,
     pub kv_last_page_len: CudaSlice<i32>,
+    /// Q indptr for tensor-core decode: [0, 1, 2, ..., B] (1 token per request).
+    pub q_indptr: CudaSlice<i32>,
     pub flashinfer_ws: FlashInferWorkspace,
     pub max_total_pages: usize,
     /// Total tokens in kv_indices from previous step (for incremental update).
@@ -33,6 +35,8 @@ pub(crate) struct FlashInferDecodeMetadata {
     indices_scratch: Vec<i32>,
     /// Cached host-side indptr from last `update()`, reused by `plan()`.
     indptr_h: Vec<i32>,
+    /// Host-side q_indptr for TC decode: [0, 1, 2, ..., max_batch_size].
+    qo_indptr_h: Vec<i32>,
     /// Batch size from last successful plan (for plan caching).
     plan_batch_size: usize,
     /// Whether the plan needs to be re-run (batch composition changed).
@@ -48,6 +52,16 @@ impl FlashInferDecodeMetadata {
         max_total_pages: usize,
         num_qheads: usize,
     ) -> Result<Self> {
+        // Pre-build q_indptr for TC decode: [0, 1, 2, ..., max_batch_size]
+        let qo_indptr_h: Vec<i32> = (0..=(max_batch_size as i32)).collect();
+        let mut q_indptr: CudaSlice<i32> = ctx
+            .stream
+            .alloc_zeros(max_batch_size + 1)
+            .map_err(|e| anyhow::anyhow!("Alloc q_indptr failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&qo_indptr_h, &mut q_indptr)
+            .map_err(|e| anyhow::anyhow!("H2D q_indptr: {e}"))?;
+
         Ok(Self {
             positions: ctx
                 .stream
@@ -65,6 +79,7 @@ impl FlashInferDecodeMetadata {
                 .stream
                 .alloc_zeros(max_batch_size)
                 .map_err(|e| anyhow::anyhow!("Alloc kv_last_page_len failed: {e}"))?,
+            q_indptr,
             flashinfer_ws: FlashInferWorkspace::new(ctx, max_batch_size, num_qheads)?,
             max_total_pages,
             prev_total_tokens: 0,
@@ -72,6 +87,7 @@ impl FlashInferDecodeMetadata {
             positions_scratch: Vec::with_capacity(max_batch_size),
             indices_scratch: Vec::with_capacity(max_batch_size),
             indptr_h: Vec::with_capacity(max_batch_size + 1),
+            qo_indptr_h,
             plan_batch_size: 0,
             plan_dirty: true,
         })
@@ -196,6 +212,38 @@ impl FlashInferDecodeMetadata {
         }
         ops::flashinfer_plan(
             ctx,
+            &self.indptr_h,
+            &mut self.flashinfer_ws,
+            batch_size,
+            num_heads,
+            num_kv_heads,
+            page_size,
+            head_dim,
+        )?;
+        self.plan_batch_size = batch_size;
+        self.plan_dirty = false;
+        Ok(())
+    }
+
+    /// Tensor-core decode plan (uses PrefillPlan for flat ITL at long contexts).
+    ///
+    /// For GQA group_size >= 4, this provides better performance than the standard
+    /// decode kernel by tiling across KV chunks with tensor cores.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tc_plan(
+        &mut self,
+        ctx: &DeviceContext,
+        batch_size: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        page_size: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        // TC decode always re-plans (PrefillPlan depends on KV lengths for split-KV).
+        let qo_indptr = &self.qo_indptr_h[..batch_size + 1];
+        ops::flashinfer_tc_plan(
+            ctx,
+            qo_indptr,
             &self.indptr_h,
             &mut self.flashinfer_ws,
             batch_size,
