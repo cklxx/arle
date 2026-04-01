@@ -95,6 +95,11 @@ rest_pat_in_fully_bound_structs = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 unreachable_pub = "warn"
 
+[[bin]]
+name = "metal_bench"
+path = "src/bin/metal_bench.rs"
+required-features = ["metal"]
+
 [[bench]]
 name = "tokenizer_bench"
 harness = false
