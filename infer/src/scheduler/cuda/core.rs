@@ -187,7 +187,7 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     /// Pre-capture CUDA Graphs for batched decode at common batch sizes.
-    fn warmup_cuda_graphs(&mut self) {
+    pub(super) fn warmup_cuda_graphs(&mut self) {
         let num_slots = self.states.len();
         if num_slots < 2 || self.paged_kv_pool.k_buffers.is_empty() {
             return;

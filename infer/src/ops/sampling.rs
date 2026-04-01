@@ -144,19 +144,21 @@ unsafe fn launch_sample_kernel_inner(
     stream: CUstream,
 ) {
     if params.is_greedy() {
-        ffi::argmax_cuda(logits_ptr, out_ptr, logits_len, stream);
+        unsafe { ffi::argmax_cuda(logits_ptr, out_ptr, logits_len, stream) };
     } else {
-        ffi::gpu_sample_cuda(
-            logits_ptr,
-            probs_ptr,
-            out_ptr,
-            logits_len,
-            1.0 / params.temperature,
-            params.top_k,
-            params.top_p,
-            random_val,
-            stream,
-        );
+        unsafe {
+            ffi::gpu_sample_cuda(
+                logits_ptr,
+                probs_ptr,
+                out_ptr,
+                logits_len,
+                1.0 / params.temperature,
+                params.top_k,
+                params.top_p,
+                random_val,
+                stream,
+            )
+        };
     }
 }
 

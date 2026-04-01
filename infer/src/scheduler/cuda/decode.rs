@@ -2,7 +2,7 @@ use super::*;
 
 impl<M: ModelForward> Scheduler<M> {
     /// Batch all decode requests into a single GPU forward pass.
-    fn step_decode_batch(&mut self) {
+    pub(super) fn step_decode_batch(&mut self) {
         let Self {
             model,
             tokenizer,
