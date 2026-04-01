@@ -25,8 +25,8 @@ mod runtime;
 pub use core::Scheduler;
 pub(super) use request::{ActiveRequest, Phase, StopCheckResult, check_stop_sequences};
 
-pub(super) const PREFILL_CHUNK_SIZE: usize = 512;
+pub(super) const PREFILL_CHUNK_SIZE: usize = 4096;
 /// Smaller chunk when decode is active, to avoid blocking decode latency.
-pub(super) const PREFILL_CHUNK_SIZE_WITH_DECODE: usize = 64;
+pub(super) const PREFILL_CHUNK_SIZE_WITH_DECODE: usize = 512;
 /// Interval (in completed requests) at which stats are logged.
 pub(super) const STATS_LOG_INTERVAL: u64 = 10;
