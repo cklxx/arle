@@ -2,7 +2,7 @@
 
 ## Context
 At 8-concurrent decode (Qwen3-4B, A100-40GB), agent-infer achieved 811 tok/s
-vs SGLang's 898 tok/s (0.90x). Used nsys to profile both systems side-by-side
+vs SGLang v0.5.9's 886 tok/s (0.92x). Used nsys to profile both systems side-by-side
 to find the exact source of the remaining 10% gap.
 
 ## What Worked

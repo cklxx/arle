@@ -1,7 +1,7 @@
 # 2026-03-31 - Throughput Profiling: Decode ITL is the Bottleneck
 
 ## Context
-At C=8 with Qwen3-4B on A100-40GB, agent-infer achieved 786 tok/s vs SGLang's 898 tok/s (0.88x).
+At C=8 with Qwen3-4B on A100-40GB, agent-infer achieved 786 tok/s vs SGLang v0.5.9's 886 tok/s (0.89x).
 Profiled the scheduler loop to find the gap.
 
 ## What Worked
