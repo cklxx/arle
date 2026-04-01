@@ -225,6 +225,35 @@ impl FlashInferDecodeMetadata {
         Ok(())
     }
 
+    /// HD256 decode plan (Qwen3.5 full attention, head_dim=256).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_hd256(
+        &mut self,
+        ctx: &DeviceContext,
+        batch_size: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        page_size: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        if !self.plan_dirty && self.plan_batch_size == batch_size {
+            return Ok(());
+        }
+        ops::flashinfer_plan_hd256(
+            ctx,
+            &self.indptr_h,
+            &mut self.flashinfer_ws,
+            batch_size,
+            num_heads,
+            num_kv_heads,
+            page_size,
+            head_dim,
+        )?;
+        self.plan_batch_size = batch_size;
+        self.plan_dirty = false;
+        Ok(())
+    }
+
     /// Tensor-core decode plan (uses PrefillPlan for flat ITL at long contexts).
     ///
     /// For GQA group_size >= 4, this provides better performance than the standard

@@ -23,6 +23,8 @@ pub(crate) struct DecodeBuffers35 {
     pub(crate) sample_out: CudaSlice<i32>,
     /// Cached raw device pointers for hot-path sampling ops.
     pub(crate) ptrs: DecodeBufferPtrs35,
+    /// Per-slot logits buffer for batched decode logit scatter.
+    pub(crate) logits_scratch: DeviceVec,
 }
 
 impl DecodeBuffers35 {
@@ -47,10 +49,13 @@ impl DecodeBuffers35 {
             sample_out_ptr: crate::tensor::cache_ptr(&sample_out, ctx),
         };
 
+        let logits_scratch = DeviceVec::zeros(ctx, config.vocab_size)?;
+
         Ok(Self {
             sample_probs,
             sample_out,
             ptrs,
+            logits_scratch,
         })
     }
 }
