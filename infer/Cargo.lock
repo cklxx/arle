@@ -1441,6 +1441,7 @@ dependencies = [
  "logforth",
  "memmap2",
  "mlx-rs",
+ "mlx-sys",
  "ndarray",
  "rand 0.10.0",
  "safetensors",

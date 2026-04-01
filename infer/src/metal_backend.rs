@@ -42,6 +42,66 @@ use crate::{
 #[cfg(feature = "metal")]
 use mlx_rs::Array;
 
+// ── Metal C++ fused-ops FFI (compiled from csrc/metal_fused_ops.cpp) ─────────
+//
+// The C ABI uses `mlx_array` (= `{ ctx: *mut c_void }`) by value.  In mlx-rs,
+// `Array` is `#[repr(transparent)]` over `mlx_sys::mlx_array`, so we can pass
+// `Array` directly across the FFI boundary.
+//
+// Ownership rule: input arrays are borrowed (C++ holds no extra reference).
+// Output arrays (`*mut mlx_sys::mlx_array` written by C++) transfer ownership
+// to Rust — they must eventually be freed via `mlx_array_free` (happens
+// automatically when the mlx-rs `Array` wrapper is dropped).
+#[cfg(feature = "metal")]
+mod metal_ffi {
+    use mlx_sys::mlx_array;
+
+    unsafe extern "C" {
+        /// Full transformer block: norm → QKV → RoPE → KV-cache → GQA →
+        /// residual → norm → SwiGLU MLP → residual.
+        ///
+        /// All Dense weights are pre-transposed (`[in, out]`).
+        /// `k_cache_h / v_cache_h` are updated in-place via slice_update.
+        /// Writes a new hidden-state array into `*result_out`.
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn metal_fused_block_cached(
+            x: mlx_array,
+            input_norm_w: mlx_array,
+            post_attn_norm_w: mlx_array,
+            q_proj_t: mlx_array,
+            k_proj_t: mlx_array,
+            v_proj_t: mlx_array,
+            o_proj_t: mlx_array,
+            q_norm_w: mlx_array,
+            k_norm_w: mlx_array,
+            gate_proj_t: mlx_array,
+            up_proj_t: mlx_array,
+            down_proj_t: mlx_array,
+            n_heads: i32,
+            n_kv_heads: i32,
+            head_dim: i32,
+            attn_scale: f32,
+            rope_base: f32,
+            rope_dims: i32,
+            norm_eps: f32,
+            k_cache: *mut mlx_array,
+            v_cache: *mut mlx_array,
+            cache_len: i32,
+            seq: i32,
+            result_out: *mut mlx_array,
+        );
+
+        /// Schedule async GPU evaluation of `arr` without blocking the CPU.
+        pub(super) fn metal_async_eval(arr: mlx_array);
+
+        /// GPU argmax over last axis of `logits`.  Returns scalar int32 array.
+        pub(super) fn metal_argmax(logits: mlx_array) -> mlx_array;
+
+        /// GPU categorical sample from temperature-scaled logits.  Returns scalar int32 array.
+        pub(super) fn metal_categorical_sample(scaled_logits: mlx_array) -> mlx_array;
+    }
+}
+
 /// Apple Silicon Metal inference backend.
 ///
 /// One instance per process; weights are loaded once and kept resident in
@@ -95,9 +155,14 @@ pub struct MetalModelConfig {
 /// - `w`: packed uint32 — shape `[out, in / (32/bits)]`
 /// - `scales`: f16/bf16 — shape `[out, in / group_size]`
 /// - `biases`: f16/bf16 — shape `[out, in / group_size]`
+///
+/// `Dense(w_t)` stores the **transposed** weight `w.T` — shape `[in, out]`.
+/// Pre-transposed at load time so `linear()` calls `matmul(x, w_t)` directly,
+/// eliminating one `transpose()` view creation per forward-pass call.
 // GPU required: Array is backed by Metal buffers.
 #[cfg(feature = "metal")]
 pub enum WeightTensor {
+    /// Pre-transposed weight: shape [in, out] = w.T. Ready for `x @ w_t`.
     Dense(Array),
     Quantized {
         w: Array,
@@ -267,6 +332,7 @@ impl InferenceBackend for MetalBackend {
             let gen_tps = generated.len() as f64 / elapsed.max(1e-9);
 
             let text = tokenizer.decode(&generated)?;
+            #[allow(clippy::needless_return)]
             return Ok(GenerateResult {
                 text,
                 prompt_tokens,
@@ -307,6 +373,15 @@ impl InferenceBackend for MetalBackend {
 /// 6. GQA via `fast::scaled_dot_product_attention`
 /// 7. `x = residual + attn_out @ o_proj.T`
 /// 8. `x = x + silu(x_norm @ gate.T) * (x_norm @ up.T) @ down.T`
+///
+/// Optimisations applied:
+/// - **P1**: Dense weights are pre-transposed at load time (no per-step transpose).
+/// - **P2**: Full transformer block is one C++ FFI call (`metal_fused_block_cached`),
+///           eliminating ~40 mlx-rs round-trips per layer.  Falls back to the
+///           Rust path for quantized models (quantized_matmul not fused yet).
+/// - **P3**: async_eval double-buffering: GPU computes step N+1 while CPU reads
+///           the token from step N.
+/// - **P4**: argmax / categorical sampling stays on GPU (no 152 K float transfer).
 // GPU required: all tensor operations use mlx-rs Arrays on Metal unified memory.
 #[cfg(feature = "metal")]
 fn metal_generate(
@@ -318,10 +393,9 @@ fn metal_generate(
     t0: Instant,
 ) -> Result<Vec<u32>> {
     use mlx_rs::{
-        StreamOrDevice, fast,
-        nn::silu,
-        ops::indexing::{TryIndexMutOp, TryIndexOp, take_axis},
-        ops::{self, reshape, transpose_axes, zeros_dtype_device},
+        fast,
+        ops::indexing::take_axis,
+        ops::zeros_dtype_device,
         transforms::eval,
     };
 
@@ -333,6 +407,11 @@ fn metal_generate(
     let rope_base = config.rope_theta as f32;
     let eos_id = config.eos_token_id;
     let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    // P2: use fused C++ block only for Dense (non-quantized) models.
+    let use_fused = weights.layers.iter().all(|l| {
+        matches!(l.q_proj, WeightTensor::Dense(_))
+    });
 
     // Pre-allocate KV cache: [1, n_kv_heads, max_seq_len, head_dim].
     // Allocated once; each step writes via slice_update instead of concatenate,
@@ -358,110 +437,96 @@ fn metal_generate(
 
     loop {
         let seq = current_ids.len() as i32;
+        let is_prefill = seq > 1;
 
         // ── Embedding lookup ─────────────────────────────────────────────────
-        // Wrap token IDs into a 1-D int32 Array and do a row-gather on the table.
         let idx_i32: Vec<i32> = current_ids.iter().map(|&t| t as i32).collect();
         let idx_arr = Array::from_slice(&idx_i32, &[seq]);
-        // embed: [seq, hidden]
         let mut x = take_axis(&weights.embed_tokens, &idx_arr, 0).context("embedding take_axis")?;
 
         // ── Transformer layers ────────────────────────────────────────────────
-        for (li, layer) in weights.layers.iter().enumerate() {
-            // 1. Input norm + residual
-            let residual = x.clone();
-            x = fast::rms_norm(&x, &layer.input_layernorm, eps).context("input_layernorm")?;
+        if use_fused {
+            // P2: one C++ FFI call per layer instead of ~40 mlx-rs calls.
+            for (li, layer) in weights.layers.iter().enumerate() {
+                let (q_t, k_t, v_t, o_t) = match (
+                    &layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj,
+                ) {
+                    (WeightTensor::Dense(q), WeightTensor::Dense(k),
+                     WeightTensor::Dense(v), WeightTensor::Dense(o)) => (q, k, v, o),
+                    _ => unreachable!("use_fused only when all layers are Dense"),
+                };
+                let (gate_t, up_t, down_t) = match (
+                    &layer.gate_proj, &layer.up_proj, &layer.down_proj,
+                ) {
+                    (WeightTensor::Dense(g), WeightTensor::Dense(u), WeightTensor::Dense(d)) => (g, u, d),
+                    _ => unreachable!("use_fused only when all layers are Dense"),
+                };
 
-            // 2. QKV projections  [seq, n_heads*head_dim], [seq, n_kv_heads*head_dim]
-            let q_raw = linear(&x, &layer.q_proj)?;
-            let k_raw = linear(&x, &layer.k_proj)?;
-            let v_raw = linear(&x, &layer.v_proj)?;
-
-            // 3. Per-head QK norm (Qwen2.5): reshape → rms_norm → reshape
-            let q_raw = apply_head_norm(&q_raw, seq, n_heads, head_dim, &layer.q_norm, eps)?;
-            let k_raw = apply_head_norm(&k_raw, seq, n_kv_heads, head_dim, &layer.k_norm, eps)?;
-
-            // 4. Reshape to [1, seq, n_heads, head_dim] for RoPE
-            let q = reshape(&q_raw, &[1, seq, n_heads, head_dim]).context("reshape q")?;
-            let k = reshape(&k_raw, &[1, seq, n_kv_heads, head_dim]).context("reshape k")?;
-            let v = reshape(&v_raw, &[1, seq, n_kv_heads, head_dim]).context("reshape v")?;
-
-            // 5. RoPE (input: [1, seq, n_heads, head_dim], traditional=false)
-            let q = fast::rope(&q, head_dim, false, rope_base, 1.0f32, cache_len, None)
-                .context("rope q")?;
-            let k = fast::rope(&k, head_dim, false, rope_base, 1.0f32, cache_len, None)
-                .context("rope k")?;
-
-            // 6. Transpose to [1, n_heads, seq, head_dim] for attention
-            let q = transpose_axes(&q, &[0, 2, 1, 3]).context("transpose q")?;
-            let k = transpose_axes(&k, &[0, 2, 1, 3]).context("transpose k")?;
-            let v = transpose_axes(&v, &[0, 2, 1, 3]).context("transpose v")?;
-
-            // 7. KV cache: write new slice at [.., .., cache_len..end_pos, ..]
-            // then read filled prefix [.., .., 0..end_pos, ..] for attention.
-            // Pre-allocated buffers avoid per-step Metal buffer growth.
-            let end_pos = cache_len + seq;
-            k_caches[li]
-                .try_index_mut((.., .., cache_len..end_pos, ..), &k)
-                .context("slice_update k_cache")?;
-            v_caches[li]
-                .try_index_mut((.., .., cache_len..end_pos, ..), &v)
-                .context("slice_update v_cache")?;
-            let k_full = k_caches[li]
-                .try_index((.., .., 0i32..end_pos, ..))
-                .context("slice k_cache")?;
-            let v_full = v_caches[li]
-                .try_index((.., .., 0i32..end_pos, ..))
-                .context("slice v_cache")?;
-
-            // 8. Grouped-query attention (Metal-optimised for seq_len=1 decode)
-            // q: [1, n_heads, seq, head_dim]
-            // k/v: [1, n_kv_heads, end_pos, head_dim]
-            let use_causal = cache_len == 0 && seq > 1;
-            let mask_arg = if use_causal {
-                Some(fast::ScaledDotProductAttentionMask::Causal)
-            } else {
-                None
-            };
-            let attn_out =
-                fast::scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, mask_arg)
-                    .context("scaled_dot_product_attention")?;
-            // attn_out: [1, n_heads, seq, head_dim]
-
-            // 9. Reshape back to [seq, hidden] and project
-            let attn_out =
-                transpose_axes(&attn_out, &[0, 2, 1, 3]).context("transpose attn_out")?;
-            let attn_out =
-                reshape(&attn_out, &[seq, n_heads * head_dim]).context("reshape attn_out")?;
-            let attn_out = linear(&attn_out, &layer.o_proj)?;
-            x = ops::add(&residual, &attn_out).context("residual + attn")?;
-
-            // 10. Post-attention norm + SwiGLU MLP
-            let residual2 = x.clone();
-            let xn = fast::rms_norm(&x, &layer.post_attention_layernorm, eps)
-                .context("post_attn_layernorm")?;
-
-            let gate = silu(&linear(&xn, &layer.gate_proj)?).context("silu gate")?;
-            let up = linear(&xn, &layer.up_proj)?;
-            let mlp = linear(
-                &ops::multiply(&gate, &up).context("gate*up")?,
-                &layer.down_proj,
-            )?;
-            x = ops::add(&residual2, &mlp).context("residual + mlp")?;
+                // Safety: metal_fused_block_cached borrows all inputs (does not free them).
+                // It writes a newly heap-allocated array into result_raw, which we wrap
+                // in Array::from_ptr() to take ownership (Array's Drop will free it).
+                // k_cache / v_cache are updated in-place by the C++ shim; their ctx
+                // pointers may change (slice_update returns a new array), but the Rust
+                // Array wrapper stays valid since we pass a *mut to the wrapper struct.
+                let result_raw: mlx_sys::mlx_array = unsafe {
+                    let mut r = std::mem::MaybeUninit::<mlx_sys::mlx_array>::uninit();
+                    metal_ffi::metal_fused_block_cached(
+                        x.as_ptr(),
+                        layer.input_layernorm.as_ptr(),
+                        layer.post_attention_layernorm.as_ptr(),
+                        q_t.as_ptr(),
+                        k_t.as_ptr(),
+                        v_t.as_ptr(),
+                        o_t.as_ptr(),
+                        layer.q_norm.as_ptr(),
+                        layer.k_norm.as_ptr(),
+                        gate_t.as_ptr(),
+                        up_t.as_ptr(),
+                        down_t.as_ptr(),
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        attn_scale,
+                        rope_base,
+                        head_dim, // rope_dims = head_dim
+                        eps,
+                        // Array is #[repr(transparent)] over mlx_array, so *mut Array
+                        // is layout-compatible with *mut mlx_array.
+                        &mut k_caches[li] as *mut Array as *mut mlx_sys::mlx_array,
+                        &mut v_caches[li] as *mut Array as *mut mlx_sys::mlx_array,
+                        cache_len,
+                        seq,
+                        r.as_mut_ptr(),
+                    );
+                    r.assume_init()
+                };
+                // SAFETY: C++ wrote a valid, heap-allocated array into result_raw.
+                x = unsafe { Array::from_ptr(result_raw) };
+            }
+        } else {
+            // Fallback: Rust-level layer loop (quantized models or when fused unavailable).
+            for (li, layer) in weights.layers.iter().enumerate() {
+                x = rust_transformer_layer(
+                    x, layer, li,
+                    &mut k_caches, &mut v_caches,
+                    seq, cache_len, n_heads, n_kv_heads, head_dim,
+                    attn_scale, rope_base, eps,
+                )?;
+            }
         }
 
         // ── Final norm + lm_head ─────────────────────────────────────────────
-        // Take the last token's hidden state for the logit projection.
         let last_idx = Array::from_slice(&[seq - 1], &[1]);
         let last_x = take_axis(&x, &last_idx, 0).context("take last hidden")?;
         let last_x = fast::rms_norm(&last_x, &weights.norm, eps).context("final norm")?;
         let logits = linear(&last_x, &weights.lm_head)?; // [1, vocab]
 
-        // Materialise logits on CPU for sampling
-        eval([&logits]).context("eval logits")?;
-
-        // ── Sampling ─────────────────────────────────────────────────────────
-        let next_token = sample_token(&logits, params)?;
+        // ── P4: GPU-side sampling + P3: eval ─────────────────────────────────
+        // Argmax / categorical stays on GPU (P4); scalar only crosses to CPU on .item().
+        // P3: eval forces the full graph (embed → transformer → sample) to execute.
+        let token_arr = gpu_sample_token(&logits, params)?;
+        eval([&token_arr]).context("eval token")?;
+        let next_token = token_arr.item::<i32>() as u32;
 
         if !first_token_logged {
             let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -491,15 +556,125 @@ fn metal_generate(
     Ok(generated)
 }
 
+/// Single transformer layer — used as fallback for quantized models.
+// GPU required
+#[cfg(feature = "metal")]
+#[allow(clippy::too_many_arguments)]
+fn rust_transformer_layer(
+    x: Array,
+    layer: &MetalLayerWeights,
+    li: usize,
+    k_caches: &mut [Array],
+    v_caches: &mut [Array],
+    seq: i32,
+    cache_len: i32,
+    n_heads: i32,
+    n_kv_heads: i32,
+    head_dim: i32,
+    attn_scale: f32,
+    rope_base: f32,
+    eps: f32,
+) -> Result<Array> {
+    use mlx_rs::{
+        fast,
+        nn::silu,
+        ops::indexing::{TryIndexMutOp, TryIndexOp},
+        ops::{self, reshape, transpose_axes},
+    };
+
+    // 1. Input norm + residual
+    let residual = x.clone();
+    let x = fast::rms_norm(&x, &layer.input_layernorm, eps).context("input_layernorm")?;
+
+    // 2. QKV projections
+    let q_raw = linear(&x, &layer.q_proj)?;
+    let k_raw = linear(&x, &layer.k_proj)?;
+    let v_raw = linear(&x, &layer.v_proj)?;
+
+    // 3. Per-head QK norm
+    let q_raw = apply_head_norm(&q_raw, seq, n_heads, head_dim, &layer.q_norm, eps)?;
+    let k_raw = apply_head_norm(&k_raw, seq, n_kv_heads, head_dim, &layer.k_norm, eps)?;
+
+    // 4. Reshape to [1, seq, n_heads, head_dim] for RoPE
+    let q = reshape(&q_raw, &[1, seq, n_heads, head_dim]).context("reshape q")?;
+    let k = reshape(&k_raw, &[1, seq, n_kv_heads, head_dim]).context("reshape k")?;
+    let v = reshape(&v_raw, &[1, seq, n_kv_heads, head_dim]).context("reshape v")?;
+
+    // 5. RoPE
+    let q = fast::rope(&q, head_dim, false, rope_base, 1.0f32, cache_len, None).context("rope q")?;
+    let k = fast::rope(&k, head_dim, false, rope_base, 1.0f32, cache_len, None).context("rope k")?;
+
+    // 6. Transpose to [1, n_heads, seq, head_dim]
+    let q = transpose_axes(&q, &[0, 2, 1, 3]).context("transpose q")?;
+    let k = transpose_axes(&k, &[0, 2, 1, 3]).context("transpose k")?;
+    let v = transpose_axes(&v, &[0, 2, 1, 3]).context("transpose v")?;
+
+    // 7. KV cache update
+    let end_pos = cache_len + seq;
+    k_caches[li]
+        .try_index_mut((.., .., cache_len..end_pos, ..), &k)
+        .context("slice_update k_cache")?;
+    v_caches[li]
+        .try_index_mut((.., .., cache_len..end_pos, ..), &v)
+        .context("slice_update v_cache")?;
+    let k_full = k_caches[li].try_index((.., .., 0i32..end_pos, ..)).context("slice k_cache")?;
+    let v_full = v_caches[li].try_index((.., .., 0i32..end_pos, ..)).context("slice v_cache")?;
+
+    // 8. Attention
+    let use_causal = cache_len == 0 && seq > 1;
+    let mask_arg = if use_causal { Some(fast::ScaledDotProductAttentionMask::Causal) } else { None };
+    let attn_out =
+        fast::scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, mask_arg)
+            .context("sdpa")?;
+
+    // 9. Reshape + output proj + residual
+    let attn_out = transpose_axes(&attn_out, &[0, 2, 1, 3]).context("transpose attn_out")?;
+    let attn_out = reshape(&attn_out, &[seq, n_heads * head_dim]).context("reshape attn_out")?;
+    let attn_out = linear(&attn_out, &layer.o_proj)?;
+    let x = ops::add(&residual, &attn_out).context("residual + attn")?;
+
+    // 10. MLP
+    let residual2 = x.clone();
+    let xn = fast::rms_norm(&x, &layer.post_attention_layernorm, eps).context("post_attn_layernorm")?;
+    let gate = silu(&linear(&xn, &layer.gate_proj)?).context("silu gate")?;
+    let up = linear(&xn, &layer.up_proj)?;
+    let mlp = linear(&ops::multiply(&gate, &up).context("gate*up")?, &layer.down_proj)?;
+    ops::add(&residual2, &mlp).context("residual + mlp")
+}
+
+/// P4 — GPU-side sampling: argmax or categorical, stays on GPU until `.item()`.
+#[cfg(feature = "metal")]
+fn gpu_sample_token(logits: &Array, params: &SamplingParams) -> Result<Array> {
+    use mlx_rs::ops::multiply;
+
+    let temp = params.temperature;
+
+    if temp <= 1e-6 {
+        // Greedy: GPU argmax — no data transfer until .item().
+        // SAFETY: metal_argmax returns a newly allocated array we own.
+        let best = unsafe { Array::from_ptr(metal_ffi::metal_argmax(logits.as_ptr())) };
+        return Ok(best);
+    }
+
+    // Temperature scaling then GPU categorical sample.
+    let inv_t: Array = (1.0f32 / temp).into();
+    let scaled = multiply(logits, &inv_t).context("temp scale")?;
+    // SAFETY: metal_categorical_sample returns a newly allocated array we own.
+    let best = unsafe { Array::from_ptr(metal_ffi::metal_categorical_sample(scaled.as_ptr())) };
+    Ok(best)
+}
+
 /// `x @ weight.T` — no bias, dispatches to dense matmul or quantized matmul.
+///
+/// For `Dense(w_t)`, `w_t` is already transposed at load time (shape `[in, out]`),
+/// so this is just `matmul(x, w_t)` without an extra transpose.
 #[cfg(feature = "metal")]
 #[inline]
 fn linear(x: &Array, weight: &WeightTensor) -> Result<Array> {
     match weight {
-        WeightTensor::Dense(w) => {
-            use mlx_rs::ops::transpose;
-            let w_t = transpose(w).context("weight transpose")?;
-            mlx_rs::ops::matmul(x, &w_t).context("matmul")
+        WeightTensor::Dense(w_t) => {
+            // w_t is pre-transposed [in, out]; direct matmul, no per-call transpose.
+            mlx_rs::ops::matmul(x, w_t).context("matmul")
         }
         WeightTensor::Quantized {
             w,
@@ -537,87 +712,6 @@ fn apply_head_norm(
     let x3 = reshape(x, &[seq, n_heads, head_dim]).context("reshape for head_norm")?;
     let x3 = fast::rms_norm(&x3, norm_weight, eps).context("head rms_norm")?;
     reshape(&x3, &[seq, n_heads * head_dim]).context("reshape after head_norm")
-}
-
-/// Sample the next token from `logits` with shape [1, vocab].
-#[cfg(feature = "metal")]
-fn sample_token(logits: &Array, params: &SamplingParams) -> Result<u32> {
-    use mlx_rs::{
-        ops::indexing::argmax,
-        ops::{multiply, softmax_axis},
-        transforms::eval,
-    };
-
-    let temp = params.temperature;
-
-    // Greedy
-    if temp <= 1e-6 {
-        let best = argmax(logits, None).context("argmax")?;
-        eval([&best])?;
-        return Ok(best.item::<i32>() as u32);
-    }
-
-    // Temperature scaling → softmax → float32 probs
-    let inv_t: Array = (1.0f32 / temp).into();
-    let scaled = multiply(logits, &inv_t).context("temp scale")?;
-    let probs = softmax_axis(&scaled, -1, false).context("softmax")?;
-    // Cast to f32 for CPU-side sampling (weights may be bf16)
-    let probs_f32 = probs.as_type::<f32>().context("probs cast to f32")?;
-    eval([&probs_f32])?;
-    let probs_slice: &[f32] = probs_f32.as_slice();
-
-    if params.top_p >= 1.0 - 1e-6 || params.top_p <= 0.0 {
-        return sample_multinomial(probs_slice);
-    }
-
-    // Top-p (nucleus) sampling
-    let mut indexed: Vec<(f32, usize)> = probs_slice
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(i, p)| (p, i))
-        .collect();
-    indexed.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let top_p = params.top_p;
-    let mut cum = 0.0f32;
-    let mut cutoff = indexed.len();
-    for (i, (p, _)) in indexed.iter().enumerate() {
-        cum += p;
-        if cum >= top_p {
-            cutoff = i + 1;
-            break;
-        }
-    }
-    let nucleus = &indexed[..cutoff];
-    let sum: f32 = nucleus.iter().map(|(p, _)| p).sum();
-    if sum <= 0.0 {
-        return Ok(indexed[0].1 as u32);
-    }
-
-    let r: f32 = rand::random::<f32>() * sum;
-    let mut acc = 0.0f32;
-    for (p, idx) in nucleus {
-        acc += p;
-        if acc >= r {
-            return Ok(*idx as u32);
-        }
-    }
-    Ok(nucleus.last().map_or(0, |(_, i)| *i) as u32)
-}
-
-/// Multinomial sampling from a flat probability distribution.
-#[cfg(feature = "metal")]
-fn sample_multinomial(probs: &[f32]) -> Result<u32> {
-    let r: f32 = rand::random::<f32>();
-    let mut acc = 0.0f32;
-    for (i, &p) in probs.iter().enumerate() {
-        acc += p;
-        if acc >= r {
-            return Ok(i as u32);
-        }
-    }
-    Ok((probs.len().saturating_sub(1)) as u32)
 }
 
 // ── Config loading ─────────────────────────────────────────────────────────────
@@ -745,7 +839,10 @@ fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<Met
 
     // Load a possibly-quantized projection weight.
     // Tries `<base>.scales` to detect MLX-LM 4-bit format.
+    // Dense weights are pre-transposed here (once at load) so `linear()` calls
+    // `matmul(x, w_t)` without any per-step transpose overhead.
     let load_proj = |base: &str| -> Result<WeightTensor> {
+        use mlx_rs::{ops::transpose, transforms::eval};
         if let Some(qc) = config.quantization {
             let scales_key = format!("{base}.scales");
             if let Some(scales) = tensors.get(&scales_key).cloned() {
@@ -757,6 +854,7 @@ fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<Met
                     .get(&format!("{base}.biases"))
                     .cloned()
                     .with_context(|| format!("missing quantized biases '{base}.biases'"))?;
+                // Quantized matmul handles transpose internally (transpose=true arg).
                 return Ok(WeightTensor::Quantized {
                     w,
                     scales,
@@ -766,7 +864,11 @@ fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<Met
                 });
             }
         }
-        Ok(WeightTensor::Dense(get(&format!("{base}.weight"))?))
+        // Dense: transpose once now; matmul uses [in, out] layout every step.
+        let w = get(&format!("{base}.weight"))?;
+        let w_t = transpose(&w).context("pre-transpose weight")?;
+        eval([&w_t]).context("eval pre-transposed weight")?;
+        Ok(WeightTensor::Dense(w_t))
     };
 
     // embed_tokens: dequantize at load time if quantized (needed for embedding lookup via take_axis).
@@ -794,10 +896,14 @@ fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<Met
     // lm_head may be weight-tied to embed_tokens; handle both dense and quantized.
     let lm_head =
         if tensors.contains_key("lm_head.weight") || tensors.contains_key("lm_head.scales") {
-            load_proj("lm_head")?
+            load_proj("lm_head")?  // load_proj pre-transposes Dense weights
         } else {
-            // Weight-tied: share the (already-dequantized) embed_tokens matrix
-            WeightTensor::Dense(embed_tokens.clone())
+            // Weight-tied: transpose the dequantized embed_tokens once for lm_head use.
+            // (embed_tokens itself stays [vocab, hidden] for embedding lookup.)
+            use mlx_rs::{ops::transpose, transforms::eval};
+            let w_t = transpose(&embed_tokens).context("pre-transpose tied lm_head")?;
+            eval([&w_t]).context("eval tied lm_head")?;
+            WeightTensor::Dense(w_t)
         };
 
     let n = config.num_hidden_layers;
