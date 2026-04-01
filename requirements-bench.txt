@@ -1,0 +1,5 @@
+# Benchmark & test dependencies (install into the same venv as build deps)
+httpx==0.28.1
+pytest>=8.0
+pytest-asyncio>=0.24
+tokenizers>=0.20

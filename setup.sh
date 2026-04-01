@@ -1,32 +1,37 @@
 #!/usr/bin/env bash
 # ============================================================================
-# agent-infer — one-shot dev environment setup
+# agent-infer — reproducible dev environment setup
 #
 # Usage:
-#   ./setup.sh              # Full setup: toolchain + deps + build + model
-#   ./setup.sh --deps-only  # Install deps only, no build/model
-#   ./setup.sh --build-only # Build only (assumes deps already installed)
+#   ./setup.sh              # Full setup: toolchain + venv + build + model
+#   ./setup.sh --deps-only  # Toolchain + venv only, no build/model
+#   ./setup.sh --build-only # Build only (assumes venv exists)
 #   ./setup.sh --model-only # Download model only
-#   ./setup.sh --check      # Verify environment is ready
+#   ./setup.sh --check      # Verify environment
+#   ./setup.sh --clean      # Remove venv and build artifacts
 #
 # Environment variables:
 #   MODEL_ID      — HuggingFace model ID  (default: Qwen/Qwen3-8B)
 #   MODEL_DIR     — Local path for model  (default: models/Qwen3-8B)
 #   CUDA_HOME     — CUDA toolkit path     (default: /usr/local/cuda)
 #   SKIP_MODEL    — Set to 1 to skip model download
+#   PYTHON        — Python interpreter     (default: python3)
+#
+# All Python deps are installed into .venv/ — never pollutes system packages.
+# Activate manually:  source .venv/bin/activate
 # ============================================================================
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Colors & helpers
 # ---------------------------------------------------------------------------
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 info()  { echo -e "${CYAN}[info]${NC}  $*"; }
 ok()    { echo -e "${GREEN}[ok]${NC}    $*"; }
 warn()  { echo -e "${YELLOW}[warn]${NC}  $*"; }
 fail()  { echo -e "${RED}[fail]${NC}  $*"; }
-step()  { echo -e "\n${GREEN}▸ $*${NC}"; }
+step()  { echo -e "\n${BOLD}${GREEN}▸ $*${NC}"; }
 
 check_cmd() {
     if command -v "$1" &>/dev/null; then
@@ -44,28 +49,52 @@ check_cmd() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+VENV_DIR="$SCRIPT_DIR/.venv"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-8B}"
 MODEL_DIR="${MODEL_DIR:-models/Qwen3-8B}"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 SKIP_MODEL="${SKIP_MODEL:-0}"
+PYTHON="${PYTHON:-python3}"
 
 # ---------------------------------------------------------------------------
 # Mode parsing
 # ---------------------------------------------------------------------------
 MODE="full"
 case "${1:-}" in
-    --deps-only)  MODE="deps" ;;
-    --build-only) MODE="build" ;;
-    --model-only) MODE="model" ;;
-    --check)      MODE="check" ;;
+    --deps-only)   MODE="deps" ;;
+    --build-only)  MODE="build" ;;
+    --model-only)  MODE="model" ;;
+    --check)       MODE="check" ;;
+    --clean)       MODE="clean" ;;
     --help|-h)
-        head -14 "$0" | tail -12
+        sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
         exit 0
         ;;
 esac
 
+# ---------------------------------------------------------------------------
+# Activate venv (if it exists) for all modes except clean
+# ---------------------------------------------------------------------------
+activate_venv() {
+    if [ -f "$VENV_DIR/bin/activate" ]; then
+        # shellcheck disable=SC1091
+        source "$VENV_DIR/bin/activate"
+    fi
+}
+
 # ============================================================================
-# CHECK mode — verify everything is ready
+# CLEAN
+# ============================================================================
+do_clean() {
+    step "Cleaning build artifacts and venv"
+    rm -rf "$VENV_DIR" && ok "Removed .venv/"
+    rm -rf target/ && ok "Removed target/"
+    rm -rf infer/target/ && ok "Removed infer/target/"
+    info "Run ./setup.sh to rebuild from scratch"
+}
+
+# ============================================================================
+# CHECK — verify everything is ready
 # ============================================================================
 do_check() {
     step "Checking environment"
@@ -74,14 +103,12 @@ do_check() {
     # Rust
     if check_cmd rustc; then
         info "  rustc $(rustc --version 2>/dev/null | awk '{print $2}')"
-    else
-        ((errors++))
-    fi
+    else ((errors++)); fi
     check_cmd cargo || ((errors++))
 
     # CUDA
     if [ -x "$CUDA_HOME/bin/nvcc" ]; then
-        ok "nvcc found: $CUDA_HOME/bin/nvcc"
+        ok "nvcc: $CUDA_HOME/bin/nvcc"
         info "  $("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | grep release)"
     else
         fail "nvcc not found at $CUDA_HOME/bin/nvcc"
@@ -90,19 +117,38 @@ do_check() {
 
     # GPU
     if check_cmd nvidia-smi; then
-        local gpu
-        gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-        info "  GPU: $gpu"
+        info "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+    else ((errors++)); fi
+
+    # Venv
+    if [ -f "$VENV_DIR/bin/activate" ]; then
+        ok "venv: $VENV_DIR"
+        activate_venv
     else
+        fail "venv not found — run ./setup.sh --deps-only"
         ((errors++))
     fi
 
-    # Python
-    if check_cmd python3; then
-        info "  python $(python3 --version 2>/dev/null | awk '{print $2}')"
-    else
-        ((errors++))
-    fi
+    # Python (from venv)
+    if check_cmd python; then
+        info "  python $(python --version 2>/dev/null | awk '{print $2}')"
+    else ((errors++)); fi
+
+    # Pinned packages
+    local pkg_errors=0
+    while IFS='==' read -r pkg ver; do
+        [[ "$pkg" =~ ^#.*$ || -z "$pkg" ]] && continue
+        pkg_name="${pkg//-/_}"
+        local actual
+        actual=$(python -c "import $pkg_name; print($pkg_name.__version__)" 2>/dev/null || echo "MISSING")
+        if [ "$actual" = "$ver" ]; then
+            ok "  $pkg==$ver"
+        else
+            fail "  $pkg: expected $ver, got $actual"
+            ((pkg_errors++))
+        fi
+    done < <(grep -E '^[a-zA-Z].*==' requirements-build.txt)
+    ((errors += pkg_errors))
 
     # nsjail
     if check_cmd nsjail; then
@@ -111,27 +157,17 @@ do_check() {
         warn "nsjail not found — tool execution will run without sandbox"
     fi
 
-    # Python packages
-    for pkg in triton flashinfer huggingface_hub; do
-        if python3 -c "import $pkg" 2>/dev/null; then
-            ok "python: $pkg available"
-        else
-            fail "python: $pkg missing"
-            ((errors++))
-        fi
-    done
-
     # Binary
     if [ -x target/release/agent-infer ]; then
         ok "target/release/agent-infer built"
     else
-        fail "target/release/agent-infer not found — run ./setup.sh --build-only"
+        fail "agent-infer binary not found — run ./setup.sh --build-only"
         ((errors++))
     fi
 
     # Model
     if [ -f "$MODEL_DIR/config.json" ]; then
-        ok "Model found: $MODEL_DIR"
+        ok "Model: $MODEL_DIR"
     else
         warn "Model not found at $MODEL_DIR — run ./setup.sh --model-only"
     fi
@@ -139,6 +175,8 @@ do_check() {
     echo ""
     if [ "$errors" -eq 0 ]; then
         ok "Environment is ready!"
+        echo ""
+        info "Activate venv:  ${BOLD}source .venv/bin/activate${NC}"
     else
         fail "$errors issue(s) found"
         return 1
@@ -146,12 +184,13 @@ do_check() {
 }
 
 # ============================================================================
-# DEPS — install toolchain + Python packages
+# DEPS — toolchain + venv + Python packages
 # ============================================================================
 do_deps() {
-    step "Installing Rust toolchain"
+    # --- Rust ---
+    step "Rust toolchain"
     if command -v rustc &>/dev/null; then
-        ok "Rust already installed: $(rustc --version)"
+        ok "Rust $(rustc --version | awk '{print $2}')"
     else
         info "Installing via rustup..."
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -160,7 +199,8 @@ do_deps() {
         ok "Rust installed: $(rustc --version)"
     fi
 
-    step "Checking CUDA toolkit"
+    # --- CUDA ---
+    step "CUDA toolkit"
     if [ -x "$CUDA_HOME/bin/nvcc" ]; then
         ok "nvcc: $("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | grep release)"
     else
@@ -169,7 +209,8 @@ do_deps() {
         exit 1
     fi
 
-    step "Installing nsjail (sandbox)"
+    # --- nsjail ---
+    step "nsjail (sandbox)"
     if command -v nsjail &>/dev/null; then
         ok "nsjail already installed"
     else
@@ -186,58 +227,70 @@ do_deps() {
         ok "nsjail built and installed"
     fi
 
-    step "Installing Python packages (pinned versions)"
-
-    # ---------- Pinned dependency versions ----------
-    # FlashInfer headers — MUST match the version our csrc/cuda/flashinfer_decode.cu is compiled against.
-    # 0.2.x: no enable_pdl param.  0.6.x: has enable_pdl param.
-    FLASHINFER_VERSION="0.6.3"
-    TRITON_VERSION="3.5.1"
-    HUGGINGFACE_HUB_VERSION="0.36.2"
-    HTTPX_VERSION="0.28.1"
-    # ------------------------------------------------
-
-    # FlashInfer headers (--no-deps: we only need the C++ headers, not the torch runtime)
-    local fi_ver
-    fi_ver=$(python3 -c "import flashinfer; print(flashinfer.__version__)" 2>/dev/null || echo "")
-    if [ "$fi_ver" = "$FLASHINFER_VERSION" ]; then
-        ok "flashinfer $FLASHINFER_VERSION already installed"
+    # --- Python venv ---
+    step "Python virtual environment"
+    if [ -f "$VENV_DIR/bin/activate" ]; then
+        ok "venv exists: $VENV_DIR"
     else
-        info "Installing flashinfer-python==$FLASHINFER_VERSION (headers only, --no-deps)..."
-        pip3 install "flashinfer-python==$FLASHINFER_VERSION" --no-deps -q
-        ok "flashinfer $FLASHINFER_VERSION installed"
+        info "Creating venv at $VENV_DIR ..."
+        "$PYTHON" -m venv "$VENV_DIR"
+        ok "venv created"
     fi
 
-    # Triton (needed for AOT kernel compilation at build time)
-    local tri_ver
-    tri_ver=$(python3 -c "import triton; print(triton.__version__)" 2>/dev/null || echo "")
-    if [ "$tri_ver" = "$TRITON_VERSION" ]; then
-        ok "triton $TRITON_VERSION already installed"
-    else
-        info "Installing triton==$TRITON_VERSION..."
-        pip3 install "triton==$TRITON_VERSION" -q
-        ok "triton $TRITON_VERSION installed"
-    fi
+    # shellcheck disable=SC1091
+    source "$VENV_DIR/bin/activate"
+    info "Python: $(python --version) — $(which python)"
 
-    # HuggingFace Hub (for model downloads)
-    if python3 -c "import huggingface_hub" 2>/dev/null; then
-        ok "huggingface_hub already installed"
-    else
-        info "Installing huggingface_hub==$HUGGINGFACE_HUB_VERSION..."
-        pip3 install "huggingface_hub==$HUGGINGFACE_HUB_VERSION" -q
-        ok "huggingface_hub installed"
-    fi
+    # Upgrade pip
+    python -m pip install --upgrade pip -q
 
-    # httpx (for benchmarks)
-    pip3 install "httpx>=$HTTPX_VERSION" -q 2>/dev/null || true
+    # --- Pinned build deps ---
+    step "Python build dependencies (from requirements-build.txt)"
+    info "FlashInfer is installed --no-deps (we only need C++ headers)"
 
-    # Project Python deps
+    # Install flashinfer separately with --no-deps
+    local fi_line
+    fi_line=$(grep "flashinfer" requirements-build.txt | head -1)
+    pip install "$fi_line" --no-deps -q
+    ok "$fi_line (headers only)"
+
+    # Install remaining build deps normally
+    grep -v "flashinfer" requirements-build.txt | grep -v "^#" | grep -v "^$" | \
+        xargs pip install -q
+    ok "Build deps installed"
+
+    # --- Bench/test deps ---
+    step "Bench & test dependencies (from requirements-bench.txt)"
+    pip install -r requirements-bench.txt -q
+    ok "Bench deps installed"
+
+    # --- Project install ---
     if [ -f pyproject.toml ]; then
-        info "Installing Python project deps..."
-        pip3 install -e ".[dev]" -q 2>/dev/null || true
+        step "Python project (editable install)"
+        pip install -e ".[dev]" -q 2>/dev/null || true
+        ok "Project installed"
     fi
 
-    ok "All dependencies installed"
+    # --- Verify pinned versions ---
+    step "Verifying pinned versions"
+    local ok_count=0
+    while IFS='==' read -r pkg ver; do
+        [[ "$pkg" =~ ^#.*$ || -z "$pkg" ]] && continue
+        pkg_name="${pkg//-/_}"
+        local actual
+        actual=$(python -c "import $pkg_name; print($pkg_name.__version__)" 2>/dev/null || echo "?")
+        if [ "$actual" = "$ver" ]; then
+            ok "  $pkg==$ver"
+            ((ok_count++))
+        else
+            fail "  $pkg: expected $ver, got $actual"
+        fi
+    done < <(grep -E '^[a-zA-Z].*==' requirements-build.txt)
+    info "$ok_count pinned packages verified"
+
+    echo ""
+    ok "All dependencies installed into $VENV_DIR"
+    info "Activate: ${BOLD}source .venv/bin/activate${NC}"
 }
 
 # ============================================================================
@@ -245,6 +298,7 @@ do_deps() {
 # ============================================================================
 do_build() {
     step "Building agent-infer (release, CUDA)"
+    activate_venv
 
     # Ensure cargo is on PATH
     # shellcheck disable=SC1091
@@ -252,17 +306,18 @@ do_build() {
 
     export CUDA_HOME
     export PATH="$CUDA_HOME/bin:$PATH"
-    # CUDA driver stubs needed for linking when driver isn't in default lib path
     export LIBRARY_PATH="$CUDA_HOME/lib64/stubs:${LIBRARY_PATH:-}"
+    # Triton AOT needs Python from venv
+    export PEGAINFER_TRITON_PYTHON="$(which python)"
 
     info "CUDA_HOME=$CUDA_HOME"
+    info "TRITON_PYTHON=$PEGAINFER_TRITON_PYTHON"
     info "SM targets: $(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr '\n' ' ')"
 
     local start
     start=$(date +%s)
 
     cargo build --release 2>&1 | while IFS= read -r line; do
-        # Show warnings/errors, suppress noisy compile lines
         case "$line" in
             *warning:*|*error:*|*Compiling*infer*|*Compiling*agent*)
                 echo "  $line" ;;
@@ -272,16 +327,8 @@ do_build() {
     local elapsed=$(( $(date +%s) - start ))
     ok "Build complete in ${elapsed}s"
 
-    # Show binary size
     if [ -x target/release/agent-infer ]; then
-        local size
-        size=$(du -h target/release/agent-infer | awk '{print $1}')
-        info "Binary: target/release/agent-infer ($size)"
-    fi
-    if [ -x target/release/infer ]; then
-        local size
-        size=$(du -h target/release/infer | awk '{print $1}')
-        info "Binary: target/release/infer ($size)"
+        info "Binary: target/release/agent-infer ($(du -h target/release/agent-infer | awk '{print $1}'))"
     fi
 }
 
@@ -290,6 +337,7 @@ do_build() {
 # ============================================================================
 do_model() {
     step "Downloading model: $MODEL_ID → $MODEL_DIR"
+    activate_venv
 
     if [ -f "$MODEL_DIR/config.json" ]; then
         ok "Model already exists at $MODEL_DIR"
@@ -298,32 +346,22 @@ do_model() {
     fi
 
     mkdir -p "$MODEL_DIR"
-
-    python3 -c "
+    python -c "
 from huggingface_hub import snapshot_download
-import sys
-
-print(f'Downloading {\"$MODEL_ID\"} ...')
-path = snapshot_download(
-    '$MODEL_ID',
-    local_dir='$MODEL_DIR',
-    ignore_patterns=['*.bin', '*.pt', 'original/*'],
-)
-print(f'Downloaded to: {path}')
+print('Downloading $MODEL_ID ...')
+snapshot_download('$MODEL_ID', local_dir='$MODEL_DIR',
+                  ignore_patterns=['*.bin', '*.pt', 'original/*'])
+print('Done')
 "
     ok "Model downloaded to $MODEL_DIR"
 
-    # Quick sanity check
     if [ -f "$MODEL_DIR/config.json" ]; then
         local params
-        params=$(python3 -c "
-import json
-c = json.load(open('$MODEL_DIR/config.json'))
-h = c.get('hidden_size', '?')
-l = c.get('num_hidden_layers', '?')
-print(f'hidden={h}, layers={l}')
+        params=$(python -c "
+import json; c = json.load(open('$MODEL_DIR/config.json'))
+print(f\"hidden={c.get('hidden_size','?')}, layers={c.get('num_hidden_layers','?')}\")
 " 2>/dev/null || echo "?")
-        info "Model config: $params"
+        info "Config: $params"
     fi
 }
 
@@ -349,19 +387,27 @@ do_full() {
     step "Setup complete!"
     echo ""
     info "Quick start:"
-    echo "  # Set runtime library paths"
+    echo ""
+    echo "  # 1. Activate the virtual environment"
+    echo "  source .venv/bin/activate"
+    echo ""
+    echo "  # 2. Set runtime library paths"
     echo "  export LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH"
     echo ""
-    echo "  # Run agent REPL (interactive, local inference)"
+    echo "  # 3. Run agent REPL"
     echo "  ./target/release/agent-infer --model-path $MODEL_DIR"
     echo ""
-    echo "  # Run HTTP server"
-    echo "  cd infer && cargo run --release -- --model-path /root/models/Qwen3-8B --port 8000"
+    echo "  # 4. Run HTTP server"
+    echo "  ./target/release/infer --model-path $MODEL_DIR --port 8000"
     echo ""
-    echo "  # Run tests"
+    echo "  # 5. Run benchmarks"
+    echo "  python scripts/bench_throughput_sweep.py --url http://localhost:8000 --quick"
+    echo ""
+    echo "  # 6. Run tests"
     echo "  cargo test --release"
+    echo "  python scripts/test_long_agent.py"
     echo ""
-    echo "  # Check environment"
+    echo "  # 7. Verify environment"
     echo "  ./setup.sh --check"
     echo ""
 }
@@ -370,9 +416,10 @@ do_full() {
 # Dispatch
 # ---------------------------------------------------------------------------
 case "$MODE" in
-    check) do_check ;;
+    check) activate_venv; do_check ;;
     deps)  do_deps ;;
     build) do_build ;;
     model) do_model ;;
+    clean) do_clean ;;
     full)  do_full ;;
 esac

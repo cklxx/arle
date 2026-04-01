@@ -6,6 +6,7 @@ build/
 *.egg
 .eggs/
 /target/
+.venv/
 .claude/
 release/
 .gstack/

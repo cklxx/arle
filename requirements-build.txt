@@ -1,0 +1,12 @@
+# Build-time Python dependencies for agent-infer
+# These are needed by infer/build.rs to compile CUDA/Triton kernels.
+#
+# FlashInfer: C++ headers only (--no-deps install). Version MUST match
+# csrc/cuda/flashinfer_decode.cu API (0.6.x has enable_pdl param).
+flashinfer-python==0.6.3
+
+# Triton: AOT kernel compilation (silu_mul, add, embedding, attention decode).
+triton==3.5.1
+
+# HuggingFace Hub: model weight download.
+huggingface_hub==0.36.2
