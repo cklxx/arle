@@ -750,8 +750,7 @@ fn find_flashinfer_include() -> Option<String> {
     }
 
     // 2. pip show (works even when flashinfer can't be imported)
-    let python = std::env::var("PEGAINFER_TRITON_PYTHON")
-        .unwrap_or_else(|_| "python3".to_string());
+    let python = std::env::var("PEGAINFER_TRITON_PYTHON").unwrap_or_else(|_| "python3".to_string());
     if let Ok(output) = Command::new(&python)
         .args(["-m", "pip", "show", "flashinfer-python"])
         .output()

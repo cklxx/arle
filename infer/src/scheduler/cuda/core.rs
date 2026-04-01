@@ -2,6 +2,7 @@ use super::*;
 
 /// CUDA-backed scheduler state and initialization.
 pub struct Scheduler<M: ModelForward> {
+    pub(super) config: SchedulerConfig,
     pub(super) model: M,
     pub(super) tokenizer: Tokenizer,
     /// Per-slot states (KV caches, decode buffers). Stored separately from
@@ -39,7 +40,14 @@ impl<M: ModelForward> Scheduler<M> {
         num_slots: usize,
         seed: u64,
     ) -> Result<(Self, SchedulerHandle)> {
-        Self::with_max_seq_len(model, tokenizer, model_id, num_slots, seed, None)
+        Self::with_config(
+            model,
+            tokenizer,
+            model_id,
+            seed,
+            SchedulerConfig::runtime_defaults(num_slots),
+            None,
+        )
     }
 
     /// Create a new scheduler with an explicit max sequence length override.
@@ -51,26 +59,47 @@ impl<M: ModelForward> Scheduler<M> {
         seed: u64,
         max_seq_len_override: Option<usize>,
     ) -> Result<(Self, SchedulerHandle)> {
+        Self::with_config(
+            model,
+            tokenizer,
+            model_id,
+            seed,
+            SchedulerConfig::runtime_defaults(num_slots),
+            max_seq_len_override,
+        )
+    }
+
+    /// Create a scheduler from an explicit runtime configuration.
+    pub fn with_config(
+        model: M,
+        tokenizer: Tokenizer,
+        model_id: &str,
+        seed: u64,
+        config: SchedulerConfig,
+        max_seq_len_override: Option<usize>,
+    ) -> Result<(Self, SchedulerHandle)> {
+        config.validate()?;
+
         let (tx, rx) = mpsc::unbounded_channel();
         let effective_max_seq_len =
-            Self::compute_max_seq_len(&model, num_slots, max_seq_len_override);
+            Self::compute_max_seq_len(&model, config.max_slots, max_seq_len_override);
 
-        let mut states = Vec::with_capacity(num_slots);
-        let mut cached_prompts = Vec::with_capacity(num_slots);
-        for i in 0..num_slots {
+        let mut states = Vec::with_capacity(config.max_slots);
+        let mut cached_prompts = Vec::with_capacity(config.max_slots);
+        for i in 0..config.max_slots {
             let mut state = model.create_state()?;
             if let Some(max_seq) = effective_max_seq_len {
                 state.set_max_seq_len(max_seq);
             }
             states.push(state);
             cached_prompts.push(Vec::new());
-            info!("Initialized state slot {}/{}", i + 1, num_slots);
+            info!("Initialized state slot {}/{}", i + 1, config.max_slots);
         }
 
         let paged_kv_pool = {
             let contiguous_max = effective_max_seq_len.unwrap_or(1024);
             let bytes_per_token = model.kv_cache_bytes_per_token();
-            let contiguous_cost = num_slots * contiguous_max * bytes_per_token;
+            let contiguous_cost = config.max_slots * contiguous_max * bytes_per_token;
             let headroom: usize = 2 * 1024 * 1024 * 1024;
             let budget_bytes = match crate::tensor::DeviceContext::gpu_memory_info() {
                 Ok((free, _)) => free.saturating_sub(contiguous_cost + headroom),
@@ -89,21 +118,24 @@ impl<M: ModelForward> Scheduler<M> {
                 model.num_kv_layers(),
                 model.num_kv_heads(),
                 model.head_dim(),
-                num_slots,
+                config.max_slots,
                 budget_bytes,
             )?
         };
 
         info!(
-            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}",
+            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, prefill_chunk_size={}",
             model_id,
-            num_slots,
+            config.max_slots,
             seed,
             effective_max_seq_len.map_or_else(|| "32768 (default)".to_string(), |n| n.to_string()),
+            config.max_waiting_requests,
+            config.prefill_chunk_size,
         );
 
         let waiting_count = Arc::new(AtomicUsize::new(0));
         let scheduler = Self {
+            config: config.clone(),
             model,
             tokenizer,
             states,
@@ -121,7 +153,7 @@ impl<M: ModelForward> Scheduler<M> {
             total_generated_tokens: 0,
         };
 
-        let handle = SchedulerHandle::with_max_waiting(tx, model_id, 256);
+        let handle = SchedulerHandle::with_max_waiting(tx, model_id, config.max_waiting_requests);
         debug_assert_eq!(handle.waiting_count(), 0);
 
         Ok((scheduler, handle))
@@ -186,6 +218,16 @@ impl<M: ModelForward> Scheduler<M> {
         Some(effective)
     }
 
+    pub(super) fn prefill_chunk_size(&self, decode_active: bool) -> usize {
+        if decode_active {
+            self.config
+                .prefill_chunk_size
+                .min(DECODE_ACTIVE_PREFILL_CHUNK_CAP)
+        } else {
+            self.config.prefill_chunk_size
+        }
+    }
+
     /// Pre-capture CUDA Graphs for batched decode at common batch sizes.
     ///
     /// Warms up graphs for batch sizes 1..min(num_slots, 32) to support
@@ -197,7 +239,10 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let max_warmup = num_slots.min(32);
-        info!("Warming up CUDA Graphs for batch sizes 1..{}...", max_warmup);
+        info!(
+            "Warming up CUDA Graphs for batch sizes 1..{}...",
+            max_warmup
+        );
         let t0 = std::time::Instant::now();
 
         for slot in 0..max_warmup {

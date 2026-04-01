@@ -77,6 +77,16 @@ struct Usage {
     total_tokens: usize,
 }
 
+impl From<crate::server_engine::Usage> for Usage {
+    fn from(value: crate::server_engine::Usage) -> Self {
+        Self {
+            prompt_tokens: value.prompt_tokens,
+            completion_tokens: value.completion_tokens,
+            total_tokens: value.total_tokens,
+        }
+    }
+}
+
 impl CompletionResponse {
     pub(super) fn from_output(model: String, created: u64, output: CompleteOutput) -> Self {
         Self {
@@ -90,11 +100,7 @@ impl CompletionResponse {
                 logprobs: None,
                 finish_reason: output.finish_reason.as_openai_str().to_string(),
             }],
-            usage: Usage {
-                prompt_tokens: output.usage.prompt_tokens,
-                completion_tokens: output.usage.completion_tokens,
-                total_tokens: output.usage.total_tokens,
-            },
+            usage: output.usage.into(),
         }
     }
 }
@@ -162,11 +168,7 @@ impl StreamUsageChunk {
             object: "text_completion",
             created,
             model: model.to_string(),
-            usage: Usage {
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-            },
+            usage: usage.into(),
         }
     }
 }
@@ -275,14 +277,8 @@ impl From<&ProtocolToolCall> for ChatToolCall {
 }
 
 impl ChatCompletionResponse {
-    pub(super) fn from_output(
-        model: String,
-        created: u64,
-        text: &str,
-        finish_reason: crate::server_engine::FinishReason,
-        usage: crate::server_engine::Usage,
-    ) -> Self {
-        let (content, parsed_calls) = crate::chat::parse_tool_calls(text);
+    pub(super) fn from_output(model: String, created: u64, output: &CompleteOutput) -> Self {
+        let (content, parsed_calls) = crate::chat::parse_tool_calls(&output.text);
         let tool_calls: Vec<ChatToolCall> = parsed_calls.iter().map(ChatToolCall::from).collect();
 
         let message = AssistantMessage {
@@ -296,7 +292,7 @@ impl ChatCompletionResponse {
         };
 
         let fr_str = if message.tool_calls.is_empty() {
-            finish_reason.as_openai_str()
+            output.finish_reason.as_openai_str()
         } else {
             "tool_calls"
         };
@@ -311,11 +307,7 @@ impl ChatCompletionResponse {
                 message,
                 finish_reason: fr_str.to_string(),
             }],
-            usage: Usage {
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-            },
+            usage: output.usage.into(),
         }
     }
 }
@@ -418,11 +410,7 @@ impl ChatStreamUsageChunk {
             object: "chat.completion.chunk",
             created,
             model: model.to_string(),
-            usage: Usage {
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-            },
+            usage: usage.into(),
         }
     }
 }

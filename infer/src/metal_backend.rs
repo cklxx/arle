@@ -411,7 +411,7 @@ fn metal_generate(
     max_new_tokens: usize,
     t0: Instant,
 ) -> Result<Vec<u32>> {
-    use mlx_rs::{ops::zeros_dtype_device, StreamOrDevice};
+    use mlx_rs::{StreamOrDevice, ops::zeros_dtype_device};
 
     let n_layers = config.num_hidden_layers;
     let n_heads = config.num_attention_heads as i32;
@@ -433,8 +433,7 @@ fn metal_generate(
     // P5: KV cache starts at the next 256-token boundary above the prefill length,
     // plus one chunk for initial decode steps.  Grown lazily in KV_CACHE_CHUNK steps.
     let prefill_len = input_ids.len() as i32;
-    let initial_cap =
-        ((prefill_len + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK + 1) * KV_CACHE_CHUNK;
+    let initial_cap = ((prefill_len + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK + 1) * KV_CACHE_CHUNK;
     let mut kv_capacity = initial_cap;
 
     let kv_dtype = weights.layers[0].k_proj.dtype();
@@ -453,13 +452,25 @@ fn metal_generate(
 
     // ── Phase 1: Prefill — build lazy graph, schedule GPU asynchronously ─────
     let prefill_token = build_forward_graph(
-        input_ids, weights, &mut k_caches, &mut v_caches,
-        cache_len, n_heads, n_kv_heads, head_dim,
-        attn_scale, rope_base, eps, use_fused, params,
+        input_ids,
+        weights,
+        &mut k_caches,
+        &mut v_caches,
+        cache_len,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        attn_scale,
+        rope_base,
+        eps,
+        use_fused,
+        params,
     )?;
     // P6: schedule GPU execution without blocking CPU.
     // SAFETY: prefill_token is a valid lazy Array; async_eval borrows by ctx pointer.
-    unsafe { metal_ffi::metal_async_eval(prefill_token.as_ptr()); }
+    unsafe {
+        metal_ffi::metal_async_eval(prefill_token.as_ptr());
+    }
     cache_len += prefill_len;
 
     // ── Phase 2: Decode loop (double-buffered — P3/P6) ────────────────────────
@@ -497,11 +508,15 @@ fn metal_generate(
                 unsafe {
                     metal_ffi::metal_kv_extend(
                         (&raw mut k_caches[li]).cast::<mlx_sys::mlx_array>(),
-                        n_kv_heads, head_dim, new_cap,
+                        n_kv_heads,
+                        head_dim,
+                        new_cap,
                     );
                     metal_ffi::metal_kv_extend(
                         (&raw mut v_caches[li]).cast::<mlx_sys::mlx_array>(),
-                        n_kv_heads, head_dim, new_cap,
+                        n_kv_heads,
+                        head_dim,
+                        new_cap,
                     );
                 }
             }
@@ -511,21 +526,35 @@ fn metal_generate(
         // P5: release accumulated temporary Metal allocations every 256 steps.
         if decode_step > 0 && decode_step.is_multiple_of(256) {
             // SAFETY: pure cache management; no Array handles are affected.
-            unsafe { metal_ffi::metal_clear_cache(); }
+            unsafe {
+                metal_ffi::metal_clear_cache();
+            }
         }
 
         // Build next decode step's lazy graph (CPU-only; GPU idle until async_eval).
         let new_pending = build_forward_graph(
-            &[next_token], weights, &mut k_caches, &mut v_caches,
-            cache_len, n_heads, n_kv_heads, head_dim,
-            attn_scale, rope_base, eps, use_fused, params,
+            &[next_token],
+            weights,
+            &mut k_caches,
+            &mut v_caches,
+            cache_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            attn_scale,
+            rope_base,
+            eps,
+            use_fused,
+            params,
         )?;
         cache_len += 1;
         decode_step += 1;
 
         // P6: kick off GPU — CPU syncs at top of next iteration via item().
         // SAFETY: new_pending is a valid lazy Array; async_eval borrows by ctx pointer.
-        unsafe { metal_ffi::metal_async_eval(new_pending.as_ptr()); }
+        unsafe {
+            metal_ffi::metal_async_eval(new_pending.as_ptr());
+        }
 
         pending = new_pending;
     }
@@ -573,14 +602,23 @@ fn build_forward_graph(
         // P2 + P7: one C++ FFI call per layer; all intermediate Arrays are C++-scoped.
         // Rust only holds the layer input (x) and output (x_next) Array handles.
         for (li, layer) in weights.layers.iter().enumerate() {
-            let (WeightTensor::Dense(q_proj_t), WeightTensor::Dense(k_proj_t),
-                 WeightTensor::Dense(v_proj_t), WeightTensor::Dense(o_proj_t)) =
-                (&layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj)
-            else { unreachable!("use_fused only when all layers are Dense") };
-            let (WeightTensor::Dense(gate_proj_t), WeightTensor::Dense(up_proj_t),
-                 WeightTensor::Dense(down_proj_t)) =
-                (&layer.gate_proj, &layer.up_proj, &layer.down_proj)
-            else { unreachable!("use_fused only when all layers are Dense") };
+            let (
+                WeightTensor::Dense(q_proj_t),
+                WeightTensor::Dense(k_proj_t),
+                WeightTensor::Dense(v_proj_t),
+                WeightTensor::Dense(o_proj_t),
+            ) = (&layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj)
+            else {
+                unreachable!("use_fused only when all layers are Dense")
+            };
+            let (
+                WeightTensor::Dense(gate_proj_t),
+                WeightTensor::Dense(up_proj_t),
+                WeightTensor::Dense(down_proj_t),
+            ) = (&layer.gate_proj, &layer.up_proj, &layer.down_proj)
+            else {
+                unreachable!("use_fused only when all layers are Dense")
+            };
 
             // SAFETY: metal_fused_block_cached borrows all inputs (does not free them).
             // It writes a newly heap-allocated array into result_raw, transferred to Rust.
@@ -590,16 +628,26 @@ fn build_forward_graph(
                     x.as_ptr(),
                     layer.input_layernorm.as_ptr(),
                     layer.post_attention_layernorm.as_ptr(),
-                    q_proj_t.as_ptr(), k_proj_t.as_ptr(), v_proj_t.as_ptr(), o_proj_t.as_ptr(),
-                    layer.q_norm.as_ptr(), layer.k_norm.as_ptr(),
-                    gate_proj_t.as_ptr(), up_proj_t.as_ptr(), down_proj_t.as_ptr(),
-                    n_heads, n_kv_heads, head_dim,
-                    attn_scale, rope_base,
+                    q_proj_t.as_ptr(),
+                    k_proj_t.as_ptr(),
+                    v_proj_t.as_ptr(),
+                    o_proj_t.as_ptr(),
+                    layer.q_norm.as_ptr(),
+                    layer.k_norm.as_ptr(),
+                    gate_proj_t.as_ptr(),
+                    up_proj_t.as_ptr(),
+                    down_proj_t.as_ptr(),
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    attn_scale,
+                    rope_base,
                     head_dim, // rope_dims = head_dim
                     eps,
                     (&raw mut k_caches[li]).cast::<mlx_sys::mlx_array>(),
                     (&raw mut v_caches[li]).cast::<mlx_sys::mlx_array>(),
-                    cache_len, seq,
+                    cache_len,
+                    seq,
                     r.as_mut_ptr(),
                 );
                 r.assume_init()
@@ -611,9 +659,7 @@ fn build_forward_graph(
         // Fallback: Rust-level layer loop (quantized models).
         for (li, layer) in weights.layers.iter().enumerate() {
             x = rust_transformer_layer(
-                x, layer, li,
-                k_caches, v_caches,
-                seq, cache_len, n_heads, n_kv_heads, head_dim,
+                x, layer, li, k_caches, v_caches, seq, cache_len, n_heads, n_kv_heads, head_dim,
                 attn_scale, rope_base, eps,
             )?;
         }
@@ -674,8 +720,10 @@ fn rust_transformer_layer(
     let v = reshape(&v_raw, &[1, seq, n_kv_heads, head_dim]).context("reshape v")?;
 
     // 5. RoPE
-    let q = fast::rope(&q, head_dim, false, rope_base, 1.0f32, cache_len, None).context("rope q")?;
-    let k = fast::rope(&k, head_dim, false, rope_base, 1.0f32, cache_len, None).context("rope k")?;
+    let q =
+        fast::rope(&q, head_dim, false, rope_base, 1.0f32, cache_len, None).context("rope q")?;
+    let k =
+        fast::rope(&k, head_dim, false, rope_base, 1.0f32, cache_len, None).context("rope k")?;
 
     // 6. Transpose to [1, n_heads, seq, head_dim]
     let q = transpose_axes(&q, &[0, 2, 1, 3]).context("transpose q")?;
@@ -690,15 +738,22 @@ fn rust_transformer_layer(
     v_caches[li]
         .try_index_mut((.., .., cache_len..end_pos, ..), &v)
         .context("slice_update v_cache")?;
-    let k_full = k_caches[li].try_index((.., .., 0i32..end_pos, ..)).context("slice k_cache")?;
-    let v_full = v_caches[li].try_index((.., .., 0i32..end_pos, ..)).context("slice v_cache")?;
+    let k_full = k_caches[li]
+        .try_index((.., .., 0i32..end_pos, ..))
+        .context("slice k_cache")?;
+    let v_full = v_caches[li]
+        .try_index((.., .., 0i32..end_pos, ..))
+        .context("slice v_cache")?;
 
     // 8. Attention
     let use_causal = cache_len == 0 && seq > 1;
-    let mask_arg = if use_causal { Some(fast::ScaledDotProductAttentionMask::Causal) } else { None };
-    let attn_out =
-        fast::scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, mask_arg)
-            .context("sdpa")?;
+    let mask_arg = if use_causal {
+        Some(fast::ScaledDotProductAttentionMask::Causal)
+    } else {
+        None
+    };
+    let attn_out = fast::scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, mask_arg)
+        .context("sdpa")?;
 
     // 9. Reshape + output proj + residual
     let attn_out = transpose_axes(&attn_out, &[0, 2, 1, 3]).context("transpose attn_out")?;
@@ -708,10 +763,14 @@ fn rust_transformer_layer(
 
     // 10. MLP
     let residual2 = x.clone();
-    let xn = fast::rms_norm(&x, &layer.post_attention_layernorm, eps).context("post_attn_layernorm")?;
+    let xn =
+        fast::rms_norm(&x, &layer.post_attention_layernorm, eps).context("post_attn_layernorm")?;
     let gate = silu(&linear(&xn, &layer.gate_proj)?).context("silu gate")?;
     let up = linear(&xn, &layer.up_proj)?;
-    let mlp = linear(&ops::multiply(&gate, &up).context("gate*up")?, &layer.down_proj)?;
+    let mlp = linear(
+        &ops::multiply(&gate, &up).context("gate*up")?,
+        &layer.down_proj,
+    )?;
     ops::add(&residual2, &mlp).context("residual + mlp")
 }
 
@@ -969,7 +1028,7 @@ fn load_metal_weights(model_dir: &Path, config: &MetalModelConfig) -> Result<Met
     // lm_head may be weight-tied to embed_tokens; handle both dense and quantized.
     let lm_head =
         if tensors.contains_key("lm_head.weight") || tensors.contains_key("lm_head.scales") {
-            load_proj("lm_head")?  // load_proj pre-transposes Dense weights
+            load_proj("lm_head")? // load_proj pre-transposes Dense weights
         } else {
             // Weight-tied: transpose the dequantized embed_tokens once for lm_head use.
             // (embed_tokens itself stays [vocab, hidden] for embedding lookup.)

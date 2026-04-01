@@ -17,7 +17,7 @@ use crate::model::{ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model};
 #[cfg(feature = "cuda")]
 use crate::model_registry::{ModelArch, detect_arch};
 #[cfg(feature = "cuda")]
-use crate::scheduler::{Scheduler, SchedulerHandle};
+use crate::scheduler::{Scheduler, SchedulerConfig, SchedulerHandle};
 #[cfg(feature = "cuda")]
 use crate::tokenizer::Tokenizer;
 
@@ -49,6 +49,27 @@ impl Default for EngineOptions {
     fn default() -> Self {
         Self {
             enable_cuda_graph: true,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug)]
+pub struct ServerRuntimeConfig {
+    pub engine: EngineOptions,
+    pub scheduler: SchedulerConfig,
+    pub seed: u64,
+    pub max_seq_len: Option<usize>,
+}
+
+#[cfg(feature = "cuda")]
+impl Default for ServerRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            engine: EngineOptions::default(),
+            scheduler: SchedulerConfig::runtime_defaults(4),
+            seed: 42,
+            max_seq_len: None,
         }
     }
 }
@@ -142,38 +163,27 @@ pub fn load_model_components(
 #[cfg(feature = "cuda")]
 pub fn spawn_scheduler_handle(
     components: LoadedModelComponents,
-    num_slots: usize,
-    seed: u64,
-    max_seq_len: Option<usize>,
+    runtime: ServerRuntimeConfig,
 ) -> Result<SchedulerHandle> {
     match components {
-        LoadedModelComponents::Qwen3(components) => {
-            spawn_scheduler_for_model(components, num_slots, seed, max_seq_len)
-        }
-        LoadedModelComponents::Qwen35(components) => {
-            spawn_scheduler_for_model(components, num_slots, seed, max_seq_len)
-        }
+        LoadedModelComponents::Qwen3(components) => spawn_scheduler_for_model(components, runtime),
+        LoadedModelComponents::Qwen35(components) => spawn_scheduler_for_model(components, runtime),
     }
 }
 
 #[cfg(feature = "cuda")]
 pub fn spawn_scheduler_handle_from_path(
     model_path: &str,
-    num_slots: usize,
-    seed: u64,
-    options: EngineOptions,
-    max_seq_len: Option<usize>,
+    runtime: ServerRuntimeConfig,
 ) -> Result<SchedulerHandle> {
-    let components = load_model_components(model_path, options)?;
-    spawn_scheduler_handle(components, num_slots, seed, max_seq_len)
+    let components = load_model_components(model_path, runtime.engine)?;
+    spawn_scheduler_handle(components, runtime)
 }
 
 #[cfg(feature = "cuda")]
 fn spawn_scheduler_for_model<M: ModelForward + 'static>(
     components: ModelComponents<M>,
-    num_slots: usize,
-    seed: u64,
-    max_seq_len: Option<usize>,
+    runtime: ServerRuntimeConfig,
 ) -> Result<SchedulerHandle> {
     let ModelComponents {
         model_id,
@@ -181,8 +191,15 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         model,
     } = components;
 
+    let ServerRuntimeConfig {
+        scheduler,
+        seed,
+        max_seq_len,
+        ..
+    } = runtime;
+
     let (scheduler, handle) =
-        Scheduler::with_max_seq_len(model, tokenizer, &model_id, num_slots, seed, max_seq_len)?;
+        Scheduler::with_config(model, tokenizer, &model_id, seed, scheduler, max_seq_len)?;
     std::thread::spawn(move || scheduler.run());
     Ok(handle)
 }

@@ -94,7 +94,10 @@ pub fn prefill_attention_batch(
                 ctx.stream.cu_stream(),
             );
             if ret != 0 {
-                return Err(anyhow!("flashinfer_single_prefill failed: CUDA error {}", ret));
+                return Err(anyhow!(
+                    "flashinfer_single_prefill failed: CUDA error {}",
+                    ret
+                ));
             }
         }
     }

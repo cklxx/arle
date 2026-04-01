@@ -1,11 +1,87 @@
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use infer::chat_protocol::{ToolCall as ProtocolToolCall, ToolDefinition};
 
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuiltinToolKind {
+    Shell,
+    Python,
+}
+
+impl BuiltinToolKind {
+    const ALL: [Self; 2] = [Self::Shell, Self::Python];
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "shell" => Some(Self::Shell),
+            "python" => Some(Self::Python),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Python => "python",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Shell => {
+                "Execute a shell command and return its stdout and stderr. Use this for file operations, system inspection, running programs, etc."
+            }
+            Self::Python => {
+                "Execute a Python 3 code snippet and return its stdout and stderr. Use this for calculations, data processing, or any task best done in Python."
+            }
+        }
+    }
+
+    fn parameters(self) -> Value {
+        match self {
+            Self::Shell => json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute"
+                    }
+                },
+                "required": ["command"]
+            }),
+            Self::Python => json!({
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "The Python 3 code to execute"
+                    }
+                },
+                "required": ["code"]
+            }),
+        }
+    }
+
+    fn into_tool(self) -> Tool {
+        Tool {
+            name: self.name().to_string(),
+            description: self.description().to_string(),
+            parameters: self.parameters(),
+        }
+    }
+
+    fn execute(self, arguments: &Value) -> String {
+        match self {
+            Self::Shell => execute_shell(argument_as_str(arguments, "command")),
+            Self::Python => execute_python(argument_as_str(arguments, "code")),
+        }
+    }
+}
 
 // ============================================================================
 // Sandbox configuration — nsjail backend
@@ -68,7 +144,15 @@ impl SandboxConfig {
         cmd.arg("--disable_proc");
 
         // Read-only bind mounts for system dirs
-        for dir in &["/bin", "/lib", "/lib64", "/usr", "/etc", "/dev/null", "/dev/urandom"] {
+        for dir in &[
+            "/bin",
+            "/lib",
+            "/lib64",
+            "/usr",
+            "/etc",
+            "/dev/null",
+            "/dev/urandom",
+        ] {
             if std::path::Path::new(dir).exists() {
                 cmd.arg("-R").arg(dir);
             }
@@ -155,58 +239,25 @@ impl Tool {
 
 /// Return the built-in tool definitions.
 pub fn builtin_tools() -> Vec<Tool> {
-    vec![
-        Tool {
-            name: "shell".to_string(),
-            description: "Execute a shell command and return its stdout and stderr. Use this for file operations, system inspection, running programs, etc.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The shell command to execute"
-                    }
-                },
-                "required": ["command"]
-            }),
-        },
-        Tool {
-            name: "python".to_string(),
-            description: "Execute a Python 3 code snippet and return its stdout and stderr. Use this for calculations, data processing, or any task best done in Python.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "code": {
-                        "type": "string",
-                        "description": "The Python 3 code to execute"
-                    }
-                },
-                "required": ["code"]
-            }),
-        },
-    ]
+    BuiltinToolKind::ALL
+        .into_iter()
+        .map(BuiltinToolKind::into_tool)
+        .collect()
 }
 
 // ============================================================================
 // Tool execution
 // ============================================================================
 
+fn argument_as_str<'a>(arguments: &'a Value, key: &str) -> &'a str {
+    arguments.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
 /// Execute a tool by name with the given JSON arguments.
 pub fn execute_tool(name: &str, arguments: &serde_json::Value) -> String {
-    match name {
-        "shell" => {
-            let command = arguments
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            execute_shell(command)
-        }
-        "python" => {
-            let code = arguments.get("code").and_then(|v| v.as_str()).unwrap_or("");
-            execute_python(code)
-        }
-        _ => format!("Error: unknown tool '{name}'"),
-    }
+    BuiltinToolKind::from_name(name)
+        .map(|tool| tool.execute(arguments))
+        .unwrap_or_else(|| format!("Error: unknown tool '{name}'"))
 }
 
 /// Execute a structured tool call.
@@ -223,7 +274,9 @@ fn collect_output(output: std::process::Output) -> String {
     // Filter nsjail's own log lines (e.g. "[W][...] logParams()...")
     let stderr: String = raw_stderr
         .lines()
-        .filter(|line| !line.starts_with("[W][") && !line.starts_with("[I][") && !line.starts_with("[D]["))
+        .filter(|line| {
+            !line.starts_with("[W][") && !line.starts_with("[I][") && !line.starts_with("[D][")
+        })
         .collect::<Vec<_>>()
         .join("\n");
 

@@ -2,9 +2,12 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use infer::bootstrap::{EngineOptions, detect_model_type, spawn_scheduler_handle_from_path};
+use infer::bootstrap::{
+    EngineOptions, ServerRuntimeConfig, detect_model_type, spawn_scheduler_handle_from_path,
+};
 use infer::http_server::build_app;
 use infer::logging;
+use infer::scheduler::SchedulerConfig;
 use infer::trace_reporter::FileReporter;
 use log::info;
 
@@ -69,13 +72,17 @@ async fn main() {
         args.num_slots,
     );
 
-    let options = EngineOptions {
-        enable_cuda_graph: args.cuda_graph,
+    let runtime = ServerRuntimeConfig {
+        engine: EngineOptions {
+            enable_cuda_graph: args.cuda_graph,
+        },
+        scheduler: SchedulerConfig::runtime_defaults(args.num_slots),
+        seed: 42,
+        max_seq_len: args.max_seq_len,
     };
 
     let handle =
-        spawn_scheduler_handle_from_path(model_path, args.num_slots, 42, options, args.max_seq_len)
-            .expect("Failed to create scheduler");
+        spawn_scheduler_handle_from_path(model_path, runtime).expect("Failed to create scheduler");
 
     info!(
         "Model loaded: elapsed_ms={}, model_id={}",
