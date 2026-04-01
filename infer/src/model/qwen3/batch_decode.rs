@@ -196,7 +196,9 @@ impl Qwen3Model {
         }
         // Use tensor-core decode (prefill kernel) for GQA group_size >= 4.
         // This tiles across KV chunks, keeping ITL flat at long contexts.
-        let use_tc_decode = num_heads / num_kv_heads >= 4;
+        // TC decode (prefill kernel for attention) is available but not faster on A100
+        // for this model size — attention isn't the bottleneck, GEMV is. Keep CUDA graph.
+        let use_tc_decode = false; // Enable with: num_heads / num_kv_heads >= 4
         if use_tc_decode {
             bufs.metadata.tc_plan(
                 &self.ctx,
@@ -237,7 +239,12 @@ impl Qwen3Model {
         // plan() was called above (updates int_workspace). graph_body only does
         // kernel launches — no allocs, no H2D, no CPU memcpy (except FlashInfer's
         // plan_info read which sets kernel params, baked on capture, stable per bs).
-        if let Some(ref graph) = bufs.graph_cache[batch_size - 1] {
+        //
+        // TC decode (prefill kernel) is NOT compatible with CUDA graph because the
+        // plan's grid size changes with KV length. Run eagerly for TC decode.
+        if use_tc_decode {
+            self.decode_batch_graph_body(bufs, paged_kv_pool, batch_size)?;
+        } else if let Some(ref graph) = bufs.graph_cache[batch_size - 1] {
             graph
                 .launch()
                 .map_err(|e| anyhow::anyhow!("CUDA Graph replay (B={}): {e}", batch_size))?;
@@ -396,7 +403,9 @@ impl Qwen3Model {
         )?;
 
         // 4. FlashInfer attention (run only -- plan was called once before loop)
-        let use_tc_decode = num_heads / num_kv_heads >= 4;
+        // TC decode (prefill kernel for attention) is available but not faster on A100
+        // for this model size — attention isn't the bottleneck, GEMV is. Keep CUDA graph.
+        let use_tc_decode = false; // Enable with: num_heads / num_kv_heads >= 4
         if use_tc_decode {
             ops::flashinfer_tc_run_layer(
                 &self.ctx,

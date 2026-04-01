@@ -522,8 +522,8 @@ unsafe impl Send for FlashInferWorkspace {}
 
 impl FlashInferWorkspace {
     /// Default sizes matching FlashInfer's typical requirements.
-    /// 512MB matches sglang's Qwen3-specific setting for split-KV temporaries.
-    const FLOAT_WORKSPACE_BYTES: usize = 512 * 1024 * 1024; // 512 MB
+    /// 256MB for split-KV temporaries (sglang uses 512MB but we need headroom).
+    const FLOAT_WORKSPACE_BYTES: usize = 256 * 1024 * 1024; // 256 MB
     const INT_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
     const PAGE_LOCKED_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
     const PLAN_INFO_BYTES: usize = 256;
