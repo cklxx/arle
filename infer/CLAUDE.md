@@ -2,7 +2,7 @@ This file provides guidance to Coding Agent when working with code in this repos
 
 ## What is infer
 
-Pure Rust + CUDA LLM inference engine (~7K Rust, ~3.4K CUDA). No PyTorch, no frameworks. Supports Qwen3-4B, Qwen3-8B, and Qwen3.5-4B (hybrid linear + full attention). OpenAI-compatible `/v1/completions` API.
+Pure Rust + CUDA LLM inference engine. No PyTorch, no frameworks. Supports Qwen3 (4B/8B) and Qwen3.5-4B (hybrid linear + full attention) with continuous batching scheduler. OpenAI-compatible `/v1/completions` + `/v1/chat/completions` API. FlashInfer for both prefill (HD128) and batched decode. Near SGLang-parity throughput on Qwen3-8B.
 
 ## Build & Run
 
@@ -43,7 +43,7 @@ HTTP Request → SchedulerHandle.submit() → channel → Scheduler.run() (dedic
                                               ┌─── Token-level KV Pool (SGLang-style paged) ───┐
                                               │         │                                       │
                                               │   Decode priority round-robin                   │
-                                              │   Chunked prefill (512 tok/chunk)               │
+                                              │   Chunked prefill (4096 tok/chunk, 64 w/ decode) │
                                               │   Batched decode (FlashInfer + CUDA Graph)      │
                                               │         │                                       │
                                               └─── model.forward(tokens, &mut slot.state) ──────┘
@@ -70,19 +70,20 @@ HTTP Request → SchedulerHandle.submit() → channel → Scheduler.run() (dedic
 
 **Key abstractions:**
 
-- **`Scheduler`** (`scheduler.rs`) — multi-request scheduler with state pooling. Accepts requests via channel, interleaves them on a single GPU. Decode steps always run before new prefills. Long prefills are chunked (512 tokens) to allow decode interleaving. Each slot has its own KV cache for prefix reuse. `--num-slots N` controls concurrency (default 4).
+- **`Scheduler`** (`scheduler/`) — multi-request scheduler with state pooling. Accepts requests via channel, interleaves them on a single GPU. Decode steps always run before new prefills. Long prefills are chunked (4096 tokens, 64 when decode active) to allow decode interleaving. Prefix-aware slot assignment for KV cache reuse. `--num-slots N` controls concurrency (default 4). CUDA Graph warmup for batch sizes 1–32.
 - **`ModelForward` trait** (`model.rs`) — single `forward(&self, tokens, state)` method; `tokens.len() > 1` → prefill, `== 1` → decode. Weights are `&self` (immutable, shareable across slots), per-request mutable state lives in the associated `State` type.
 - **`GenericServerEngine`** (`server_engine.rs`) — legacy single-request engine, still used by the REPL/agent CLI. HTTP server uses Scheduler instead.
 - **Model submodules** — each model lives under `src/model/{qwen3,qwen35}/` with `weights.rs`, `forward.rs`, `prefill.rs`, `decode.rs`, `config.rs`, `decode_buffers.rs`. Shared code: `model/cuda_graph.rs` (CUDA Graph capture/replay), `model/kv_cache.rs`.
 - **`ops.rs`** — high-level GPU operators (gemv, rms_norm, rope, fused_mlp, fused_attention, sampling). Calls unsafe C FFI in `ffi.rs`.
 - **Tensor types** (`tensor.rs`) — `DeviceVec` (1D bf16), `DeviceMatrix` (2D bf16), `HiddenStates` (batched hidden states). All GPU-resident, accessed via cudarc.
-- **CUDA Graph** (`model/cuda_graph.rs`) — decode path captured per state slot on first token, replayed on subsequent tokens. Each slot has independent graph state.
+- **CUDA Graph** (`model/cuda_graph.rs`) — batched decode captured per batch size (1–32), replayed on subsequent steps. Eliminates ~504 kernel launches per decode step.
 - **KVCache** (`model/kv_cache.rs`) — per-layer contiguous K/V buffers with CPU offload. Multiple instances coexist (one per scheduler slot).
 - **RecurrentState** (`model/qwen35/recurrent_state.rs`) — Qwen3.5 linear attention state, persists across decode steps within a generation.
 
-**Build system** (`build.rs`) does two things:
+**Build system** (`build.rs`) does three things:
 1. Compiles `csrc/*.cu` with nvcc (auto-detects GPU SM targets)
-2. Runs Triton AOT compilation via `tools/triton/gen_triton_aot.py` for 7 kernels (silu_mul, add, embedding variants, split-KV attention decode/reduce)
+2. Runs Triton AOT compilation via `tools/triton/gen_triton_aot.py` for kernels (silu_mul, add, embedding variants, HD256 attention, GDR chunkwise)
+3. Links FlashInfer C library for single prefill (HD128) and batched decode attention
 
 ---
 

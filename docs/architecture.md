@@ -655,7 +655,7 @@ Every decode step with B active requests:
 
 4. **Decode before prefill** — scheduler prioritizes batch-decoding all active requests before any prefill chunk. Prevents decode latency spikes from prefill interference.
 
-5. **Chunked prefill (512 tokens)** — long prompts are prefilled in 512-token chunks, allowing decode steps to interleave. Prevents prefill from starving active decoders.
+5. **Chunked prefill (4096 tokens, 64 when decode active)** — long prompts are prefilled in chunks, allowing decode steps to interleave. Prevents prefill from starving active decoders.
 
 6. **CUDA Graph per batch size** — `BatchDecodeBuffers` captures a CUDA Graph on the first decode pass for each distinct batch_size. Subsequent steps with the same batch_size replay the graph, eliminating CPU-GPU kernel dispatch overhead. Pre-captured at startup for all expected batch sizes.
 
@@ -669,25 +669,29 @@ Every decode step with B active requests:
 
 ---
 
-## What's Implemented (as of 2026-03-31)
+## What's Implemented (as of 2026-04-01)
 
 | Component | Status |
 |-----------|--------|
 | Qwen3 model (GQA) | ✅ |
 | Qwen3.5 model (hybrid recurrent+attn) | ✅ |
-| FlashAttention-2 (Triton, prefill) | ✅ |
-| Decode attention kernel (Triton split-KV, single-request) | ✅ |
+| Qwen3.5 scheduler + batched decode | ✅ |
+| FlashInfer single prefill (HD128) | ✅ |
+| FlashAttention-2 (Triton, HD256 prefill) | ✅ |
+| FlashInfer batch decode (plan/run, paged KV) | ✅ |
+| Merged QKV + gate-up GEMM | ✅ |
+| scatter_kv + decode_prep_paged + kv_cache_to_paged kernels | ✅ |
 | KV cache with CPU offload (single-request path) | ✅ |
 | TokenKVPool — token-level paged KV (page_size=1) | ✅ |
-| FlashInfer batch decode (plan/run, paged KV) | ✅ |
-| scatter_kv + decode_prep_paged + kv_cache_to_paged kernels | ✅ |
-| CUDA Graph per batch size (pre-captured at startup) | ✅ |
+| CUDA Graph per batch size (pre-captured 1–32 at startup) | ✅ |
 | Continuous batching scheduler | ✅ |
-| Chunked prefill (512-token chunks) | ✅ |
+| Chunked prefill (4096 tok, 64 when decode active) | ✅ |
 | Decode-priority scheduling | ✅ |
+| Prefix-aware slot assignment | ✅ |
 | Request priority + backpressure | ✅ |
 | top-k / top-p / temperature / min-p sampling | ✅ |
 | Repetition / frequency / presence penalties | ✅ |
+| Batched sampling (single sync) | ✅ |
 | OpenAI `/v1/completions` API | ✅ |
 | OpenAI `/v1/chat/completions` API | ✅ |
 | SSE streaming | ✅ |
@@ -702,7 +706,7 @@ Every decode step with B active requests:
 | Rust agent binary (tool calling) | ✅ |
 | Python agent (async HTTP) | ✅ |
 | Metal backend (Apple Silicon, mlx-rs) | ✅ (single-request) |
-| PagedAttention CUDA kernel (arbitrary page size) | ❌ |
+| Benchmark suite (throughput, agent, multi-request) | ✅ |
 | Llama / DeepSeek / Mistral / Gemma / Phi models | ❌ |
 | FlashAttention-3 | ❌ |
 | MLA attention (DeepSeek) | ❌ |

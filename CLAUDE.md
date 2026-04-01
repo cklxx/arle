@@ -171,7 +171,7 @@ agent-infer/          ← top-level Cargo workspace
 │   ├── src/
 │   │   ├── model/       ← Model implementations (Qwen3, Qwen35, ...)
 │   │   ├── ops/         ← CUDA-backed tensor ops (attention, linear, norm...)
-│   │   ├── scheduler.rs ← Multi-request continuous batching scheduler
+│   │   ├── scheduler/   ← Multi-request continuous batching scheduler
 │   │   ├── sampler.rs   ← Sampling strategies
 │   │   ├── http_server/ ← OpenAI-compatible HTTP API
 │   │   └── server_engine.rs ← Single-request inference façade
@@ -185,7 +185,7 @@ agent-infer/          ← top-level Cargo workspace
 - **`ModelForward` trait** (`infer/src/model.rs`) — single `forward()` entry point per model. Implement for each new architecture.
 - **`GenerationState` trait** — per-request mutable state (KV cache, recurrent state). Separate from weights.
 - **`ServerEngine` trait** — single-request synchronous inference (used by agent binary + tests).
-- **`Scheduler`** (`infer/src/scheduler.rs`) — multi-request continuous batching over any `ModelForward`.
+- **`Scheduler`** (`infer/src/scheduler/`) — multi-request continuous batching over any `ModelForward`.
 - **`SamplingParams`** (`infer/src/sampler.rs`) — sampling config (temperature, top-k, top-p, ...).
 - **`SchedulerHandle`** — `Clone + Send` handle for submitting requests from HTTP handlers.
 
@@ -210,27 +210,33 @@ FFI bindings are declared in `infer/src/ffi.rs`.
 
 ## Key References
 
-[ModelForward trait](infer/src/model.rs) · [Scheduler](infer/src/scheduler.rs) · [KV cache](infer/src/model/kv_cache.rs) · [Attention ops](infer/src/ops/attention.rs) · [HTTP server](infer/src/http_server.rs) · [Roadmap](ROADMAP.md)
+[ModelForward trait](infer/src/model.rs) · [Scheduler](infer/src/scheduler/) · [KV cache](infer/src/model/kv_cache.rs) · [Attention ops](infer/src/ops/attention.rs) · [HTTP server](infer/src/http_server.rs) · [Roadmap](ROADMAP.md)
 
 ---
 
-## What's Implemented (as of 2026-03-31)
+## What's Implemented (as of 2026-04-01)
 
 | Component | Status |
 |-----------|--------|
 | Qwen3 model (GQA) | ✅ |
 | Qwen3.5 model (hybrid recurrent+attn) | ✅ |
-| FlashAttention-2 (Triton, prefill) | ✅ |
-| Decode attention kernel (Triton) | ✅ |
+| Qwen3.5 scheduler + batched decode | ✅ |
+| FlashInfer single prefill (HD128) | ✅ |
+| FlashAttention-2 (Triton, HD256 prefill) | ✅ |
+| FlashInfer batched decode attention | ✅ |
+| Merged QKV + gate-up GEMM | ✅ |
+| Batched GEMM decode (multi-request) | ✅ |
 | KV cache with CPU offload | ✅ |
-| CUDA graph for decode | ✅ |
-| CUDA graph batch pool (CPU tracking + GPU stub) | ✅ |
+| Token-level KV pool (SGLang-style) | ✅ |
+| CUDA Graph for batched decode (per batch size 1–32) | ✅ |
 | Continuous batching scheduler | ✅ |
-| Chunked prefill (512-token chunks) | ✅ |
+| Chunked prefill (4096 tok, 64 when decode active) | ✅ |
 | Decode-priority scheduling | ✅ |
+| Prefix-aware slot assignment | ✅ |
 | Request priority + backpressure | ✅ |
 | top-k / top-p / temperature / min-p sampling | ✅ |
 | Repetition / frequency / presence penalties | ✅ |
+| Batched sampling (single sync) | ✅ |
 | OpenAI `/v1/completions` API | ✅ |
 | OpenAI `/v1/chat/completions` API | ✅ |
 | SSE streaming | ✅ |
@@ -239,19 +245,14 @@ FFI bindings are declared in `infer/src/ffi.rs`.
 | Model architecture registry (9 architectures) | ✅ |
 | Quantization format detection (GPTQ/AWQ/FP8/INT8/GGUF) | ✅ (detection only) |
 | Radix tree prefix cache (data structure) | ✅ (CPU, not yet GPU-wired) |
-| Token-level KV pool (SGLang-style) | ✅ |
 | Speculative decoding framework | ✅ (CPU stubs, GPU pending) |
 | Tensor parallel config + sharding math | ✅ (CPU, NCCL stubs) |
 | Rust agent binary (tool calling) | ✅ |
 | Python agent (async HTTP) | ✅ |
-| FlashInfer batched decode attention | ✅ |
-| Batched GEMM decode (multi-request) | ✅ |
-| CUDA Graph for batched decode | ✅ |
-| Batched sampling (single sync) | ✅ |
+| Benchmark suite (throughput, agent, multi-request) | ✅ |
 | Llama / DeepSeek / Mistral / Gemma / Phi models | ❌ |
 | FlashAttention-3 | ❌ |
 | MLA attention (DeepSeek) | ❌ |
 | Beam search | ❌ |
 | Quantization GPU kernels (GPTQ/AWQ/FP8/INT8) | ❌ |
 | NCCL all-reduce / all-gather | ❌ |
-| Benchmark suite (TTFT/TBT) | partial |

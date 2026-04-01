@@ -74,8 +74,8 @@ User
 └──────────────────────────┬──────────────────────────────┘
                            │  CUDA kernels
                            ▼
-         FlashAttention-2 · RMSNorm · GEMM/GEMV · Sampling
-                    (Triton + CUDA C, infer/csrc/)
+         FlashInfer · RMSNorm · GEMM/GEMV · Sampling
+                    (FlashInfer + CUDA C, infer/csrc/)
 ```
 
 ---
@@ -115,7 +115,7 @@ main()
   6. Bind HTTP server on 0.0.0.0:port
   7. Scheduler run loop on dedicated thread:
        ─ Decode priority: all active decodes run before new prefills
-       ─ Chunked prefill: 512 tokens/chunk (64 when decode active)
+       ─ Chunked prefill: 4096 tokens/chunk (64 when decode active)
        ─ Batched decode: FlashInfer paged attention + CUDA Graph replay
 ```
 
@@ -152,7 +152,7 @@ Reuses KV cache across multi-turn conversations. When a new prompt shares a pref
 When GPU HBM is full, older KV blocks are migrated to CPU RAM and prefetched back before attention. Enables contexts beyond GPU VRAM capacity.
 
 ### Continuous Batching + Chunked Prefill
-Scheduler interleaves multiple requests on a single GPU. Long prefills are chunked (512 tokens) so decode steps can run between chunks, keeping decode latency low for concurrent requests.
+Scheduler interleaves multiple requests on a single GPU. Long prefills are chunked (4096 tokens, 64 when decode active) so decode steps can run between chunks, keeping decode latency low for concurrent requests.
 
 ### CUDA Graph Decode
 Decode layer loop (36 layers × ~14 kernels = ~504 launches) is captured into CUDA Graphs — one graph per batch_size, cached in a HashMap. First call captures; subsequent calls replay. Eliminates CPU→GPU dispatch overhead per step.
@@ -298,7 +298,7 @@ agent-infer/
 │   ├── src/
 │   │   ├── model/               # Qwen3, Qwen3.5 implementations
 │   │   ├── ops/                 # GPU ops: attention, linear, norm, sampling
-│   │   ├── scheduler.rs         # Multi-request continuous batching
+│   │   ├── scheduler/           # Multi-request continuous batching
 │   │   ├── sampler.rs           # Sampling parameters + penalty logic
 │   │   ├── http_server.rs       # Axum HTTP server + SSE streaming
 │   │   ├── block_manager.rs     # Paged KV block accounting
@@ -386,12 +386,12 @@ See [ROADMAP.md](ROADMAP.md) for the full phased plan.
 
 | Phase | Focus | Status |
 |-------|-------|--------|
-| 0 | Foundation (CPU-verifiable) | ✅ Done |
-| 1 | Core GPU features (PagedAttn, more models) | 🔜 Planned |
+| 0 | Foundation (CPU-verifiable) | ✅ Complete |
+| 1 | Core GPU features (more models, FA3, MLA) | 🔄 Active |
 | 2 | Quantization (GPTQ/AWQ/FP8/INT8) | 🔜 Planned |
 | 3 | Tensor/Pipeline Parallel | 🔜 Planned |
 | 4 | Advanced decoding (beam search, speculative) | 🔜 Planned |
-| 5 | Performance optimization | 🔜 Planned |
+| 5 | Performance optimization | 🔄 Partial (5.1 CUDA Graph batch ✅) |
 
 ---
 

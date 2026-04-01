@@ -1,7 +1,14 @@
 | Path | TL;DR |
 | --- | --- |
+| **Projects** | |
+| [projects/qwen35-batched-decode.md](projects/qwen35-batched-decode.md) | **Done** — Qwen3.5 batched decode: FlashInfer HD256 + scheduler integration |
+| **Plans** | |
+| [plans/sglang-parity.md](plans/sglang-parity.md) | **Done** — Qwen3-8B sglang parity plan (C=4 exceeded) |
+| [plans/qwen35-sglang-parity.md](plans/qwen35-sglang-parity.md) | **In Progress** — Qwen3.5 sglang parity: ITL gap from per-request recurrent ops |
+| **Experience — Errors** | |
 | [experience/errors/2026-03-31-flashinfer-segfault-debug.md](experience/errors/2026-03-31-flashinfer-segfault-debug.md) | 3 bugs causing FlashInfer batch decode crash: hardcoded MAX_SEQ, GPU plan_info, double alloc |
-| [experience/wins/2026-03-31-batched-decode-throughput.md](experience/wins/2026-03-31-batched-decode-throughput.md) | 128 -> 811 tok/s (6.3x) via token pool + FlashInfer + buffer reuse + plan-once + CUDA Graph + argmax/scatter |
+| **Experience — Wins** | |
+| [experience/wins/2026-03-31-batched-decode-throughput.md](experience/wins/2026-03-31-batched-decode-throughput.md) | 128 → 811 tok/s (6.3x) via token pool + FlashInfer + buffer reuse + plan-once + CUDA Graph + argmax/scatter |
 | [experience/wins/2026-03-31-nsys-profiling-decode.md](experience/wins/2026-03-31-nsys-profiling-decode.md) | nsys profiling methodology for decode kernel analysis |
 | [experience/wins/2026-03-31-throughput-profiling.md](experience/wins/2026-03-31-throughput-profiling.md) | Profiling-driven throughput optimization for Qwen3 |
 | [experience/wins/2026-04-01-sglang-parity-steps1-4.md](experience/wins/2026-04-01-sglang-parity-steps1-4.md) | Qwen3-8B scheduler fixes: C=4 exceeds sglang (260 vs 256 tok/s) |
@@ -9,5 +16,3 @@
 | [experience/wins/2026-04-01-bench-raw-data.md](experience/wins/2026-04-01-bench-raw-data.md) | Raw benchmark data for Qwen3-8B optimization runs |
 | [experience/wins/2026-04-01-long-seq-agent-bench.md](experience/wins/2026-04-01-long-seq-agent-bench.md) | Long-sequence agent benchmark results |
 | [experience/wins/2026-04-01-qwen35-scheduler-support.md](experience/wins/2026-04-01-qwen35-scheduler-support.md) | Qwen3.5 scheduler + FlashInfer HD256 batched decode; C=1 100tok/s, C=4 290tok/s vs sglang 107/349 |
-| [plans/sglang-parity.md](plans/sglang-parity.md) | **Done** — Qwen3-8B sglang parity plan (C=4 exceeded) |
-| [plans/qwen35-sglang-parity.md](plans/qwen35-sglang-parity.md) | **In Progress** — Qwen3.5 sglang parity: ITL gap from per-request recurrent ops |

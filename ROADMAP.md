@@ -4,11 +4,17 @@ Target: **production-grade LLM inference engine** on par with sglang (excluding 
 
 ---
 
-## Current State (2026-03-31)
+## Current State (2026-04-01)
 
-Working: Qwen3/Qwen3.5 inference, FlashAttention-2 (Triton), KV cache + CPU offload, continuous batching with chunked prefill, top-k/p/temp/min-p/penalty sampling, OpenAI `/v1/completions` + `/v1/chat/completions` + SSE, CUDA graph decode, Rust agent binary, Python async agent, Prometheus `/metrics` + `/v1/stats` endpoints, model architecture registry, radix-tree prefix cache (data structure), paged KV block manager (accounting), speculative decoding framework (CPU stubs), tensor parallel config/sharding math (CPU stubs), CUDA graph batch pool (CPU tracking), quantization format detection (GPTQ/AWQ/FP8/INT8/GGUF parser).
+Working: Qwen3/Qwen3.5 inference, FlashInfer single prefill (HD128) + Triton FA2 (HD256), FlashInfer batched decode attention, KV cache + CPU offload, token-level KV pool (SGLang-style), continuous batching with chunked prefill (4096 tok), decode-priority scheduling, prefix-aware slot assignment, merged QKV + gate-up GEMM (96 fewer launches/step), CUDA Graph batched decode (per batch size), top-k/p/temp/min-p/penalty sampling, batched sampling, OpenAI `/v1/completions` + `/v1/chat/completions` + SSE, Rust agent binary, Python async agent, Prometheus `/metrics` + `/v1/stats` endpoints, model architecture registry, radix-tree prefix cache (data structure), paged KV block manager (accounting), speculative decoding framework (CPU stubs), tensor parallel config/sharding math (CPU stubs), quantization format detection (GPTQ/AWQ/FP8/INT8/GGUF parser), throughput benchmark suite (bench_throughput.py, bench_agent.py).
 
-Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi), PagedAttention CUDA kernel, MLA attention, quantization GPU kernels, tensor parallel communication (NCCL), speculative decoding GPU integration, comprehensive benchmark suite.
+**Recent milestones (April 2026)**:
+- Qwen3-8B throughput at SGLang parity: C=1 -8%, C=4 +2%, TTFT 2.5x faster
+- Qwen3.5-4B scheduler + FlashInfer HD256 batched decode: C=1 100 tok/s, C=4 290 tok/s
+- FlashInfer single prefill replaced Triton FA2 for HD128 models
+- Merged QKV + gate-up GEMM: 96 fewer kernel launches per decode step
+
+Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi), MLA attention, quantization GPU kernels, tensor parallel communication (NCCL), speculative decoding GPU integration, FlashAttention-3 (H100).
 
 ---
 
@@ -20,11 +26,11 @@ Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi), Pa
 
 ---
 
-## Phase 0 — Foundation (CPU-verifiable, no GPU needed)
+## Phase 0 — Foundation (CPU-verifiable, no GPU needed) ✅ Complete
 
-These tasks can be built and tested entirely on CPU.
+All Phase 0 tasks have been implemented and are in production use.
 
-### 0.1 Chat Completions API
+### 0.1 Chat Completions API ✅
 **Files**: `infer/src/http_server/openai_v1.rs`
 **Goal**: Add `/v1/chat/completions` endpoint with message → ChatML conversion, streaming SSE, and `finish_reason` handling. Essential for LLM clients (OpenAI SDK, litellm, etc.).
 
@@ -38,7 +44,7 @@ Tool call delta streaming (OpenAI format)
 
 ---
 
-### 0.2 Sampler Expansion
+### 0.2 Sampler Expansion ✅
 **Files**: `infer/src/sampler.rs`, `infer/src/ops/sampling.rs`
 **Goal**: Add missing sampling strategies so the engine is compatible with all common LLM configs.
 
@@ -55,8 +61,8 @@ stop_token_ids: Vec<u32>       ← additional stop tokens beyond model EOS
 
 ---
 
-### 0.3 Radix Tree Prefix Cache
-**Files**: `infer/src/model/prefix_cache.rs` (new)
+### 0.3 Radix Tree Prefix Cache ✅
+**Files**: `infer/src/prefix_cache.rs`
 **Goal**: Content-addressable KV cache reuse across requests. Requests sharing a common prefix (system prompt, few-shot examples) skip prefill for the shared portion.
 
 ```
@@ -72,8 +78,8 @@ RadixTree<BlockId>
 
 ---
 
-### 0.4 Paged KV Cache Block Manager
-**Files**: `infer/src/model/block_manager.rs` (new), extend `kv_cache.rs`
+### 0.4 Paged KV Cache Block Manager ✅
+**Files**: `infer/src/block_manager.rs`, `infer/src/model/kv_cache.rs`
 **Goal**: Fixed-size block allocator for KV cache. Required for PagedAttention and for radix cache to work across requests without copying.
 
 ```
@@ -94,22 +100,24 @@ BlockManager {
 
 ---
 
-### 0.5 Scheduler Improvements
-**Files**: `infer/src/scheduler.rs`
+### 0.5 Scheduler Improvements ✅
+**Files**: `infer/src/scheduler/`
 **Goal**: Upgrade scheduler for PagedAttention-era requirements.
 
-- **Preemption with swap**: when GPU OOM, preempt lowest-priority request, swap its KV blocks to CPU, resume later
-- **Priority queue**: add request priority field, FCFS + optional priority override
-- **Waiting queue backpressure**: expose `max_waiting_requests` config, return 503 when full
-- **Chunked prefill config**: make `PREFILL_CHUNK_SIZE` configurable per-request
-- **Stats endpoint**: `/metrics` with Prometheus-compatible counters (requests/s, TTFT p50/p95/p99, TBT p50/p95, KV cache utilization)
+- ✅ **Priority queue**: request priority field, FCFS + optional priority override
+- ✅ **Waiting queue backpressure**: `max_waiting_requests` config, returns 503 when full
+- ✅ **Chunked prefill config**: configurable chunk size (4096 default, 64 when decode active)
+- ✅ **Stats endpoint**: `/metrics` Prometheus counters + `/v1/stats` human-readable
+- ✅ **Prefix-aware slot assignment**: KV cache reuse across requests
+- ✅ **Continuous batching**: decode-priority scheduling, CUDA Graph warmup for batch sizes 1-32
+- **Preemption with swap**: when GPU OOM, preempt lowest-priority request, swap its KV blocks to CPU, resume later (not yet implemented)
 
 **Local test**: mock `ModelForward` for scheduler unit tests (no GPU).
 
 ---
 
-### 0.6 Model Architecture Registry
-**Files**: `infer/src/model/registry.rs` (new), `infer/src/server_engine.rs`
+### 0.6 Model Architecture Registry ✅
+**Files**: `infer/src/model_registry.rs`, `infer/src/server_engine.rs`
 **Goal**: Replace hard-coded `ModelType` enum with a dynamic registry. Enables adding new architectures without changing the dispatch code.
 
 ```rust
@@ -132,8 +140,8 @@ Register `Qwen3`, `Qwen35`, and stubs for `Llama`, `DeepSeek`, `Mistral`, `Gemma
 
 ---
 
-### 0.7 Benchmark Suite
-**Files**: `scripts/bench_throughput.py`, `scripts/bench_latency.py`, `infer/src/bin/bench_serving.rs`
+### 0.7 Benchmark Suite ✅
+**Files**: `scripts/bench_throughput.py`, `scripts/bench_agent.py`, `scripts/bench_multi_request.py`
 **Goal**: Comprehensive benchmark framework measuring all production metrics.
 
 ```
@@ -407,9 +415,9 @@ For DeepSeek-V3: use MTP heads (built into model) as draft — zero additional m
 
 ## Phase 5 — Performance Optimization
 
-### 5.1 CUDA Graph for Multi-Request Decode
+### 5.1 CUDA Graph for Multi-Request Decode ✅
 **Files**: `infer/src/model/cuda_graph.rs`
-**Goal**: Extend existing single-request CUDA graph to capture multi-request batched decode. Requires fixed batch size → maintain a pool of graphs (batch sizes 1, 2, 4, 8, 16, 32).
+**Goal**: Extend existing single-request CUDA graph to capture multi-request batched decode. Maintains a pool of graphs per batch size (1–32), captured on first call, replayed thereafter.
 
 ---
 
@@ -432,27 +440,26 @@ For DeepSeek-V3: use MTP heads (built into model) as draft — zero additional m
 ## Dependency Graph
 
 ```
-Phase 0 (CPU) → can start immediately, no GPU needed
-  0.1 Chat API          → enables downstream integration
-  0.2 Sampler           → no deps
-  0.3 Radix Cache       → data structure only
-  0.4 Block Manager     → depends on 0.3 design
-  0.5 Scheduler++       → depends on 0.4 design
-  0.6 Model Registry    → no deps
-  0.7 Benchmark Suite   → depends on 0.1
+Phase 0 (CPU) ✅ COMPLETE
+  0.1 Chat API          ✅
+  0.2 Sampler           ✅
+  0.3 Radix Cache       ✅
+  0.4 Block Manager     ✅
+  0.5 Scheduler++       ✅ (preemption/swap pending)
+  0.6 Model Registry    ✅
+  0.7 Benchmark Suite   ✅
 
-Phase 1 (GPU)
-  1.1 PagedAttention    → depends on 0.4 (block manager)
-  1.2 FA3               → depends on existing FA2
+Phase 1 (GPU) — ACTIVE
+  1.2 FA3               → depends on existing FA2/FlashInfer
   1.3 MLA               → needed by 1.5
-  1.4 Llama             → depends on 0.6 (registry), 1.1
-  1.5 DeepSeek          → depends on 0.6, 1.1, 1.3
-  1.6 Mistral           → depends on 0.6, 1.1
-  1.7 Gemma             → depends on 0.6, 1.1
-  1.8 Phi               → depends on 0.6, 1.1
+  1.4 Llama             → depends on 0.6 ✅ (registry)
+  1.5 DeepSeek          → depends on 0.6 ✅, 1.3
+  1.6 Mistral           → depends on 0.6 ✅
+  1.7 Gemma             → depends on 0.6 ✅
+  1.8 Phi               → depends on 0.6 ✅
 
 Phase 2 (Quantization)
-  2.1 Loader            → depends on 0.6
+  2.1 Loader            → depends on 0.6 ✅
   2.2 GPTQ/AWQ          → depends on 2.1
   2.3 FP8               → depends on 2.1
   2.4 INT8              → depends on 2.1
@@ -466,40 +473,40 @@ Phase 3 (TP/PP/EP)
   3.5 EP (MoE)          → depends on 3.3, 1.5/1.6 (MoE models)
 
 Phase 4 (Decoding)
-  4.1 Beam search       → depends on 0.4 (block sharing)
+  4.1 Beam search       → depends on 0.4 ✅ (block sharing)
   4.2 Speculative       → depends on 1.x (two models loaded)
-  4.3 Structured output → depends on 0.2 (sampler logit hooks)
+  4.3 Structured output → depends on 0.2 ✅ (sampler logit hooks)
 
 Phase 5 (Optimization)
-  5.1 CUDA graph batch  → depends on 1.1 (paged attn)
+  5.1 CUDA graph batch  ✅ (per batch size, 1–32)
   5.2 Compute/comm overlap → depends on 3.1
   5.4 Disaggregation    → depends on all Phase 3
 ```
 
 ---
 
-## Immediate Next Steps (Start Here)
+## Immediate Next Steps
 
-1. **0.1 Chat Completions API** — unblocks all OpenAI-compatible clients
-2. **0.2 Sampler Expansion** — repetition penalty is needed for all production use cases
-3. **0.6 Model Registry** — clean up `ModelType` enum before adding more models
-4. **0.3 + 0.4 Radix Cache + Block Manager** — foundation for all KV cache work
-5. **0.5 Scheduler improvements** — preemption, stats endpoint
-6. **0.7 Benchmark Suite** — need baseline numbers before GPU kernel work
+Phase 0 is complete. Focus shifts to multi-model support and performance closing:
 
-First GPU task (when on the A100): **1.1 PagedAttention** — unlocks all model-architecture work, enables large contexts without OOM.
+1. **Qwen3.5 SGLang parity** (in progress) — close ITL gap via batched recurrent kernels
+2. **1.4 Llama 3/4 Model** — most requested architecture, unblocks community adoption
+3. **1.5 DeepSeek-V3 / R1** — requires MLA (1.3) first
+4. **1.2 FlashAttention-3** — H100 utilization improvement
+5. **2.1–2.2 Quantization (GPTQ/AWQ)** — most community models are quantized
+6. **Scheduler preemption with KV swap** — remaining 0.5 item for production robustness
 
 ---
 
 ## Local Verifiability Checklist
 
-| Task | Verifiable without GPU? |
-|------|------------------------|
-| 0.1 Chat API | ✅ Mock scheduler |
-| 0.2 Sampler | ✅ Unit tests on f32 arrays |
-| 0.3 Radix Cache | ✅ Pure data structure |
-| 0.4 Block Manager | ✅ Accounting only |
-| 0.5 Scheduler++ | ✅ Mock ModelForward |
-| 0.6 Model Registry | ✅ Config parsing |
-| 0.7 Benchmarks | ✅ Mock HTTP server |
-| 1.x–5.x | ❌ GPU required |
+| Task | Verifiable without GPU? | Status |
+|------|------------------------|--------|
+| 0.1 Chat API | ✅ Mock scheduler | ✅ Done |
+| 0.2 Sampler | ✅ Unit tests on f32 arrays | ✅ Done |
+| 0.3 Radix Cache | ✅ Pure data structure | ✅ Done |
+| 0.4 Block Manager | ✅ Accounting only | ✅ Done |
+| 0.5 Scheduler++ | ✅ Mock ModelForward | ✅ Done |
+| 0.6 Model Registry | ✅ Config parsing | ✅ Done |
+| 0.7 Benchmarks | ✅ Mock HTTP server | ✅ Done |
+| 1.x–5.x | ❌ GPU required | 5.1 ✅ Done |
