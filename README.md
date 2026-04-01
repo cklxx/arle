@@ -10,19 +10,19 @@ Pure Rust LLM inference engine with multi-turn agent tool-calling.
 
 | Metric | agent-infer | SGLang v0.5.9 | Ratio |
 |--------|-------------|---------------|-------|
-| TTFT (C=1) | **17.9ms** | 40.5ms | **2.3x faster** |
+| TTFT (C=1) | **8.6ms** | 39.3ms | **4.6x faster** |
 | Throughput C=1 | 119.5 tok/s | 121.0 tok/s | **0.99x** |
 | Throughput C=4 | 414.8 tok/s | 419.4 tok/s | **0.99x** |
-| Throughput C=8 | 710.9 tok/s | 814.8 tok/s | **0.87x** |
+| Throughput C=8 | 811 tok/s | 886 tok/s | **0.92x** |
 | ITL (decode step) | 8.3ms | 8.0ms | 1.04x |
 
 **Benchmark parameters**: 50 synthetic prompts, max_tokens=128, temperature=0 (greedy), same A100-40GB GPU. agent-infer: `--num-slots 8`; SGLang: `--disable-radix-cache`.
 
 **TTFT lead**: Rust runtime eliminates Python dispatch overhead; CUDA Graph decode removes per-step CPU→GPU launches.
 
-**Single-request parity**: At C=1, agent-infer matches SGLang throughput (119.5 vs 121.0 tok/s) with 2.3x faster first-token latency.
+**Single-request parity**: At C=1, agent-infer matches SGLang throughput (119.5 vs 121.0 tok/s) with 4.6x faster first-token latency.
 
-**Concurrent throughput**: At C=8, agent-infer reaches **0.87x** of SGLang (711 vs 815 tok/s). Remaining gap is from prefill/decode interleaving overhead and batched attention scheduling efficiency.
+**Concurrent throughput**: At C=8, agent-infer reaches **0.92x** of SGLang (811 vs 886 tok/s). Remaining gap is from prefill/decode interleaving overhead and batched attention scheduling efficiency.
 
 ---
 
@@ -36,7 +36,8 @@ Pure Rust LLM inference engine with multi-turn agent tool-calling.
 | 3 | FlashInfer plan once per step (not per layer) | 690 tok/s | +1% |
 | 4 | Embedding + logits buffer pre-allocation | 700 tok/s | +1% |
 | 5 | CUDA Graph investigation (CPU memcpy constraint) | 700 tok/s | — |
-| 6 | CUDA Graph batched decode (one graph per batch_size) | **756 tok/s** | +8% |
+| 6 | CUDA Graph batched decode (one graph per batch_size) | 756 tok/s | +8% |
+| 7 | Argmax/scatter optimization (batched argmax, skip D2D scatter for greedy) | **811 tok/s** | +7% |
 
 ---
 
@@ -261,9 +262,9 @@ python3 scripts/bench_multi_request.py --url http://localhost:8000
 
 | Concurrency | agent-infer tok/s | SGLang tok/s | TTFT (ours) | TTFT (SGLang) |
 |-------------|-------------------|--------------|-------------|---------------|
-| 1 | 119.5 | 121.0 | **17.9ms** | 40.5ms |
+| 1 | 119.5 | 121.0 | **8.6ms** | 39.3ms |
 | 4 | 414.8 | 419.4 | **53.1ms** | 137.0ms |
-| 8 | 710.9 | 814.8 | 68.7ms | 78.1ms |
+| 8 | 811 | 886 | 68.7ms | 78.1ms |
 
 ### Agent Benchmark Results
 
@@ -385,7 +386,7 @@ See [ROADMAP.md](ROADMAP.md) for the full phased plan.
 
 | Phase | Focus | Status |
 |-------|-------|--------|
-| 0 | Foundation (CPU-verifiable) | 🔄 In progress |
+| 0 | Foundation (CPU-verifiable) | ✅ Done |
 | 1 | Core GPU features (PagedAttn, more models) | 🔜 Planned |
 | 2 | Quantization (GPTQ/AWQ/FP8/INT8) | 🔜 Planned |
 | 3 | Tensor/Pipeline Parallel | 🔜 Planned |

@@ -1,8 +1,8 @@
-# 2026-03-31 · Batched Decode: 128 -> 690 tok/s (5.4x)
+# 2026-03-31 · Batched Decode: 128 -> 811 tok/s (6.3x)
 
 ## Context
 
-Goal: match SGLang's concurrent throughput on A100-40GB with Qwen3-4B. Starting point: 128 tok/s at 8 concurrent (SGLang: 886 tok/s, 6.9x gap). Each decode request ran as an independent forward pass — no batching.
+Goal: match SGLang's concurrent throughput on A100-40GB with Qwen3-4B. Starting point: 128 tok/s at 8 concurrent (SGLang v0.5.9: 886 tok/s, 6.9x gap). Each decode request ran as an independent forward pass — no batching.
 
 ## What Worked
 
@@ -63,4 +63,10 @@ Captured CUDA Graphs for the decode layer loop (36 layers x ~14 kernels = ~504 l
 
 Key insight (from SGLang source): FlashInfer plan() runs outside graph, only run() is captured. Graph replays kernel launches with same GPU buffer pointers but updated data.
 
-**Final: 756 tok/s at 8-concurrent (SGLang: 886, gap: 1.17x)**
+**Final: 811 tok/s at 8-concurrent (SGLang v0.5.9: 886, gap: 1.09x)**
+
+### Phase 7: Argmax/Scatter Optimization (756 -> 811 tok/s, +7%)
+
+Batched greedy argmax across all decode requests in one kernel launch. Skip D2D scatter for greedy path (token IDs written directly to output buffer). Also: zero-alloc logit extraction (D2D direct write to decode_bufs), decode-priority chunked prefill (64-token chunks).
+
+Multiple sub-steps: 756 → 786 (+4%, decode-priority chunked prefill) → 790 (+0.5%, zero-alloc logit) → 807 (+2%, batched argmax + cached raw CUDA ptrs) → 811 (+0.5%, skip D2D scatter for greedy).

@@ -8,7 +8,7 @@ Measured on **A100-40GB**, BF16, Qwen3-4B, 8 concurrent requests:
 
 | | infer | SGLang | Ratio |
 |---|---|---|---|
-| Throughput (tok/s) | **756** | 886 | 0.85x |
+| Throughput (tok/s) | **811** | 886 | 0.92x |
 | Decode ITL (ms) | 10.4 | 8.2 | 1.27x |
 
 ## Optimization Journey
@@ -22,9 +22,10 @@ Starting point: 128 tok/s at 8 concurrent. Each phase on A100-40GB, Qwen3-4B.
 | 2 | Pre-allocate decode buffers (no per-step GPU malloc) | 681 | +57% |
 | 3 | FlashInfer plan once per step (not per layer) | 690 | +1% |
 | 4 | Pre-allocate embedding + logit buffers | 700 | +1% |
-| 5 | CUDA Graph for batched decode | **756** | +8% |
+| 5 | CUDA Graph for batched decode | 756 | +8% |
+| 6 | Argmax/scatter optimization (batched argmax, skip D2D scatter for greedy) | **811** | +7% |
 
-Remaining gap to SGLang: ~2.2ms/step decode ITL, primarily cuBLAS vs SGLang's kernel choices.
+Remaining gap to SGLang (1.09x): cuBLAS vs SGLang's kernel choices, sync strategy (stream vs event), FusedAddRMSNorm.
 
 ## Architecture
 
