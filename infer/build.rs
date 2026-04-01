@@ -674,7 +674,78 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     println!("cargo:rerun-if-env-changed=PEGAINFER_TRITON_PYTHON");
 }
 
+/// Locate the mlx-sys build output directory so we can find MLX C++ headers.
+///
+/// Cargo puts all crate build outputs under the same `{target}/{profile}/build/` tree.
+/// Our OUT_DIR is `{target}/{profile}/build/infer-{hash}/out`, so going up two levels
+/// gives us `{target}/{profile}/build/`, where we scan for `mlx-sys-*/out`.
+fn find_mlx_include_dirs() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").ok()?);
+    // OUT_DIR = …/build/infer-<hash>/out  → parent = …/build/infer-<hash> → parent = …/build
+    let build_dir = out_dir.parent()?.parent()?;
+
+    for entry in std::fs::read_dir(build_dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_str().unwrap_or("");
+        if !name_str.starts_with("mlx-sys-") {
+            continue;
+        }
+        let out = entry.path().join("out");
+        // C++ MLX source headers: mlx/fast.h, mlx/transforms.h, mlx/ops.h, …
+        let cpp_hdr = out.join("build/_deps/mlx-src");
+        // mlx-c public headers: mlx/c/array.h (mlx_array typedef)
+        let c_hdr = out.join("build/include");
+        if cpp_hdr.exists() && c_hdr.exists() {
+            return Some((cpp_hdr, c_hdr));
+        }
+    }
+    None
+}
+
 fn main() {
+    // ── Metal C++ fused-ops shim (macOS only, requires `metal` feature) ────────
+    if std::env::var("CARGO_FEATURE_METAL").is_ok() {
+        println!("cargo:rerun-if-changed=csrc/metal_fused_ops.cpp");
+        match find_mlx_include_dirs() {
+            Some((cpp_hdr, c_hdr)) => {
+                let mut build = cc::Build::new();
+                build
+                    .cpp(true)
+                    .std("c++17")
+                    .warnings(false)
+                    .flag("-O3")
+                    // MLX C++ headers (mlx/fast.h, mlx/transforms.h, …)
+                    .include(&cpp_hdr)
+                    // mlx-c public headers (mlx_array typedef used in our ABI)
+                    .include(&c_hdr)
+                    .file("csrc/metal_fused_ops.cpp");
+
+                // On macOS, use clang++ and link frameworks
+                if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+                    build.compiler("clang++");
+                }
+
+                build.compile("metal_fused_ops");
+                // libmlxc (C wrappers) and libmlx (C++ core) are already linked by
+                // mlx-sys; we don't need to repeat link lines here.
+                println!(
+                    "cargo:warning=metal_fused_ops: compiled with MLX headers from {}",
+                    cpp_hdr.display()
+                );
+            }
+            None => {
+                // mlx-sys hasn't been built yet, or OUT_DIR structure changed.
+                // This is a hard error — without the C++ shim we can't compile
+                // the metal feature.  The user will see this message.
+                panic!(
+                    "metal_fused_ops: cannot find mlx-sys build output (expected \
+                     mlx-sys-*/out/build/_deps/mlx-src under the cargo build dir). \
+                     Try `cargo clean` and rebuild."
+                );
+            }
+        }
+    }
+
     // When the `no-cuda` feature is active (e.g. macOS dev machines without a GPU),
     // skip all CUDA/Triton compilation. GPU ops will panic at runtime.
     if std::env::var("CARGO_FEATURE_NO_CUDA").is_ok() {
