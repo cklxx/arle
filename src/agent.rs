@@ -5,7 +5,7 @@ use infer::sampler::SamplingParams;
 use infer::server_engine::{CompleteRequest, ServerEngine};
 
 use crate::chat::{Message, format_prompt, parse_tool_calls};
-use crate::tools::{Tool, execute_tool};
+use crate::tools::{Tool, execute_tool_call};
 
 const SYSTEM_PROMPT: &str = r#"You are a helpful AI assistant with access to tools. You can use tools to help answer questions, perform calculations, run commands, and more.
 
@@ -51,7 +51,9 @@ pub fn run_agent(
             output.finish_reason
         );
 
-        let (content, tool_calls) = parse_tool_calls(&output.text);
+        let parsed = parse_tool_calls(&output.text);
+        let content = parsed.content;
+        let tool_calls = parsed.tool_calls;
 
         if tool_calls.is_empty() {
             // No tool calls -- this is the final response
@@ -74,7 +76,7 @@ pub fn run_agent(
                 serde_json::to_string(&tc.arguments).unwrap_or_default()
             );
 
-            let result = execute_tool(&tc.name, &tc.arguments);
+            let result = execute_tool_call(tc);
 
             // Show truncated result
             let display_result = if result.len() > 500 {

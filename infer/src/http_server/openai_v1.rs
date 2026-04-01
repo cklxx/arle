@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::chat::{ChatMessage, ToolDefinition};
+use crate::chat_protocol::ToolCall as ProtocolToolCall;
 use crate::server_engine::{CompleteOutput, StreamDelta};
 
 // OpenAI-compatible /v1/completions request
@@ -260,6 +261,19 @@ struct ChatFunctionCall {
     arguments: String,
 }
 
+impl From<&ProtocolToolCall> for ChatToolCall {
+    fn from(value: &ProtocolToolCall) -> Self {
+        Self {
+            id: format!("call_{}", Uuid::new_v4().simple()),
+            call_type: "function",
+            function: ChatFunctionCall {
+                name: value.name.clone(),
+                arguments: value.arguments.to_string(),
+            },
+        }
+    }
+}
+
 impl ChatCompletionResponse {
     pub(super) fn from_output(
         model: String,
@@ -269,18 +283,7 @@ impl ChatCompletionResponse {
         usage: crate::server_engine::Usage,
     ) -> Self {
         let (content, parsed_calls) = crate::chat::parse_tool_calls(text);
-
-        let tool_calls: Vec<ChatToolCall> = parsed_calls
-            .iter()
-            .map(|tc| ChatToolCall {
-                id: format!("call_{}", Uuid::new_v4().simple()),
-                call_type: "function",
-                function: ChatFunctionCall {
-                    name: tc.name.clone(),
-                    arguments: tc.arguments.to_string(),
-                },
-            })
-            .collect();
+        let tool_calls: Vec<ChatToolCall> = parsed_calls.iter().map(ChatToolCall::from).collect();
 
         let message = AssistantMessage {
             role: "assistant",

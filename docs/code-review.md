@@ -173,7 +173,7 @@ unsafe impl Send for Qwen3State {}
 
 README.md 整体准确，架构图和构建命令与代码一致。
 
-**一处过时：** README 中提到 `--features dynamo` 编译选项，但没有说明 `dynamo` 子模块需要额外 `git submodule init` 步骤，新用户可能遇到编译错误。
+**一处过时：** README 需要与当前仓库边界保持同步，避免保留已删除能力的构建说明或目录描述，让新用户误判项目能力范围。
 
 ### ROADMAP.md
 

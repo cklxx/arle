@@ -1,0 +1,171 @@
+use super::*;
+
+/// Newly assigned, needs prefix cache check.
+pub(super) enum Phase {
+    New,
+    /// Prefilling in chunks. Decode takes priority between chunks.
+    Prefilling {
+        effective_tokens: Vec<u32>,
+        progress: usize,
+    },
+    /// Generating tokens.
+    Decoding,
+    /// Completed.
+    Finished,
+}
+
+pub(super) struct ActiveRequest {
+    pub(super) id: u64,
+    pub(super) slot_idx: usize,
+    pub(super) prompt_tokens: Vec<u32>,
+    pub(super) generated_tokens: Vec<u32>,
+    pub(super) max_tokens: usize,
+    pub(super) sampling: crate::sampler::SamplingParams,
+    pub(super) stop: Option<Vec<String>>,
+    pub(super) delta_tx: mpsc::UnboundedSender<StreamDelta>,
+    /// Full decoded text, maintained incrementally.
+    pub(super) full_decoded: String,
+    /// Number of tokens already decoded into full_decoded.
+    pub(super) decoded_token_count: usize,
+    /// Number of characters already sent to the client.
+    pub(super) sent_len: usize,
+    pub(super) phase: Phase,
+}
+
+impl ActiveRequest {
+    /// Decode newly generated tokens and emit text deltas to the client.
+    ///
+    /// Uses incremental decode: only re-decodes a small suffix (4 tokens)
+    /// to handle multi-byte character boundaries, instead of all tokens.
+    /// Cost per call: O(1) instead of O(N) where N = generated token count.
+    pub(super) fn emit_delta(&mut self, tokenizer: &Tokenizer) {
+        let n = self.generated_tokens.len();
+        if n == 0 {
+            return;
+        }
+
+        let overlap = 4;
+        let safe_point = self.decoded_token_count.saturating_sub(overlap);
+        let new_text = match tokenizer.decode(&self.generated_tokens[safe_point..]) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+
+        if safe_point > 0 {
+            let prefix_text = tokenizer
+                .decode(&self.generated_tokens[..safe_point])
+                .unwrap_or_default();
+            self.full_decoded.truncate(prefix_text.len());
+            self.full_decoded.push_str(&new_text);
+        } else {
+            self.full_decoded = new_text;
+        }
+        self.decoded_token_count = n;
+
+        if let Some(ref stops) = self.stop {
+            match check_stop_sequences(&self.full_decoded, stops) {
+                StopCheckResult::StopFound { stop_pos } => {
+                    if stop_pos > self.sent_len {
+                        let _ = self.delta_tx.send(StreamDelta {
+                            text_delta: self.full_decoded[self.sent_len..stop_pos].to_string(),
+                            finish_reason: None,
+                            usage: None,
+                        });
+                    }
+                    self.sent_len = stop_pos;
+                    self.phase = Phase::Finished;
+                    self.send_finish(FinishReason::Stop);
+                    return;
+                }
+                StopCheckResult::NoStop { safe_len } => {
+                    if safe_len > self.sent_len {
+                        let _ = self.delta_tx.send(StreamDelta {
+                            text_delta: self.full_decoded[self.sent_len..safe_len].to_string(),
+                            finish_reason: None,
+                            usage: None,
+                        });
+                        self.sent_len = safe_len;
+                    }
+                }
+            }
+        } else if self.full_decoded.len() > self.sent_len {
+            let _ = self.delta_tx.send(StreamDelta {
+                text_delta: self.full_decoded[self.sent_len..].to_string(),
+                finish_reason: None,
+                usage: None,
+            });
+            self.sent_len = self.full_decoded.len();
+        }
+    }
+
+    /// Flush remaining buffered text and send the final finish delta.
+    pub(super) fn finish(&mut self, reason: FinishReason, tokenizer: &Tokenizer) {
+        if matches!(self.phase, Phase::Finished) {
+            return;
+        }
+        self.phase = Phase::Finished;
+
+        if !self.generated_tokens.is_empty() {
+            if let Ok(full_text) = tokenizer.decode(&self.generated_tokens) {
+                let end = if let Some(ref stops) = self.stop {
+                    match check_stop_sequences(&full_text, stops) {
+                        StopCheckResult::StopFound { stop_pos } => stop_pos,
+                        StopCheckResult::NoStop { .. } => full_text.len(),
+                    }
+                } else {
+                    full_text.len()
+                };
+                if end > self.sent_len {
+                    let _ = self.delta_tx.send(StreamDelta {
+                        text_delta: full_text[self.sent_len..end].to_string(),
+                        finish_reason: None,
+                        usage: None,
+                    });
+                }
+            }
+        }
+
+        self.send_finish(reason);
+    }
+
+    fn send_finish(&self, reason: FinishReason) {
+        let _ = self.delta_tx.send(StreamDelta {
+            text_delta: String::new(),
+            finish_reason: Some(reason),
+            usage: Some(Usage {
+                prompt_tokens: self.prompt_tokens.len(),
+                completion_tokens: self.generated_tokens.len(),
+                total_tokens: self.prompt_tokens.len() + self.generated_tokens.len(),
+            }),
+        });
+    }
+}
+
+/// Result of scanning decoded text for stop sequences.
+pub(super) enum StopCheckResult {
+    /// No stop found. Safe to emit text up to `safe_len` (holds back
+    /// `max_stop_len` bytes to avoid splitting a partially-matched stop).
+    NoStop { safe_len: usize },
+    /// Stop sequence found; text up to `stop_pos` should be emitted, then
+    /// the request should finish.
+    StopFound { stop_pos: usize },
+}
+
+/// Scan `text` for any of the given stop sequences.
+///
+/// When no stop is found, returns `NoStop` with a safe emit length that
+/// withholds `max_stop_len` bytes from the tail (in case a stop sequence
+/// straddles the boundary of text decoded so far).
+pub(super) fn check_stop_sequences(text: &str, stops: &[String]) -> StopCheckResult {
+    for stop in stops {
+        if stop.is_empty() {
+            continue;
+        }
+        if let Some(pos) = text.find(stop.as_str()) {
+            return StopCheckResult::StopFound { stop_pos: pos };
+        }
+    }
+    let max_stop_len = stops.iter().map(|s| s.len()).max().unwrap_or(0);
+    let safe_len = text.len().saturating_sub(max_stop_len);
+    StopCheckResult::NoStop { safe_len }
+}

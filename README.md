@@ -1,6 +1,6 @@
 # agent-infer
 
-Pure Rust LLM inference engine with multi-turn agent tool-calling. Built on **Infer** (Rust+CUDA inference) + **Dynamo** (distributed orchestration).
+Pure Rust LLM inference engine with multi-turn agent tool-calling.
 
 **No Python glue** — GPU inference calls go directly from Rust to CUDA kernels.
 
@@ -82,8 +82,8 @@ User
 ## Quick Start
 
 ```bash
-# 1. Clone (with submodules for Dynamo support)
-git clone --recurse-submodules https://github.com/cklxx/agent-infer && cd agent-infer
+# 1. Clone
+git clone https://github.com/cklxx/agent-infer && cd agent-infer
 
 # 2. Build inference server (requires CUDA toolkit)
 cd infer && cargo build --release
@@ -158,15 +158,6 @@ Decode layer loop (36 layers × ~14 kernels = ~504 launches) is captured into CU
 
 ### FlashInfer Batched Decode
 Token-level KV pool (SGLang's `TokenToKVPool` pattern, page_size=1) enables `BatchDecodeWithPagedKVCacheDispatched` across all requests in a single kernel launch. FlashInfer plan runs once per step (not per layer) with buffers pre-allocated at startup.
-
-### Dynamo Integration
-```bash
-cargo build --release --features dynamo
-./target/release/agent-infer --model-path ... --dynamo
-```
-Registers with Dynamo's ETCD service registry and NATS event bus for service discovery and KV-aware routing.
-
----
 
 ## API
 
@@ -298,11 +289,10 @@ python3 scripts/bench_multi_request.py --url http://localhost:8000
 ```
 agent-infer/
 ├── src/                         # Rust agent binary
-│   ├── main.rs                  # CLI + REPL + Dynamo path
+│   ├── main.rs                  # CLI + REPL
 │   ├── agent.rs                 # Agent loop: generate → parse → execute
 │   ├── chat.rs                  # ChatML formatter + <tool_call> parser
-│   ├── tools.rs                 # shell / python tool execution
-│   └── dynamo_integration.rs    # Dynamo runtime bridge
+│   └── tools.rs                 # shell / python tool execution
 ├── infer/                       # Inference engine (Rust library)
 │   ├── src/
 │   │   ├── model/               # Qwen3, Qwen3.5 implementations
@@ -319,7 +309,6 @@ agent-infer/
 │   │   └── tensor_parallel.rs   # TP config + sharding math
 │   ├── csrc/                    # CUDA C kernels
 │   └── tools/triton/            # Triton Python kernels (AOT compiled)
-├── dynamo/                      # Dynamo runtime submodule
 ├── scripts/                     # Benchmark + utility scripts
 └── Cargo.toml
 ```
@@ -344,8 +333,7 @@ agent-infer/
   --max-tokens 4096            \  # Tokens per turn
   --temperature 0.0            \  # 0.0 = greedy
   --no-cuda-graph              \  # Disable CUDA graph (for debugging)
-  --max-gpu-kv 512             \  # Limit GPU KV tokens (tests CPU offload)
-  --dynamo                        # Register with Dynamo runtime
+  --max-gpu-kv 512                # Limit GPU KV tokens (tests CPU offload)
 ```
 
 ### Built-in Agent Tools
@@ -363,9 +351,6 @@ cargo build --no-default-features --features no-cuda
 
 # GPU (requires CUDA toolkit + nvidia driver)
 cargo build --release
-
-# With Dynamo distributed runtime
-cargo build --release --features dynamo
 ```
 
 ### Testing

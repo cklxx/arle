@@ -31,8 +31,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # Build from infer/ directory (not workspace root) since agent-infer
-      # depends on the dynamo submodule which is not checked out in CI.
+      # Keep Rust CI focused on the infer library's CPU-only surface.
       - name: cargo check (CPU-only)
         working-directory: infer
         run: cargo check --no-default-features --features no-cuda --lib
@@ -98,7 +97,7 @@ jobs:
         with:
           components: rustfmt
 
-      # fmt runs from infer/ since workspace root needs dynamo submodule.
+      # Match the Rust CI scope and format the infer crate from its own manifest root.
       - name: cargo fmt check
         working-directory: infer
         run: cargo fmt --all -- --check

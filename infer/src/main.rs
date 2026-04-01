@@ -2,12 +2,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
+use infer::bootstrap::{EngineOptions, detect_model_type, spawn_scheduler_handle_from_path};
 use infer::http_server::build_app;
 use infer::logging;
-use infer::model::{ModelRuntimeConfig, Qwen3Model, Qwen35Model};
-use infer::scheduler::Scheduler;
-use infer::server_engine::{EngineOptions, ModelType, detect_model_type, model_id_from_path};
-use infer::tokenizer::Tokenizer;
 use infer::trace_reporter::FileReporter;
 use log::info;
 
@@ -62,8 +59,6 @@ async fn main() {
         .to_str()
         .expect("Model path must be valid UTF-8");
     let model_type = detect_model_type(model_path).expect("Failed to detect model type");
-    let model_id = model_id_from_path(model_path);
-
     info!("=== Infer Server - {} (GPU) ===", model_type);
     info!("Loading model...");
     let start = Instant::now();
@@ -78,48 +73,9 @@ async fn main() {
         enable_cuda_graph: args.cuda_graph,
     };
 
-    // Load model, create scheduler, and spawn scheduler thread.
-    // The scheduler owns the model and state pool; the handle is Send+Clone.
-    let handle = match model_type {
-        ModelType::Qwen35 => {
-            let model =
-                Qwen35Model::from_safetensors_with_options(model_path, options.enable_cuda_graph)
-                    .expect("Failed to load Qwen3.5 model");
-            let tokenizer = Tokenizer::from_file(model_path).expect("Failed to load tokenizer");
-            let (scheduler, handle) = Scheduler::with_max_seq_len(
-                model,
-                tokenizer,
-                &model_id,
-                args.num_slots,
-                42,
-                args.max_seq_len,
-            )
+    let handle =
+        spawn_scheduler_handle_from_path(model_path, args.num_slots, 42, options, args.max_seq_len)
             .expect("Failed to create scheduler");
-            std::thread::spawn(move || scheduler.run());
-            handle
-        }
-        ModelType::Qwen3 => {
-            let model = Qwen3Model::from_safetensors_with_runtime(
-                model_path,
-                ModelRuntimeConfig {
-                    enable_cuda_graph: options.enable_cuda_graph,
-                },
-            )
-            .expect("Failed to load Qwen3 model");
-            let tokenizer = Tokenizer::from_file(model_path).expect("Failed to load tokenizer");
-            let (scheduler, handle) = Scheduler::with_max_seq_len(
-                model,
-                tokenizer,
-                &model_id,
-                args.num_slots,
-                42,
-                args.max_seq_len,
-            )
-            .expect("Failed to create scheduler");
-            std::thread::spawn(move || scheduler.run());
-            handle
-        }
-    };
 
     info!(
         "Model loaded: elapsed_ms={}, model_id={}",

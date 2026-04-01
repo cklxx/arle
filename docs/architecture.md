@@ -11,7 +11,6 @@
 │                           agent-infer REPL (src/)                            │
 │   stdin → agent::run_agent() → ServerEngine::complete_stream()               │
 │           tools.rs (builtin tools)  chat.rs (ChatML)                         │
-│           [optional] dynamo_integration.rs → Dynamo distributed runtime      │
 └────────────────────────────────┬─────────────────────────────────────────────┘
                                  │ ServerEngine trait (single-request)
                                  │
@@ -137,8 +136,7 @@
 agent-infer (src/)
 ├── agent.rs         ← uses ServerEngine trait from infer
 ├── chat.rs          ← uses infer::chat (ChatML formatting)
-├── tools.rs         ← pure Rust, no infer dep
-└── dynamo_integration.rs  ← uses SchedulerHandle, Scheduler, model types
+└── tools.rs         ← pure Rust, no infer dep
 
 infer/src/
 ├── lib.rs           ← re-exports all public modules
@@ -606,11 +604,10 @@ Every decode step with B active requests:
 
 | Module | Responsibility |
 |--------|----------------|
-| `main.rs` | CLI entry point: detect model type, load engine, run REPL or Dynamo worker |
+| `main.rs` | CLI entry point: detect model type, load engine, run REPL |
 | `agent.rs` | Agent loop: generate → parse tool calls → execute tools → feed results back |
 | `chat.rs` | ChatML message builder for agent conversations |
 | `tools.rs` | Builtin tool definitions (functions the agent can call) |
-| `dynamo_integration.rs` | Register with Dynamo distributed runtime for service discovery + KV routing |
 
 ### CUDA Kernels (infer/csrc/)
 
@@ -704,7 +701,6 @@ Every decode step with B active requests:
 | Tensor parallel config + sharding math | ✅ (CPU, NCCL stubs) |
 | Rust agent binary (tool calling) | ✅ |
 | Python agent (async HTTP) | ✅ |
-| Dynamo distributed runtime integration | ✅ (optional feature) |
 | Metal backend (Apple Silicon, mlx-rs) | ✅ (single-request) |
 | PagedAttention CUDA kernel (arbitrary page size) | ❌ |
 | Llama / DeepSeek / Mistral / Gemma / Phi models | ❌ |

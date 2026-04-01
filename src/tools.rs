@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::process::Command;
 
+use infer::chat_protocol::{ToolCall as ProtocolToolCall, ToolDefinition};
+
 // ============================================================================
 // Tool definition
 // ============================================================================
@@ -11,6 +13,16 @@ pub struct Tool {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+}
+
+impl Tool {
+    pub fn to_definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            self.name.clone(),
+            self.description.clone(),
+            self.parameters.clone(),
+        )
+    }
 }
 
 /// Return the built-in tool definitions.
@@ -68,6 +80,11 @@ pub fn execute_tool(name: &str, arguments: &serde_json::Value) -> String {
         }
         _ => format!("Error: unknown tool '{name}'"),
     }
+}
+
+/// Execute a structured tool call.
+pub fn execute_tool_call(call: &ProtocolToolCall) -> String {
+    execute_tool(&call.name, &call.arguments)
 }
 
 fn execute_shell(command: &str) -> String {
