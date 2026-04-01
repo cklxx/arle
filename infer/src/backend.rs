@@ -46,6 +46,8 @@ pub struct GenerateResult {
     pub ttft_ms: f64,
     /// Prompt throughput in tokens/s (0.0 if unknown).
     pub prompt_tps: f64,
-    /// Generation throughput in tokens/s (0.0 if unknown).
+    /// Generation throughput in tokens/s, excluding prompt/prefill time.
     pub generation_tps: f64,
+    /// End-to-end wall-clock time in milliseconds.
+    pub total_time_ms: f64,
 }

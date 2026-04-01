@@ -24,6 +24,7 @@ Diagnosis:
 Changes:
 
 - `GenerateResult` now carries `ttft_ms`.
+- `GenerateResult` now also carries end-to-end `total_time_ms`.
 - Metal backend now computes:
   - `prompt_tps = prompt_tokens / ttft`
   - `generation_tps = generated_tokens / (total_time - ttft)`
@@ -34,6 +35,7 @@ Changes:
   - `generation_tps`
   - `e2e_tps`
   - `ttft_ms`
+  - `total_time_ms`
 
 Expected outcome:
 
@@ -47,6 +49,12 @@ Measured after alignment (`warmup=1`, `runs=3`, `max_tokens=512`):
 | --- | ---: | ---: | ---: | ---: |
 | `mlx_lm 0.30.4` | `~1114 tok/s` | `~316.4 tok/s` | not reported | prompt-only timing |
 | `agent-infer` (aligned) | `~971.8 tok/s` | `~146.5 tok/s` | `~145.7 tok/s` | `~21.4ms` |
+
+Measured end-to-end wall time on the aligned benchmark:
+
+| Runner | Total wall |
+| --- | ---: |
+| `agent-infer` (aligned) | `~3515ms` mean |
 
 What this clarified:
 

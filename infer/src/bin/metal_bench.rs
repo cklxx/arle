@@ -112,7 +112,7 @@ fn run_bench() -> Result<()> {
 
     // ── Timed runs ───────────────────────────────────────────────────────────
     struct Run {
-        elapsed_s: f64,
+        total_time_ms: f64,
         prompt_tokens: usize,
         tokens: usize,
         prompt_tps: f64,
@@ -124,14 +124,12 @@ fn run_bench() -> Result<()> {
     let mut runs: Vec<Run> = Vec::with_capacity(cli.runs);
 
     for i in 0..cli.runs {
-        let t0 = Instant::now();
         let result = backend.generate(prompt, &params)?;
-        let elapsed_s = t0.elapsed().as_secs_f64();
-        let e2e_tps = result.completion_tokens as f64 / elapsed_s.max(1e-9);
+        let e2e_tps = result.completion_tokens as f64 / (result.total_time_ms / 1000.0).max(1e-9);
 
         if cli.profile || !cli.json {
             eprintln!(
-                "  run {:2}: prompt {:3} tok @ {:6.1} tok/s  gen {:4} tok @ {:6.1} tok/s  e2e {:6.1} tok/s  ttft {:6.1}ms",
+                "  run {:2}: prompt {:3} tok @ {:6.1} tok/s  gen {:4} tok @ {:6.1} tok/s  e2e {:6.1} tok/s  ttft {:6.1}ms  total {:6.1}ms",
                 i + 1,
                 result.prompt_tokens,
                 result.prompt_tps,
@@ -139,11 +137,12 @@ fn run_bench() -> Result<()> {
                 result.generation_tps,
                 e2e_tps,
                 result.ttft_ms,
+                result.total_time_ms,
             );
         }
 
         runs.push(Run {
-            elapsed_s,
+            total_time_ms: result.total_time_ms,
             prompt_tokens: result.prompt_tokens,
             tokens: result.completion_tokens,
             prompt_tps: result.prompt_tps,
@@ -181,8 +180,12 @@ fn run_bench() -> Result<()> {
 
     let avg_tokens = runs.iter().map(|r| r.tokens).sum::<usize>() / runs.len().max(1);
     let prompt_tokens = runs.first().map_or(0, |r| r.prompt_tokens);
-    let mean_elapsed_ms =
-        runs.iter().map(|r| r.elapsed_s).sum::<f64>() / runs.len() as f64 * 1000.0;
+    let mut total_time_ms_sorted: Vec<f64> = runs.iter().map(|r| r.total_time_ms).collect();
+    total_time_ms_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean_total_time_ms =
+        total_time_ms_sorted.iter().sum::<f64>() / total_time_ms_sorted.len() as f64;
+    let p50_total_time_ms = percentile(&total_time_ms_sorted, 50.0);
+    let p99_total_time_ms = percentile(&total_time_ms_sorted, 99.0);
 
     let peak_mb = peak_rss_kb() as f64 / 1024.0;
 
@@ -203,7 +206,7 @@ fn run_bench() -> Result<()> {
                 "generation_tps": { "mean": mean_generation_tps, "p50": p50_generation_tps, "p99": p99_generation_tps },
                 "e2e_tps": { "mean": mean_e2e_tps, "p50": p50_e2e_tps, "p99": p99_e2e_tps },
                 "ttft_ms": { "mean": mean_ttft_ms, "p50": p50_ttft_ms, "p99": p99_ttft_ms },
-                "elapsed_ms": { "mean": mean_elapsed_ms },
+                "total_time_ms": { "mean": mean_total_time_ms, "p50": p50_total_time_ms, "p99": p99_total_time_ms },
                 "peak_rss_mb": peak_mb,
             })
         );
@@ -224,6 +227,9 @@ fn run_bench() -> Result<()> {
         );
         println!(
             "  TTFT            : {mean_ttft_ms:.0}ms mean  |  {p50_ttft_ms:.0}ms p50  |  {p99_ttft_ms:.0}ms p99"
+        );
+        println!(
+            "  Total wall      : {mean_total_time_ms:.0}ms mean  |  {p50_total_time_ms:.0}ms p50  |  {p99_total_time_ms:.0}ms p99"
         );
         println!("  Peak RSS        : {peak_mb:.0}MB");
         println!(
