@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── macOS arm64: Metal/MLX backend ──────────────────────────────────────────
+  build-macos:
+    name: Build macOS arm64 (Metal)
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-arm64-cargo-
+
+      - name: Build metal_bench + infer lib (Metal, no-cuda)
+        run: >
+          cargo build --release
+          --no-default-features --features metal,no-cuda
+          -p infer --lib --bin metal_bench
+
+      - name: Locate libmetal_fused_ops.a
+        id: locate_lib
+        run: |
+          LIB=$(find target/release/build -name "libmetal_fused_ops.a" | head -1)
+          if [ -z "$LIB" ]; then
+            echo "::error::libmetal_fused_ops.a not found under target/release/build"
+            exit 1
+          fi
+          echo "lib_path=$LIB" >> "$GITHUB_OUTPUT"
+
+      - name: Package macOS artifacts
+        run: |
+          mkdir -p dist
+          cp target/release/metal_bench dist/
+          cp "${{ steps.locate_lib.outputs.lib_path }}" dist/
+          tar -czf agent-infer-${{ github.ref_name }}-macos-arm64.tar.gz -C dist .
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: agent-infer-${{ github.ref_name }}-macos-arm64.tar.gz
+
+  # ── Linux x86_64: CUDA backend ───────────────────────────────────────────────
+  build-linux:
+    name: Build Linux x86_64 (CUDA)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install CUDA toolkit 12.8
+        uses: Jimver/cuda-toolkit@v0.2.22
+        with:
+          cuda: '12.8.0'
+          method: network
+
+      - name: Install Python + Triton (required for AOT kernel compilation)
+        run: pip install triton
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-x86-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-x86-cargo-
+
+      - name: Build infer + bench_serving (CUDA)
+        env:
+          # No GPU on CI runners — pin SM targets to avoid nvidia-smi panic.
+          # sm_80 (Ampere/A100) + sm_90 (Hopper/H100) covers common deployments.
+          PEGAINFER_CUDA_SM: '80,90'
+        run: cargo build --release --features cuda -p infer
+
+      - name: Package Linux artifacts
+        run: |
+          mkdir -p dist
+          cp target/release/infer dist/
+          cp target/release/bench_serving dist/
+          tar -czf agent-infer-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist .
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: agent-infer-${{ github.ref_name }}-linux-x86_64.tar.gz
+
+  # ── GitHub Release ────────────────────────────────────────────────────────────
+  create-release:
+    name: Create GitHub Release
+    needs: [build-macos, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            agent-infer-${{ github.ref_name }}-macos-arm64.tar.gz
+            agent-infer-${{ github.ref_name }}-linux-x86_64.tar.gz

@@ -11,6 +11,31 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # ── macOS arm64: Metal feature surface ──────────────────────────────────────
+  check-macos:
+    name: Check (macOS Metal)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-arm64-cargo-
+
+      - name: cargo check (Metal, no-cuda)
+        working-directory: infer
+        run: cargo check --no-default-features --features metal,no-cuda --lib
+
+  # ── Linux: CPU-only (no CUDA, no Metal) ─────────────────────────────────────
   check:
     name: Check
     runs-on: ubuntu-latest
