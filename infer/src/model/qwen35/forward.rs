@@ -78,10 +78,13 @@ impl ModelForward for Qwen35Model {
     type State = Qwen35State;
 
     fn create_state(&self) -> Result<Self::State> {
+        let single_token_bufs = SingleTokenBuffers::new(&self.ctx, &self.config)?;
+        let decode_bufs =
+            DecodeBuffers35::new(&self.ctx, &self.config, &single_token_bufs.logits)?;
         Ok(Qwen35State {
             ctx: self.ctx.clone(),
-            decode_bufs: DecodeBuffers35::new(&self.ctx, &self.config)?,
-            single_token_bufs: SingleTokenBuffers::new(&self.ctx, &self.config)?,
+            decode_bufs,
+            single_token_bufs,
             base: GenerationStateBase::new(
                 self.config.num_full_attention_layers(),
                 self.config.num_key_value_heads,
@@ -154,10 +157,62 @@ impl ModelForward for Qwen35Model {
     }
 
     fn is_stop_token(&self, token_id: u32) -> bool {
-        token_id == self.config.eos_token_id
+        self.config.is_stop_token(token_id)
     }
 
     fn device_context(&self) -> &crate::tensor::DeviceContext {
         &self.ctx
+    }
+
+    fn select_tokens_batch(
+        &self,
+        states: &mut [Self::State],
+        slot_indices: &[usize],
+        params: &[&crate::sampler::SamplingParams],
+        rng: &mut rand::rngs::StdRng,
+    ) -> anyhow::Result<Vec<u32>> {
+        let b = slot_indices.len();
+
+        // Phase 1: Launch all sampling kernels (no sync between requests)
+        for i in 0..b {
+            let si = slot_indices[i];
+            let random_val: f32 = rng.random();
+            if states[si].base.prefill_logits.is_some() {
+                let logits = states[si].base.prefill_logits.as_ref().unwrap();
+                crate::ops::gpu_sample_launch(
+                    &self.ctx,
+                    logits,
+                    &mut states[si].decode_bufs.sample_probs,
+                    &mut states[si].decode_bufs.sample_out,
+                    params[i],
+                    random_val,
+                )?;
+            } else {
+                let ptrs = &states[si].decode_bufs.ptrs;
+                crate::ops::gpu_sample_launch_raw(
+                    &self.ctx,
+                    ptrs.logits_ptr,
+                    ptrs.logits_len,
+                    ptrs.sample_probs_ptr,
+                    ptrs.sample_out_ptr,
+                    params[i],
+                    random_val,
+                )?;
+            }
+        }
+
+        // Phase 2: Single sync
+        self.ctx.sync()?;
+
+        // Phase 3: Readback all results
+        let mut tokens = Vec::with_capacity(b);
+        for i in 0..b {
+            let si = slot_indices[i];
+            tokens.push(crate::ops::gpu_sample_readback(
+                &self.ctx,
+                &states[si].decode_bufs.sample_out,
+            )?);
+        }
+        Ok(tokens)
     }
 }
