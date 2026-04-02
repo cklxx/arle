@@ -1,6 +1,6 @@
 # Plan: Qwen3.5 SGLang 0.5.9 Parity (Qwen3.5-4B, A100-80GB)
 
-> Status: **C=1–C=8 ahead, C=16 parity, C=32 -17%, C=64 works**
+> Status: **Decode speed exceeds SGLang at all C. Throughput ahead C=1–C=16, -8% at C=32 (TTFT gap)**
 > Created: 2026-04-01
 > Updated: 2026-04-02
 > Goal: Match SGLang 0.5.9 throughput on Qwen3.5-4B
@@ -11,66 +11,52 @@
 
 | Config | agent-infer | SGLang 0.5.9 | Gap |
 |--------|------------|--------------|-----|
-| C=1 throughput | 113 tok/s | 110 tok/s | **+3%** |
-| C=4 throughput | 399 tok/s | 376 tok/s | **+6%** |
-| C=8 throughput | 742 tok/s | 707 tok/s | **+5%** |
-| C=16 throughput | 1199 tok/s | 1261 tok/s | -5% (parity) |
-| C=32 throughput | 1818 tok/s | 2189 tok/s | -17% |
-| C=64 throughput | 2397 tok/s | N/A | new! |
-| C=8 ITL p50 | **10.0ms** | 10.3ms | **+3%** |
-| C=32 ITL p50 | 14.2ms | 12.9ms | -10% |
+| C=1 throughput | 123 tok/s | 110 tok/s | **+12%** |
+| C=4 throughput | 428 tok/s | 376 tok/s | **+14%** |
+| C=8 throughput | 816 tok/s | 707 tok/s | **+15%** |
+| C=16 throughput | 1320 tok/s | 1261 tok/s | **+5%** |
+| C=32 throughput | 2021 tok/s | 2189 tok/s | -8% |
+| C=64 throughput | 2709 tok/s | — | new |
+| C=1 ITL p50 | **8.0ms** | 8.8ms | **+10% faster** |
+| C=8 ITL p50 | **9.0ms** | 10.3ms | **+14% faster** |
+| C=32 ITL p50 | **12.4ms** | 12.9ms | **+4% faster** |
 | C=1 TTFT p50 | **21ms** | 71ms | **3.4x faster** |
 
 ## Completed Steps
 
-### Step 1: Auto slots + batched kernels
-- Auto-computed slots from GPU memory (32 on A100-80GB)
+### Step 1: Auto slots + batched kernels (2026-04-01)
+- Auto-computed slots from GPU memory
 - Batched conv1d + GDR decode kernels
-- SGLang-style CUDA Graph warmup (12 batch sizes)
 
 ### Step 2: Fix prefix cache crash (2026-04-02)
-- **Root cause**: Full prefix reuse on Qwen3.5 kept contaminated recurrent state from previous request's decode tokens. GDR kernel hit illegal memory during batched decode.
-- **Fix**: Disabled prefix cache for Qwen3.5 (temporary)
+- Disabled prefix cache for Qwen3.5 (recurrent state contamination)
 
 ### Step 3: Fix auto-slots OOM (2026-04-02)
-- **Root cause**: MAX_SLOTS=64 used ~80 GB (entire GPU). No headroom for workspace.
-- **Fix**: Increased RESERVED_BYTES to 6 GB, capped MAX_SLOTS to 32
+- RESERVED_BYTES 6 GB, MAX_SLOTS capped
 
 ### Step 4: 128 slots + high concurrency fixes (2026-04-02)
-- **MAX_SLOTS**: 32 → 128, auto-computed from GPU memory
-- **kv_pool_headroom**: 2 GB → 4 GB for batch buffers + CUDA graphs
-- **Prefill rate limiting**: 1 per step when decode active (prevents scheduler blocking)
-- **BUG FIX**: Shared waiting counter — handle and scheduler had separate AtomicUsize counters, causing all requests rejected after 256 total
-- **CUDA Graph sizes**: Added 16, 20, 24, 28, 32 to warmup schedule
-- C=32 improved from 1628 → 1818 tok/s, C=64 now works at 2397 tok/s
+- MAX_SLOTS 32→128, kv_pool_headroom 2→4 GB
+- Shared waiting counter bug fix (handle/scheduler separate counters)
+- Prefill rate limiting: 1/step when decode active
 
 ### Step 5: Per-layer pointer array pre-upload (2026-04-02)
-- Moved all 48 H2D pointer array uploads before the decode body
-- Eliminated CPU-GPU sync points during layer loop
-- **C=1 ITL now consistent 8.6ms** (was 8.7-10.3ms, varying with input length)
-- C=1 throughput at 2048-in improved 17% (91.6 → 107.2 tok/s)
-- No improvement at C=32 (GPU already saturated, no sync penalty)
+- Moved all 48 H2D pointer uploads before decode body
+- C=1 ITL consistent 8.6ms (was 8.7–10.3ms)
 
-### Step 5b: CUDA Graph attempt (reverted)
-- Tried full decode graph capture but FlashInfer plan changes per step (KV lengths grow)
-- Resulted in CUDA_ERROR_ILLEGAL_ADDRESS on graph replay
-- Partial graph (recurrent only) needs layer loop restructuring
+### Step 6: Piecewise CUDA Graph (2026-04-02)
+- Capture per-group graphs for 8 groups of 3 linear layers
+- Full attention layers run eagerly between groups
+- All ITL -6%
+
+### Step 7: O(1) emit_delta (2026-04-02)
+- Fixed O(N) tokenizer re-decode in emit_delta (re-decoded ALL prefix tokens)
+- Cached prefix byte length between calls
+- C=32 ITL: 13.5ms → 12.4ms (now beats SGLang 12.9ms)
 
 ## Remaining Work
 
 | Step | Priority | Impact | Description |
 |------|----------|--------|-------------|
-| Piecewise CUDA Graph (SGLang approach) | High | C=32 ~7% | Capture per-group (3 linear layers) between attention layers |
-| Fused QKV+Z projection GEMM | Medium | ~2-3% | 4→2 GEMMs per linear layer, needs stride-aware kernels |
-| Fix prefix cache for Qwen3.5 | Medium | TTFT | Reset recurrent state on prefix hit |
-| Optimize conv1d/GDR kernels | Low | ~5% | Profile vs SGLang Triton, optimize memory access |
-| Async scheduling (overlap) | Low | ~3% | Prepare batch N+1 while GPU runs batch N |
-
-## Analysis of C=32 Gap (-17%)
-
-SGLang's 12.9ms ITL vs our 14.4ms ITL at B=32 comes from:
-1. **Piecewise CUDA Graph**: SGLang captures per-layer-group graphs for recurrent layers (~0.35ms savings from ~240→8 kernel launches)
-2. **Kernel efficiency**: SGLang uses torch.compile (Triton) for MLPs/projections, possibly better occupancy
-3. **Dual-stream projection**: SGLang overlaps independent projections on parallel streams (disabled in PCG mode)
-
-The FlashInfer attention layers (8 of 32) run eagerly in both SGLang and agent-infer.
+| Fix prefix cache for Qwen3.5 | High | C=32 TTFT -135ms | Reset recurrent state on prefix hit; closes -8% throughput gap |
+| Batched prefill (multi-request) | Medium | TTFT | Prefill multiple requests in one forward pass |
+| Increase prefill rate during ramp-up | Low | TTFT | More than 1 prefill/step when few decodes active |
