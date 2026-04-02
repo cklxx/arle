@@ -74,6 +74,7 @@ impl GenerationState for Qwen35State {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl ModelForward for Qwen35Model {
     type State = Qwen35State;
     type DecodeContext = super::batch_decode::BatchDecodeBuffers35;
