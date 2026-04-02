@@ -8,6 +8,8 @@ on:
       - 'infer/csrc/metal/**'
       - 'infer/build.rs'
       - 'infer/Cargo.toml'
+      - 'infer/src/bin/metal_bench.rs'
+      - 'benchmarks/metal_baseline.json'
       - '.github/workflows/metal-ci.yml'
   pull_request:
     branches: [ main, master ]
@@ -16,6 +18,8 @@ on:
       - 'infer/csrc/metal/**'
       - 'infer/build.rs'
       - 'infer/Cargo.toml'
+      - 'infer/src/bin/metal_bench.rs'
+      - 'benchmarks/metal_baseline.json'
       - '.github/workflows/metal-ci.yml'
 
 env:
@@ -61,6 +65,13 @@ jobs:
           cargo build
           --no-default-features --features metal,no-cuda
           --bin metal_bench --release
+
+      # Validate that the baseline JSON is well-formed.
+      # NOTE: Actually running benchmarks requires a model and a Metal GPU,
+      # so the CI job only validates that the binary compiles and the
+      # baseline JSON parses correctly.
+      - name: Validate baseline JSON
+        run: python3 -c "import json; json.load(open('benchmarks/metal_baseline.json'))"
 
       # Upload metal_bench binary as a workflow artifact.
       - name: Upload metal_bench artifact

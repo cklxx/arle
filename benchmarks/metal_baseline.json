@@ -1,0 +1,13 @@
+{
+  "model": "Qwen3-0.6B-4bit",
+  "prompt_tokens": 20,
+  "generation_tokens": 512,
+  "metrics": {
+    "prompt_tps": { "mean": 1443.6 },
+    "generation_tps": { "mean": 174.7 },
+    "ttft_ms": { "mean": 14.5 },
+    "total_time_ms": { "mean": 3355.0 }
+  },
+  "recorded_at": "2026-04-01",
+  "notes": "Post step 3: merged quantized projections + token-count parity"
+}

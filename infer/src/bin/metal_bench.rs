@@ -14,10 +14,13 @@
 //!   --prompt-tokens 20 --generation-tokens 256 --warmup 3 --runs 5 --json
 //! ```
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 
 /// Metal backend benchmark: prompt speed, TTFT, decode throughput, peak RSS.
 #[derive(Parser)]
@@ -53,6 +56,20 @@ struct Cli {
     /// Emit results as JSON on stdout (suppresses human-readable table).
     #[arg(long, default_value_t = false)]
     json: bool,
+
+    /// Save benchmark results as a baseline JSON file.
+    #[arg(long, value_name = "PATH")]
+    save_baseline: Option<PathBuf>,
+
+    /// Compare benchmark results against a previously saved baseline.
+    /// Exits with code 1 if any metric regresses beyond its threshold.
+    #[arg(long, value_name = "PATH")]
+    compare_baseline: Option<PathBuf>,
+
+    /// Like --save-baseline, but only overwrites if all metrics PASS
+    /// (or if no baseline file exists yet).
+    #[arg(long, value_name = "PATH")]
+    update_baseline: Option<PathBuf>,
 }
 
 struct Run {
@@ -63,6 +80,120 @@ struct Run {
     generation_tps: f64,
     ttft_ms: f64,
     e2e_tps: f64,
+}
+
+/// A single metric stat in a baseline file (only mean is required).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MetricStat {
+    mean: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p99: Option<f64>,
+}
+
+/// Baseline JSON schema for saving / comparing benchmark results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Baseline {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation_tokens: Option<usize>,
+    metrics: BTreeMap<String, MetricStat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recorded_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<String>,
+}
+
+/// Regression thresholds: how much worse (%) a metric can get before FAIL.
+/// For throughput metrics (higher=better), a regression means the current
+/// value is _lower_ than the baseline.
+/// For latency metrics (lower=better), a regression means the current
+/// value is _higher_ than the baseline.
+fn regression_threshold(metric: &str) -> Option<(f64, bool)> {
+    // Returns (threshold_pct, higher_is_better)
+    match metric {
+        "generation_tps" => Some((5.0, true)),
+        "prompt_tps" => Some((10.0, true)),
+        "ttft_ms" => Some((15.0, false)),
+        _ => None,
+    }
+}
+
+/// Compare current metrics against a baseline. Returns true if all checked
+/// metrics pass, false if any regresses beyond its threshold.
+fn compare_baseline(baseline: &Baseline, current: &BTreeMap<String, MetricStat>) -> bool {
+    let mut all_pass = true;
+    let mut rows: Vec<(String, f64, f64, f64, bool)> = Vec::new();
+
+    for (metric, threshold_info) in [
+        ("prompt_tps", regression_threshold("prompt_tps")),
+        ("generation_tps", regression_threshold("generation_tps")),
+        ("ttft_ms", regression_threshold("ttft_ms")),
+        ("total_time_ms", regression_threshold("total_time_ms")),
+    ] {
+        let base_val = match baseline.metrics.get(metric) {
+            Some(s) => s.mean,
+            None => continue,
+        };
+        let cur_val = match current.get(metric) {
+            Some(s) => s.mean,
+            None => continue,
+        };
+
+        let (pass, delta_pct) = if let Some((thresh, higher_is_better)) = threshold_info {
+            let delta = if higher_is_better {
+                // throughput: regression = current < baseline
+                (cur_val - base_val) / base_val * 100.0
+            } else {
+                // latency: regression = current > baseline (invert sign so negative = regression)
+                (base_val - cur_val) / base_val * 100.0
+            };
+            let pass = delta >= -thresh;
+            (pass, delta)
+        } else {
+            // No threshold — always pass, just report delta
+            let delta = (cur_val - base_val) / base_val * 100.0;
+            (true, delta)
+        };
+
+        if !pass {
+            all_pass = false;
+        }
+        rows.push((metric.to_string(), base_val, cur_val, delta_pct, pass));
+    }
+
+    // Print comparison table
+    eprintln!();
+    eprintln!("  {:<20} {:>12} {:>12} {:>10}   {}", "Metric", "Baseline", "Current", "Delta", "Status");
+    eprintln!("  {}", "-".repeat(72));
+    for (metric, base_val, cur_val, delta_pct, pass) in &rows {
+        let status = if *pass { "PASS" } else { "FAIL" };
+        eprintln!(
+            "  {:<20} {:>12.1} {:>12.1} {:>+9.1}%   {}",
+            metric, base_val, cur_val, delta_pct, status
+        );
+    }
+    eprintln!();
+
+    all_pass
+}
+
+fn build_current_metrics(
+    mean_prompt_tps: f64,
+    mean_generation_tps: f64,
+    mean_ttft_ms: f64,
+    mean_total_time_ms: f64,
+) -> BTreeMap<String, MetricStat> {
+    let mut m = BTreeMap::new();
+    m.insert("prompt_tps".into(), MetricStat { mean: mean_prompt_tps, p50: None, p99: None });
+    m.insert("generation_tps".into(), MetricStat { mean: mean_generation_tps, p50: None, p99: None });
+    m.insert("ttft_ms".into(), MetricStat { mean: mean_ttft_ms, p50: None, p99: None });
+    m.insert("total_time_ms".into(), MetricStat { mean: mean_total_time_ms, p50: None, p99: None });
+    m
 }
 
 fn main() -> Result<()> {
@@ -248,6 +379,85 @@ fn run_bench() -> Result<()> {
             "==={}===",
             "=".repeat(cli.model.len() + quant_hint.len() + 4)
         );
+    }
+
+    // ── Baseline operations ─────────────────────────────────────────────
+    let current_metrics = build_current_metrics(
+        mean_prompt_tps,
+        mean_generation_tps,
+        mean_ttft_ms,
+        mean_total_time_ms,
+    );
+
+    let make_baseline = |notes: Option<String>| -> Baseline {
+        Baseline {
+            model: Some(cli.model.clone()),
+            prompt_tokens: Some(cli.prompt_tokens),
+            generation_tokens: Some(cli.generation_tokens),
+            metrics: current_metrics.clone(),
+            recorded_at: None,
+            notes,
+        }
+    };
+
+    // --save-baseline: unconditionally write current results
+    if let Some(ref path) = cli.save_baseline {
+        let bl = make_baseline(None);
+        let json = serde_json::to_string_pretty(&bl)?;
+        std::fs::write(path, &json)?;
+        eprintln!("Baseline saved to {}", path.display());
+    }
+
+    // --compare-baseline: load baseline and compare
+    let comparison_passed = if let Some(ref path) = cli.compare_baseline {
+        let data = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read baseline {}: {}", path.display(), e))?;
+        let baseline: Baseline = serde_json::from_str(&data)
+            .map_err(|e| anyhow::anyhow!("failed to parse baseline {}: {}", path.display(), e))?;
+        eprintln!("Comparing against baseline: {}", path.display());
+        let passed = compare_baseline(&baseline, &current_metrics);
+        if !passed {
+            eprintln!("REGRESSION DETECTED — one or more metrics exceeded threshold.");
+        } else {
+            eprintln!("All metrics within threshold.");
+        }
+        Some(passed)
+    } else {
+        None
+    };
+
+    // --update-baseline: only overwrite if comparison passes (or no prior baseline)
+    if let Some(ref path) = cli.update_baseline {
+        let should_write = if path.exists() {
+            // Load existing baseline and compare
+            let data = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("failed to read baseline {}: {}", path.display(), e))?;
+            let baseline: Baseline = serde_json::from_str(&data)
+                .map_err(|e| anyhow::anyhow!("failed to parse baseline {}: {}", path.display(), e))?;
+            eprintln!("Checking update eligibility against: {}", path.display());
+            let passed = compare_baseline(&baseline, &current_metrics);
+            if passed {
+                eprintln!("All metrics PASS — updating baseline.");
+            } else {
+                eprintln!("Regression detected — baseline NOT updated.");
+            }
+            passed
+        } else {
+            eprintln!("No existing baseline at {} — creating new.", path.display());
+            true
+        };
+
+        if should_write {
+            let bl = make_baseline(None);
+            let json = serde_json::to_string_pretty(&bl)?;
+            std::fs::write(path, &json)?;
+            eprintln!("Baseline written to {}", path.display());
+        }
+    }
+
+    // Exit with code 1 if comparison failed
+    if comparison_passed == Some(false) {
+        std::process::exit(1);
     }
 
     Ok(())
