@@ -162,7 +162,7 @@ fn generate<M: ModelForward>(
     let mut tokens = prompt_tokens.to_vec();
 
     let ttft_start = Instant::now();
-    model.forward(prompt_tokens, state)?;
+    model.forward_prefill(prompt_tokens, state)?;
     let next_token = model.select_token(state, params, rng)?;
     let ttft = ttft_start.elapsed();
 
@@ -183,7 +183,7 @@ fn generate<M: ModelForward>(
     for i in 1..max_new_tokens {
         let _span = LocalSpan::enter_with_local_parent("decode_step")
             .with_property(|| ("step", i.to_string()));
-        model.forward(&[*tokens.last().unwrap()], state)?;
+        model.forward_decode(*tokens.last().unwrap(), state)?;
         let next_token = model.select_token(state, params, rng)?;
 
         if !params.ignore_eos && model.is_stop_token(next_token) {
@@ -239,7 +239,7 @@ fn generate_streaming_with_callback<M: ModelForward>(
     let mut tokens = prompt_tokens.to_vec();
 
     let ttft_start = Instant::now();
-    model.forward(prompt_tokens, state)?;
+    model.forward_prefill(prompt_tokens, state)?;
     let next_token = model.select_token(state, params, rng)?;
     let ttft = ttft_start.elapsed();
     debug!(
@@ -272,7 +272,7 @@ fn generate_streaming_with_callback<M: ModelForward>(
     for i in 1..max_new_tokens {
         let _span = LocalSpan::enter_with_local_parent("decode_step")
             .with_property(|| ("step", i.to_string()));
-        model.forward(&[*tokens.last().unwrap()], state)?;
+        model.forward_decode(*tokens.last().unwrap(), state)?;
         let next_token = model.select_token(state, params, rng)?;
 
         if !params.ignore_eos && model.is_stop_token(next_token) {

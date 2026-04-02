@@ -20,7 +20,8 @@ pub struct Scheduler<M: ModelForward> {
     /// Paged KV cache pool shared across all slots (for batched decode).
     pub(super) paged_kv_pool: PagedKVPool,
     /// Pre-allocated buffers for batched decode (reused across steps).
-    pub(super) decode_bufs: Option<Box<dyn std::any::Any + Send>>,
+    /// Typed via `M::DecodeContext` — no downcasting needed.
+    pub(super) decode_bufs: Option<M::DecodeContext>,
     /// Round-robin index for fair decode scheduling.
     pub(super) last_served: usize,
     /// Lifetime stats.
@@ -257,18 +258,33 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
 
+        // Lazy-init decode context before warmup.
+        if self.decode_bufs.is_none() {
+            match self
+                .model
+                .create_decode_context(self.states.len(), &self.paged_kv_pool)
+            {
+                Ok(ctx) => self.decode_bufs = Some(ctx),
+                Err(e) => {
+                    error!("Warmup: failed to create decode context: {}", e);
+                    return;
+                }
+            }
+        }
+
         let dummy_tokens: Vec<u32> = vec![0; max_bs];
         let slot_indices: Vec<usize> = (0..max_bs).collect();
         let mut captured = 0;
         for &bs in &warmup_sizes {
             let tokens = &dummy_tokens[..bs];
             let si = &slot_indices[..bs];
+            let decode_ctx = self.decode_bufs.as_mut().unwrap();
             if let Err(e) = self.model.forward_decode_batch(
                 tokens,
                 &mut self.states,
                 si,
                 Some(&mut self.paged_kv_pool),
-                &mut self.decode_bufs,
+                decode_ctx,
                 false,
             ) {
                 info!(

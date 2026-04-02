@@ -147,7 +147,7 @@ impl Qwen3Model {
     /// Batched decode: process B tokens from B different requests in one pass.
     ///
     /// Batched decode using contiguous (per-slot) KV cache.
-    /// Falls back to sequential forward() calls — correct but not optimal.
+    /// Falls back to sequential forward_decode() calls — correct but not optimal.
     pub fn decode_batch_contiguous(
         &self,
         tokens: &[u32],
@@ -155,7 +155,7 @@ impl Qwen3Model {
         slot_indices: &[usize],
     ) -> Result<()> {
         for (i, &token) in tokens.iter().enumerate() {
-            self.forward(&[token], &mut states[slot_indices[i]])?;
+            self.forward_decode(token, &mut states[slot_indices[i]])?;
         }
         Ok(())
     }

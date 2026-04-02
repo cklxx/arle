@@ -84,12 +84,27 @@ impl<M: ModelForward> Scheduler<M> {
             .iter()
             .all(|p| p.is_greedy() && !p.has_penalties());
 
+        // Lazy-init decode context on first batched decode.
+        if decode_bufs.is_none() {
+            match model.create_decode_context(states.len(), paged_kv_pool) {
+                Ok(ctx) => *decode_bufs = Some(ctx),
+                Err(e) => {
+                    error!("Failed to create decode context: {}", e);
+                    for &i in &decode_indices {
+                        active[i].phase = Phase::Finished;
+                    }
+                    return;
+                }
+            }
+        }
+        let decode_ctx = decode_bufs.as_mut().unwrap();
+
         let forward_result = model.forward_decode_batch(
             &token_ids,
             states,
             &slot_indices,
             Some(paged_kv_pool),
-            decode_bufs,
+            decode_ctx,
             all_greedy,
         );
 
@@ -101,7 +116,7 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
         let sampled_result = if all_greedy {
-            match model.sample_batch_greedy(&slot_indices, decode_bufs) {
+            match model.sample_batch_greedy(&slot_indices, decode_ctx) {
                 Ok(Some(tokens)) => Ok(tokens),
                 Ok(None) => model.select_tokens_batch(states, &slot_indices, &sampling_params, rng),
                 Err(e) => Err(e),

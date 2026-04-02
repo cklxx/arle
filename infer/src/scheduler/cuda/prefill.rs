@@ -128,7 +128,7 @@ impl<M: ModelForward> Scheduler<M> {
 
         let slot_idx = req.slot_idx;
         let state = &mut states[slot_idx];
-        let forward_result = model.forward(chunk, state);
+        let forward_result = model.forward_prefill(chunk, state);
 
         if let Err(e) = forward_result {
             error!("Request {}: prefill chunk failed: {}", req.id, e);
