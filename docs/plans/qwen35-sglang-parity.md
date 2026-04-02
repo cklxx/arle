@@ -44,10 +44,33 @@
 - **CUDA Graph sizes**: Added 16, 20, 24, 28, 32 to warmup schedule
 - C=32 improved from 1628 → 1818 tok/s, C=64 now works at 2397 tok/s
 
+### Step 5: Per-layer pointer array pre-upload (2026-04-02)
+- Moved all 48 H2D pointer array uploads before the decode body
+- Eliminated CPU-GPU sync points during layer loop
+- **C=1 ITL now consistent 8.6ms** (was 8.7-10.3ms, varying with input length)
+- C=1 throughput at 2048-in improved 17% (91.6 → 107.2 tok/s)
+- No improvement at C=32 (GPU already saturated, no sync penalty)
+
+### Step 5b: CUDA Graph attempt (reverted)
+- Tried full decode graph capture but FlashInfer plan changes per step (KV lengths grow)
+- Resulted in CUDA_ERROR_ILLEGAL_ADDRESS on graph replay
+- Partial graph (recurrent only) needs layer loop restructuring
+
 ## Remaining Work
 
 | Step | Priority | Impact | Description |
 |------|----------|--------|-------------|
-| CUDA Graph for Qwen3.5 decode | High | C=32 -10% ITL | Recurrent layers run eager; need contiguous cache like SGLang |
+| Piecewise CUDA Graph (SGLang approach) | High | C=32 ~7% | Capture per-group (3 linear layers) between attention layers |
+| Fused QKV+Z projection GEMM | Medium | ~2-3% | 4→2 GEMMs per linear layer, needs stride-aware kernels |
 | Fix prefix cache for Qwen3.5 | Medium | TTFT | Reset recurrent state on prefix hit |
-| Async scheduling (overlap) | Low | ~5% | Prepare batch N+1 while GPU runs batch N |
+| Optimize conv1d/GDR kernels | Low | ~5% | Profile vs SGLang Triton, optimize memory access |
+| Async scheduling (overlap) | Low | ~3% | Prepare batch N+1 while GPU runs batch N |
+
+## Analysis of C=32 Gap (-17%)
+
+SGLang's 12.9ms ITL vs our 14.4ms ITL at B=32 comes from:
+1. **Piecewise CUDA Graph**: SGLang captures per-layer-group graphs for recurrent layers (~0.35ms savings from ~240→8 kernel launches)
+2. **Kernel efficiency**: SGLang uses torch.compile (Triton) for MLPs/projections, possibly better occupancy
+3. **Dual-stream projection**: SGLang overlaps independent projections on parallel streams (disabled in PCG mode)
+
+The FlashInfer attention layers (8 of 32) run eagerly in both SGLang and agent-infer.
