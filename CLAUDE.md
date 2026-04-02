@@ -90,6 +90,17 @@ Non-trivial tasks follow phases. **Each phase has a clear exit condition.**
 
 ---
 
+## Benchmark Rules
+
+- **Snapshot before & after**: Every optimization must have a dated baseline snapshot saved *before* coding and a result snapshot saved *after*. Both go in `docs/experience/wins/YYYY-MM-DD-bench-<label>.md`.
+- **Never overwrite**: Old snapshots are immutable history. Always create a new dated file.
+- **Standard tool**: Use `scripts/bench_throughput_sweep.py` for throughput/ITL/TTFT measurements. Include `--label` for traceability.
+- **Include environment**: Every snapshot must record GPU model, CUDA version, model name, num_slots, and any non-default flags.
+- **Raw data**: Include the full output table, not summaries. Numbers are the ground truth.
+- **Comparison**: After-snapshot should reference the before-snapshot and call out delta on key metrics (throughput, ITL p50, TTFT p50).
+
+---
+
 ## Experience Entries
 
 **Error** (`docs/experience/errors/YYYY-MM-DD-slug.md`):
