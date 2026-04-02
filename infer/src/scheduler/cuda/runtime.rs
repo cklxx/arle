@@ -114,6 +114,7 @@ impl<M: ModelForward> Scheduler<M> {
                 decoded_token_count: 0,
                 sent_len: 0,
                 phase: Phase::New,
+                prefix_byte_len: 0,
             });
         }
     }
