@@ -2,6 +2,10 @@
 
 Target: **production-grade LLM inference engine** on par with sglang (excluding KV-affinity routing).
 
+Related docs:
+
+- [docs/projects/xma-future-research.md](docs/projects/xma-future-research.md) — external research note on XMA / accelerated-model-architectures and what it implies for future architecture work
+
 ---
 
 ## Current State (2026-04-01)
