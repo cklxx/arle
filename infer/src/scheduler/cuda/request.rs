@@ -89,11 +89,15 @@ impl ActiveRequest {
                 }
             }
         } else if self.full_decoded.len() > self.sent_len {
-            let _ = self.delta_tx.send(StreamDelta {
-                text_delta: self.full_decoded[self.sent_len..].to_string(),
-                finish_reason: None,
-                usage: None,
-            });
+            // Snap to char boundary to avoid panic on multi-byte characters.
+            let start = self.full_decoded.floor_char_boundary(self.sent_len);
+            if start < self.full_decoded.len() {
+                let _ = self.delta_tx.send(StreamDelta {
+                    text_delta: self.full_decoded[start..].to_string(),
+                    finish_reason: None,
+                    usage: None,
+                });
+            }
             self.sent_len = self.full_decoded.len();
         }
     }
@@ -115,9 +119,11 @@ impl ActiveRequest {
                 } else {
                     full_text.len()
                 };
-                if end > self.sent_len {
+                let start = full_text.floor_char_boundary(self.sent_len);
+                let end = full_text.floor_char_boundary(end);
+                if end > start {
                     let _ = self.delta_tx.send(StreamDelta {
-                        text_delta: full_text[self.sent_len..end].to_string(),
+                        text_delta: full_text[start..end].to_string(),
                         finish_reason: None,
                         usage: None,
                     });
@@ -166,6 +172,8 @@ pub(crate) fn check_stop_sequences(text: &str, stops: &[String]) -> StopCheckRes
         }
     }
     let max_stop_len = stops.iter().map(|s| s.len()).max().unwrap_or(0);
-    let safe_len = text.len().saturating_sub(max_stop_len);
+    let raw_safe = text.len().saturating_sub(max_stop_len);
+    // Snap to a char boundary so slicing never panics on multi-byte chars.
+    let safe_len = text.floor_char_boundary(raw_safe);
     StopCheckResult::NoStop { safe_len }
 }
