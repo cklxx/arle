@@ -92,10 +92,15 @@ fn detect_sm_targets() -> Vec<String> {
         return sms;
     }
 
-    print!(
+    println!(
         "cargo:warning=Failed to detect GPU SMs via nvidia-smi. Set PEGAINFER_CUDA_SM/CUDA_SM environment variable to override."
     );
-    panic!("GPU detection failed");
+    // Default to sm_80 (A100) when no GPU is detected, allowing compilation
+    // on CI/dev machines. The binary will still require a compatible GPU at runtime.
+    println!(
+        "cargo:warning=Defaulting to sm_80 (A100). Override with PEGAINFER_CUDA_SM if needed."
+    );
+    vec!["80".to_string()]
 }
 
 fn nvcc_arch_args(sm_targets: &[String]) -> Vec<String> {

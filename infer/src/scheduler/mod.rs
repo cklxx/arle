@@ -16,6 +16,7 @@
 //! 4. Starting new prefills only when no decode work is pending
 
 mod batch;
+pub mod metrics;
 mod types;
 
 #[cfg(feature = "cuda")]

@@ -326,7 +326,8 @@ impl TokenKVPool {
                     self.head_dim as i32,
                     self.kv_dim as i32, // stride_page = kv_dim (one token row)
                     ctx.stream.cu_stream(),
-                );
+                )
+                .result()?;
             }
         }
 

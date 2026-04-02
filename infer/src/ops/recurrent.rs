@@ -50,7 +50,8 @@ pub(crate) fn gated_delta_rule_decode_into(
             key_dim as i32,
             val_dim as i32,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
 
     Ok(())
@@ -94,7 +95,9 @@ pub(crate) fn conv1d_decode_batch_into(
             kernel_size as i32,
             batch_size as i32,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()
+        .expect("conv1d_decode_batch_cuda failed");
     }
 }
 
@@ -140,7 +143,8 @@ pub(crate) fn gdr_decode_batch_into(
             val_dim as i32,
             batch_size as i32,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
 
     Ok(())
@@ -177,7 +181,9 @@ pub(crate) fn conv1d_prefill_batch_into(
             x_seq.seq_len as i32,
             kernel_size as i32,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()
+        .expect("conv1d_prefill_cuda failed");
     }
 }
 

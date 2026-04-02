@@ -43,7 +43,7 @@ __global__ void scatter_write_kv_kernel(
     v_pool[dst_offset] = v_batch[src_offset];
 }
 
-extern "C" void scatter_write_kv_cuda(
+extern "C" cudaError_t scatter_write_kv_cuda(
     const __nv_bfloat16* k_batch,
     const __nv_bfloat16* v_batch,
     __nv_bfloat16* k_pool,
@@ -59,4 +59,5 @@ extern "C" void scatter_write_kv_cuda(
     scatter_write_kv_kernel<<<grid, block, 0, stream>>>(
         k_batch, v_batch, k_pool, v_pool, token_indices,
         seq_len, num_kv_heads, head_dim);
+    return cudaGetLastError();
 }

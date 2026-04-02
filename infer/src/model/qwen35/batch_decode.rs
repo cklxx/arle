@@ -16,51 +16,109 @@ use crate::ops;
 use crate::paged_kv::PagedKVPool;
 use crate::tensor::{DeviceContext, HiddenStates};
 
+// ── Sub-structs ─────────────────────────────────────────────────────────────
+
+/// Buffers shared across all layer types: embedding, residuals, final norm.
+pub(crate) struct CommonBufs {
+    pub(super) hidden_out: HiddenStates,
+    pub(super) normed: HiddenStates,
+    pub(super) embedding_out: HiddenStates,
+    pub(super) o_buf: HiddenStates,
+    pub(super) attn_results: HiddenStates,
+    pub(super) hidden_mid: HiddenStates,
+}
+
+// SAFETY: Exclusively accessed from the single scheduler inference thread.
+unsafe impl Send for CommonBufs {}
+
+impl CommonBufs {
+    fn set_batch_size(&mut self, bs: usize) {
+        self.hidden_out.seq_len = bs;
+        self.normed.seq_len = bs;
+        self.o_buf.seq_len = bs;
+        self.attn_results.seq_len = bs;
+        self.hidden_mid.seq_len = bs;
+    }
+}
+
+/// Buffers for full attention layers (HD256, paged).
+pub(crate) struct FullAttnBufs {
+    pub(super) q_full_batch: HiddenStates,
+    pub(super) q_batch: HiddenStates,
+    pub(super) k_batch: HiddenStates,
+    pub(super) v_batch: HiddenStates,
+    pub(super) attn_output: HiddenStates,
+}
+
+// SAFETY: Exclusively accessed from the single scheduler inference thread.
+unsafe impl Send for FullAttnBufs {}
+
+impl FullAttnBufs {
+    fn set_batch_size(&mut self, bs: usize) {
+        self.q_full_batch.seq_len = bs;
+        self.q_batch.seq_len = bs;
+        self.k_batch.seq_len = bs;
+        self.v_batch.seq_len = bs;
+        self.attn_output.seq_len = bs;
+    }
+}
+
+/// Buffers for linear attention layers (conv1d + GDR recurrent).
+pub(crate) struct RecurrentBufs {
+    pub(super) qkv_batch: HiddenStates,
+    pub(super) z_batch: HiddenStates,
+    pub(super) b_batch: HiddenStates,
+    pub(super) a_batch: HiddenStates,
+    pub(super) conv_state_ptrs_gpu: CudaSlice<u64>,
+    pub(super) conv_state_ptrs_host: Vec<u64>,
+    pub(super) gdr_state_ptrs_gpu: CudaSlice<u64>,
+    pub(super) gdr_state_ptrs_host: Vec<u64>,
+    pub(super) qkv_conv_batch: HiddenStates,
+    pub(super) gdr_out_batch: HiddenStates,
+    pub(super) normed_gated: HiddenStates,
+}
+
+// SAFETY: Exclusively accessed from the single scheduler inference thread.
+unsafe impl Send for RecurrentBufs {}
+
+impl RecurrentBufs {
+    fn set_batch_size(&mut self, bs: usize) {
+        self.qkv_batch.seq_len = bs;
+        self.z_batch.seq_len = bs;
+        self.b_batch.seq_len = bs;
+        self.a_batch.seq_len = bs;
+        self.qkv_conv_batch.seq_len = bs;
+        self.gdr_out_batch.seq_len = bs;
+        self.normed_gated.seq_len = bs;
+    }
+}
+
+/// Buffers for MLP (gate/up/down projections).
+pub(crate) struct MlpBufs {
+    pub(super) gate_out: HiddenStates,
+    pub(super) up_out: HiddenStates,
+    pub(super) act_out: HiddenStates,
+}
+
+// SAFETY: Exclusively accessed from the single scheduler inference thread.
+unsafe impl Send for MlpBufs {}
+
+impl MlpBufs {
+    fn set_batch_size(&mut self, bs: usize) {
+        self.gate_out.seq_len = bs;
+        self.up_out.seq_len = bs;
+        self.act_out.seq_len = bs;
+    }
+}
+
+// ── Outer container ─────────────────────────────────────────────────────────
+
 /// Pre-allocated buffers for batched decode, reused across steps.
 pub(crate) struct BatchDecodeBuffers35 {
-    // ── Common buffers ──
-    hidden_out: HiddenStates,
-    normed: HiddenStates,
-    embedding_out: HiddenStates,
-    o_buf: HiddenStates,
-    gate_out: HiddenStates,
-    up_out: HiddenStates,
-    act_out: HiddenStates,
-
-    // ── Full attention (8 layers) ──
-    /// Q+gate projection output [B, q_proj_dim] where q_proj_dim = num_q_heads * 256 * 2
-    q_full_batch: HiddenStates,
-    /// Q output after norm+RoPE (no gate) [B, q_dim] where q_dim = num_q_heads * 256
-    q_batch: HiddenStates,
-    k_batch: HiddenStates,
-    v_batch: HiddenStates,
-    attn_output: HiddenStates,
-
-    // ── Linear attention (24 layers) — batched projections ──
-    qkv_batch: HiddenStates,
-    z_batch: HiddenStates,
-    b_batch: HiddenStates,
-    a_batch: HiddenStates,
-
-    // ── Linear attention — batched recurrent kernel support ──
-    /// Device pointer array for per-request conv states [max_batch_size] u64 pointers
-    conv_state_ptrs_gpu: CudaSlice<u64>,
-    conv_state_ptrs_host: Vec<u64>,
-    /// Device pointer array for per-request GDR states [max_batch_size] u64 pointers
-    gdr_state_ptrs_gpu: CudaSlice<u64>,
-    gdr_state_ptrs_host: Vec<u64>,
-    /// Batched conv1d output [B, qkv_dim] — fed into GDR
-    qkv_conv_batch: HiddenStates,
-
-    // ── Linear attention — batched output ──
-    gdr_out_batch: HiddenStates,
-    normed_gated: HiddenStates,
-
-    // ── Attention/recurrent output → O/out proj input [B, hidden] ──
-    attn_results: HiddenStates,
-
-    // ── Residual intermediate [B, hidden] ──
-    hidden_mid: HiddenStates,
+    pub(super) common: CommonBufs,
+    pub(super) attn: FullAttnBufs,
+    pub(super) recurrent: RecurrentBufs,
+    pub(super) mlp: MlpBufs,
 
     // ── Logits + sampling ──
     pub(super) logits_batch: Option<HiddenStates>,
@@ -96,27 +154,28 @@ impl BatchDecodeBuffers35 {
         num_qheads: usize,
         max_total_pages: usize,
     ) -> Result<Self> {
-        Ok(Self {
+        let common = CommonBufs {
             hidden_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
             normed: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
             embedding_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
             o_buf: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
-            gate_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
-            up_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
-            act_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
+            attn_results: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
+            hidden_mid: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
+        };
 
+        let attn = FullAttnBufs {
             q_full_batch: HiddenStates::zeros(ctx, q_proj_dim, max_batch_size)?,
             q_batch: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
             k_batch: HiddenStates::zeros(ctx, kv_dim, max_batch_size)?,
             v_batch: HiddenStates::zeros(ctx, kv_dim, max_batch_size)?,
             attn_output: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
+        };
 
+        let recurrent = RecurrentBufs {
             qkv_batch: HiddenStates::zeros(ctx, qkv_dim, max_batch_size)?,
             z_batch: HiddenStates::zeros(ctx, z_dim, max_batch_size)?,
             b_batch: HiddenStates::zeros(ctx, b_dim, max_batch_size)?,
             a_batch: HiddenStates::zeros(ctx, b_dim, max_batch_size)?,
-
-            // Batched recurrent kernel pointer arrays
             conv_state_ptrs_gpu: ctx
                 .stream
                 .alloc_zeros(max_batch_size)
@@ -128,12 +187,21 @@ impl BatchDecodeBuffers35 {
                 .map_err(|e| anyhow::anyhow!("Alloc gdr_state_ptrs: {e}"))?,
             gdr_state_ptrs_host: vec![0u64; max_batch_size],
             qkv_conv_batch: HiddenStates::zeros(ctx, qkv_dim, max_batch_size)?,
-
             gdr_out_batch: HiddenStates::zeros(ctx, z_dim, max_batch_size)?,
             normed_gated: HiddenStates::zeros(ctx, z_dim, max_batch_size)?,
+        };
 
-            attn_results: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
-            hidden_mid: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
+        let mlp = MlpBufs {
+            gate_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
+            up_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
+            act_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
+        };
+
+        Ok(Self {
+            common,
+            attn,
+            recurrent,
+            mlp,
 
             logits_batch: None,
             argmax_out: ctx
@@ -161,26 +229,10 @@ impl BatchDecodeBuffers35 {
 
     fn set_batch_size(&mut self, bs: usize) {
         debug_assert!(bs <= self.max_batch_size);
-        self.hidden_out.seq_len = bs;
-        self.normed.seq_len = bs;
-        self.q_full_batch.seq_len = bs;
-        self.q_batch.seq_len = bs;
-        self.k_batch.seq_len = bs;
-        self.v_batch.seq_len = bs;
-        self.attn_output.seq_len = bs;
-        self.o_buf.seq_len = bs;
-        self.gate_out.seq_len = bs;
-        self.up_out.seq_len = bs;
-        self.act_out.seq_len = bs;
-        self.qkv_batch.seq_len = bs;
-        self.z_batch.seq_len = bs;
-        self.b_batch.seq_len = bs;
-        self.a_batch.seq_len = bs;
-        self.qkv_conv_batch.seq_len = bs;
-        self.gdr_out_batch.seq_len = bs;
-        self.normed_gated.seq_len = bs;
-        self.attn_results.seq_len = bs;
-        self.hidden_mid.seq_len = bs;
+        self.common.set_batch_size(bs);
+        self.attn.set_batch_size(bs);
+        self.recurrent.set_batch_size(bs);
+        self.mlp.set_batch_size(bs);
     }
 }
 
@@ -248,7 +300,7 @@ impl Qwen35Model {
             head_dim,
         )?;
 
-        bufs.embedding_out.seq_len = batch_size;
+        bufs.common.embedding_out.seq_len = batch_size;
 
         // Lazy-init logits buffer
         if bufs.logits_batch.is_none() {
@@ -296,10 +348,10 @@ impl Qwen35Model {
             &self.ctx,
             &self.embed_tokens,
             &bufs.token_ids_gpu,
-            &mut bufs.embedding_out,
+            &mut bufs.common.embedding_out,
         )?;
 
-        let hidden_ptr = &mut bufs.embedding_out as *mut HiddenStates;
+        let hidden_ptr = &mut bufs.common.embedding_out as *mut HiddenStates;
 
         let mut full_idx = 0usize;
         let mut linear_idx = 0usize;
@@ -331,10 +383,21 @@ impl Qwen35Model {
 
         // Final norm (offset variant) + logits GEMM
         let hidden = unsafe { &*hidden_ptr };
-        ops::rms_norm_batch_offset_into(&self.ctx, hidden, &self.norm, eps, &mut bufs.normed)?;
+        ops::rms_norm_batch_offset_into(
+            &self.ctx,
+            hidden,
+            &self.norm,
+            eps,
+            &mut bufs.common.normed,
+        )?;
         let logits_buf = bufs.logits_batch.as_mut().unwrap();
         logits_buf.seq_len = batch_size;
-        ops::gemm_into(&self.ctx, &self.embed_tokens, &bufs.normed, logits_buf);
+        ops::gemm_into(
+            &self.ctx,
+            &self.embed_tokens,
+            &bufs.common.normed,
+            logits_buf,
+        );
 
         Ok(())
     }
@@ -363,26 +426,36 @@ impl Qwen35Model {
             hidden,
             &layer.input_layernorm,
             eps,
-            &mut bufs.normed,
+            &mut bufs.common.normed,
         )?;
 
         // 2. QKV projections (batched GEMM)
         ops::gemm_into(
             &self.ctx,
             &attn.q_proj,
-            &bufs.normed,
-            &mut bufs.q_full_batch,
+            &bufs.common.normed,
+            &mut bufs.attn.q_full_batch,
         );
-        ops::gemm_into(&self.ctx, &attn.k_proj, &bufs.normed, &mut bufs.k_batch);
-        ops::gemm_into(&self.ctx, &attn.v_proj, &bufs.normed, &mut bufs.v_batch);
+        ops::gemm_into(
+            &self.ctx,
+            &attn.k_proj,
+            &bufs.common.normed,
+            &mut bufs.attn.k_batch,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &attn.v_proj,
+            &bufs.common.normed,
+            &mut bufs.attn.v_batch,
+        );
 
         // 3. Decode prep: QK-norm (1+w) + partial RoPE + paged KV write
         ops::decode_prep_paged_hd256(
             &self.ctx,
-            &bufs.q_full_batch,
-            &mut bufs.q_batch,
-            &bufs.k_batch,
-            &bufs.v_batch,
+            &bufs.attn.q_full_batch,
+            &mut bufs.attn.q_batch,
+            &bufs.attn.k_batch,
+            &bufs.attn.v_batch,
             &attn.q_norm,
             &attn.k_norm,
             &self.cos_cache,
@@ -403,13 +476,13 @@ impl Qwen35Model {
         // 4. FlashInfer HD256 attention
         ops::flashinfer_run_layer_hd256(
             &self.ctx,
-            &bufs.q_batch,
+            &bufs.attn.q_batch,
             kv_pool,
             full_idx,
             &bufs.metadata.kv_indptr,
             &bufs.metadata.kv_indices,
             &bufs.metadata.kv_last_page_len,
-            &mut bufs.attn_output,
+            &mut bufs.attn.attn_output,
             &mut bufs.metadata.flashinfer_ws,
             num_heads,
             num_kv_heads,
@@ -420,8 +493,8 @@ impl Qwen35Model {
         // 5. Apply sigmoid gate
         ops::attention_gate_paged_hd256(
             &self.ctx,
-            &bufs.q_full_batch,
-            &mut bufs.attn_output,
+            &bufs.attn.q_full_batch,
+            &mut bufs.attn.attn_output,
             num_heads,
         );
 
@@ -429,8 +502,8 @@ impl Qwen35Model {
         ops::gemm_into(
             &self.ctx,
             &attn.o_proj,
-            &bufs.attn_output,
-            &mut bufs.attn_results,
+            &bufs.attn.attn_output,
+            &mut bufs.common.attn_results,
         );
 
         // 7. Residual + post-attention norm + MLP
@@ -460,19 +533,34 @@ impl Qwen35Model {
             hidden,
             &layer.input_layernorm,
             eps,
-            &mut bufs.normed,
+            &mut bufs.common.normed,
         )?;
 
         // 2. Batched projections (GEMM)
         ops::gemm_into(
             &self.ctx,
             &attn.in_proj_qkv,
-            &bufs.normed,
-            &mut bufs.qkv_batch,
+            &bufs.common.normed,
+            &mut bufs.recurrent.qkv_batch,
         );
-        ops::gemm_into(&self.ctx, &attn.in_proj_z, &bufs.normed, &mut bufs.z_batch);
-        ops::gemm_into(&self.ctx, &attn.in_proj_b, &bufs.normed, &mut bufs.b_batch);
-        ops::gemm_into(&self.ctx, &attn.in_proj_a, &bufs.normed, &mut bufs.a_batch);
+        ops::gemm_into(
+            &self.ctx,
+            &attn.in_proj_z,
+            &bufs.common.normed,
+            &mut bufs.recurrent.z_batch,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &attn.in_proj_b,
+            &bufs.common.normed,
+            &mut bufs.recurrent.b_batch,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &attn.in_proj_a,
+            &bufs.common.normed,
+            &mut bufs.recurrent.a_batch,
+        );
 
         // 3. Batched conv1d + GDR via pointer arrays (one kernel launch each)
         //
@@ -488,33 +576,33 @@ impl Qwen35Model {
                 let layer_state = &mut states[si].recurrent_state.layers[linear_idx];
                 let (conv_ptr, _) = layer_state.conv_state.data.device_ptr_mut(&self.ctx.stream);
                 let (gdr_ptr, _) = layer_state.state.device_ptr_mut(&self.ctx.stream);
-                bufs.conv_state_ptrs_host[b] = conv_ptr as u64;
-                bufs.gdr_state_ptrs_host[b] = gdr_ptr as u64;
+                bufs.recurrent.conv_state_ptrs_host[b] = conv_ptr as u64;
+                bufs.recurrent.gdr_state_ptrs_host[b] = gdr_ptr as u64;
             }
 
             // H2D upload pointer arrays
             self.ctx
                 .stream
                 .memcpy_htod(
-                    &bufs.conv_state_ptrs_host[..batch_size],
-                    &mut bufs.conv_state_ptrs_gpu,
+                    &bufs.recurrent.conv_state_ptrs_host[..batch_size],
+                    &mut bufs.recurrent.conv_state_ptrs_gpu,
                 )
                 .map_err(|e| anyhow::anyhow!("H2D conv_state_ptrs: {e}"))?;
             self.ctx
                 .stream
                 .memcpy_htod(
-                    &bufs.gdr_state_ptrs_host[..batch_size],
-                    &mut bufs.gdr_state_ptrs_gpu,
+                    &bufs.recurrent.gdr_state_ptrs_host[..batch_size],
+                    &mut bufs.recurrent.gdr_state_ptrs_gpu,
                 )
                 .map_err(|e| anyhow::anyhow!("H2D gdr_state_ptrs: {e}"))?;
 
             // Batched conv1d decode: one kernel launch for all B requests
             ops::conv1d_decode_batch_into(
                 &self.ctx,
-                &bufs.qkv_batch,
+                &bufs.recurrent.qkv_batch,
                 &attn.conv1d_weight,
-                &mut bufs.conv_state_ptrs_gpu,
-                &mut bufs.qkv_conv_batch,
+                &mut bufs.recurrent.conv_state_ptrs_gpu,
+                &mut bufs.recurrent.qkv_conv_batch,
                 c.linear_conv_kernel_dim,
                 batch_size,
             );
@@ -522,13 +610,13 @@ impl Qwen35Model {
             // Batched GDR decode: one kernel launch for all B requests
             ops::gdr_decode_batch_into(
                 &self.ctx,
-                &bufs.qkv_conv_batch,
-                &bufs.b_batch,
-                &bufs.a_batch,
+                &bufs.recurrent.qkv_conv_batch,
+                &bufs.recurrent.b_batch,
+                &bufs.recurrent.a_batch,
                 &attn.dt_bias,
                 &attn.a_log,
-                &mut bufs.gdr_state_ptrs_gpu,
-                &mut bufs.gdr_out_batch,
+                &mut bufs.recurrent.gdr_state_ptrs_gpu,
+                &mut bufs.recurrent.gdr_out_batch,
                 c.linear_num_key_heads,
                 c.linear_num_value_heads,
                 c.linear_key_head_dim,
@@ -540,10 +628,10 @@ impl Qwen35Model {
         // 4. Batched gated RMSNorm
         ops::rms_norm_gated_batch_into(
             &self.ctx,
-            &bufs.gdr_out_batch,
+            &bufs.recurrent.gdr_out_batch,
             &attn.norm_weight,
-            &bufs.z_batch,
-            &mut bufs.normed_gated,
+            &bufs.recurrent.z_batch,
+            &mut bufs.recurrent.normed_gated,
             c.linear_num_value_heads,
             c.linear_value_head_dim,
             eps,
@@ -553,8 +641,8 @@ impl Qwen35Model {
         ops::gemm_into(
             &self.ctx,
             &attn.out_proj,
-            &bufs.normed_gated,
-            &mut bufs.attn_results,
+            &bufs.recurrent.normed_gated,
+            &mut bufs.common.attn_results,
         );
 
         // 6. Residual + post-attention norm + MLP
@@ -574,46 +662,56 @@ impl Qwen35Model {
         let eps = self.config.rms_norm_eps;
 
         // Residual 1: hidden_mid = hidden + attn_results
-        ops::add_batch_into(&self.ctx, hidden, &bufs.attn_results, &mut bufs.hidden_mid)?;
+        ops::add_batch_into(
+            &self.ctx,
+            hidden,
+            &bufs.common.attn_results,
+            &mut bufs.common.hidden_mid,
+        )?;
 
         // Post-attention RMSNorm (offset variant)
         ops::rms_norm_batch_offset_into(
             &self.ctx,
-            &bufs.hidden_mid,
+            &bufs.common.hidden_mid,
             &layer.post_attention_layernorm,
             eps,
-            &mut bufs.normed,
+            &mut bufs.common.normed,
         )?;
 
         // MLP: gate + up → silu_mul → down
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.gate_proj,
-            &bufs.normed,
-            &mut bufs.gate_out,
+            &bufs.common.normed,
+            &mut bufs.mlp.gate_out,
         );
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.up_proj,
-            &bufs.normed,
-            &mut bufs.up_out,
+            &bufs.common.normed,
+            &mut bufs.mlp.up_out,
         );
-        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+        ops::silu_mul_batch_into(
+            &self.ctx,
+            &bufs.mlp.gate_out,
+            &bufs.mlp.up_out,
+            &mut bufs.mlp.act_out,
+        )?;
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,
-            &bufs.act_out,
-            &mut bufs.o_buf,
+            &bufs.mlp.act_out,
+            &mut bufs.common.o_buf,
         );
 
         // Residual 2: hidden = hidden_mid + mlp_out
         ops::add_batch_into(
             &self.ctx,
-            &bufs.hidden_mid,
-            &bufs.o_buf,
-            &mut bufs.hidden_out,
+            &bufs.common.hidden_mid,
+            &bufs.common.o_buf,
+            &mut bufs.common.hidden_out,
         )?;
-        std::mem::swap(hidden, &mut bufs.hidden_out);
+        std::mem::swap(hidden, &mut bufs.common.hidden_out);
 
         Ok(())
     }

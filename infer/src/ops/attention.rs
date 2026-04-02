@@ -74,7 +74,8 @@ pub fn prefill_attention_batch(
                 max_seq_len as i32,
                 rms_eps,
                 ctx.stream.cu_stream(),
-            );
+            )
+            .result()?;
 
             // Step 3: FlashInfer single prefill — reads normed Q and KV cache
             let kv_len = start_pos + seq_len;
@@ -276,7 +277,8 @@ pub fn prefill_attention_hd256_batch_with_scratch(
             rms_eps,
             max_seq_len as i32,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
 
     flash_attention_prefill_hd256_into(
@@ -299,7 +301,8 @@ pub fn prefill_attention_hd256_batch_with_scratch(
             num_q_heads as i32,
             seq_len as i32,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
 
     Ok(())
@@ -386,7 +389,8 @@ pub fn fused_attention_decode_batched_into(
             batch_size as i32,
             rms_eps,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
 
     // Phase 2: reduce partials → final bf16 output
@@ -400,7 +404,8 @@ pub fn fused_attention_decode_batched_into(
             head_dim as i32,
             batch_size as i32,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
 
     Ok(())
@@ -685,7 +690,8 @@ pub fn decode_prep_paged(
             batch_size as i32,
             rms_eps,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
 
     Ok(())
@@ -1090,7 +1096,8 @@ pub(crate) fn decode_prep_paged_hd256(
             rotary_dim as i32,
             rms_eps,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
 
     Ok(())
@@ -1115,7 +1122,9 @@ pub(crate) fn attention_gate_paged_hd256(
             num_q_heads as i32,
             batch_size as i32,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()
+        .expect("attention_gate_paged_hd256_cuda failed");
     }
 }
 

@@ -59,6 +59,8 @@ impl DeviceContext {
 pub struct DeviceVec {
     pub data: CudaSlice<bf16>,
     pub len: usize,
+    /// Debug label describing the tensor's semantic shape (e.g., "norm_weight[hidden]", "kv_cache[heads,seq,dim]").
+    pub label: &'static str,
 }
 
 impl DeviceVec {
@@ -71,6 +73,7 @@ impl DeviceVec {
         Ok(Self {
             data: gpu_data,
             len: data.len(),
+            label: "",
         })
     }
 
@@ -99,7 +102,18 @@ impl DeviceVec {
         Ok(Self {
             data: gpu_data,
             len,
+            label: "",
         })
+    }
+
+    /// Attach a debug label describing this tensor's semantic shape/purpose.
+    ///
+    /// ```ignore
+    /// let w = DeviceVec::zeros(&ctx, 4096)?.with_label("norm_weight[hidden]");
+    /// ```
+    pub fn with_label(mut self, label: &'static str) -> Self {
+        self.label = label;
+        self
     }
 
     /// Copy a region of the device buffer to a host slice (D2H).
@@ -207,6 +221,17 @@ impl Clone for DeviceVec {
         Self {
             data: self.data.try_clone().unwrap(),
             len: self.len,
+            label: self.label,
+        }
+    }
+}
+
+impl std::fmt::Debug for DeviceVec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.label.is_empty() {
+            write!(f, "DeviceVec(len={})", self.len)
+        } else {
+            write!(f, "DeviceVec({}, len={})", self.label, self.len)
         }
     }
 }

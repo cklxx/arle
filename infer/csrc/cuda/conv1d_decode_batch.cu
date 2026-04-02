@@ -67,7 +67,7 @@ __global__ void conv1d_decode_batch_kernel(
 
 extern "C" {
 
-void conv1d_decode_batch_cuda(
+cudaError_t conv1d_decode_batch_cuda(
     const __nv_bfloat16* x_batch,
     const __nv_bfloat16* conv_weight,
     __nv_bfloat16** conv_state_ptrs,
@@ -82,6 +82,7 @@ void conv1d_decode_batch_cuda(
         x_batch, conv_weight, conv_state_ptrs, out_batch,
         num_channels, kernel_size
     );
+    return cudaGetLastError();
 }
 
 } // extern "C"

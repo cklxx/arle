@@ -160,7 +160,7 @@ __global__ void decode_prep_paged_kernel(
 
 extern "C" {
 
-void decode_prep_paged_cuda(
+cudaError_t decode_prep_paged_cuda(
     __nv_bfloat16* q_batch,
     const __nv_bfloat16* k_batch,
     const __nv_bfloat16* v_batch,
@@ -196,6 +196,7 @@ void decode_prep_paged_cuda(
         page_size, stride_page,
         rms_eps
     );
+    return cudaGetLastError();
 }
 
 } // extern "C"

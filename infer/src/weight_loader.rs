@@ -70,6 +70,22 @@ pub(crate) fn mmap_shards(shard_paths: &[String]) -> Result<Vec<Mmap>> {
     Ok(mmaps)
 }
 
+/// Build a `&'static str` debug label for a 1D weight tensor.
+///
+/// Leaks a small `String` — acceptable because weight loading is a one-time startup cost
+/// and the labels live for the process lifetime.
+fn shape_label_1d(name: &str, shape: &[usize]) -> &'static str {
+    let dims: String = shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let short = name.rsplit('.').next().unwrap_or(name);
+    let label = format!("{}[{}]", short, dims);
+    // SAFETY: intentional leak — one allocation per weight, bounded by model size.
+    Box::leak(label.into_boxed_str())
+}
+
 fn find_tensor<'a>(
     shards: &'a [SafeTensors<'a>],
     weight_map: &HashMap<String, usize>,
@@ -97,7 +113,9 @@ pub(crate) fn load_tensor_1d(
     name: &str,
 ) -> Result<DeviceVec> {
     let tensor = find_tensor(shards, weight_map, name)?;
-    DeviceVec::from_safetensors(ctx, tensor.data())
+    let shape = tensor.shape();
+    let label = shape_label_1d(name, shape);
+    DeviceVec::from_safetensors(ctx, tensor.data()).map(|v| v.with_label(label))
 }
 
 pub(crate) fn load_tensor_2d(
@@ -143,8 +161,8 @@ pub(crate) fn precompute_rope(
         }
     }
 
-    let cos_cache = DeviceVec::from_host(ctx, &cos_host)?;
-    let sin_cache = DeviceVec::from_host(ctx, &sin_host)?;
+    let cos_cache = DeviceVec::from_host(ctx, &cos_host)?.with_label("rope_cos[seq,dim]");
+    let sin_cache = DeviceVec::from_host(ctx, &sin_host)?.with_label("rope_sin[seq,dim]");
 
     Ok((cos_cache, sin_cache))
 }

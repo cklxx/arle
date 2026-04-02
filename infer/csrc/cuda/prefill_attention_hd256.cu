@@ -158,7 +158,7 @@ __global__ void attention_gate_batch_hd256_kernel(
 
 extern "C" {
 
-void prefill_attention_hd256_prep_cuda(
+cudaError_t prefill_attention_hd256_prep_cuda(
     const __nv_bfloat16* q_full_batch,
     const __nv_bfloat16* k_batch,
     const __nv_bfloat16* v_batch,
@@ -206,9 +206,10 @@ void prefill_attention_hd256_prep_cuda(
         start_pos_ptr,
         max_seq_len
     );
+    return cudaGetLastError();
 }
 
-void attention_gate_batch_hd256_cuda(
+cudaError_t attention_gate_batch_hd256_cuda(
     const __nv_bfloat16* q_full_batch,
     __nv_bfloat16* attn_out,
     int num_q_heads,
@@ -224,6 +225,7 @@ void attention_gate_batch_hd256_cuda(
         num_q_heads,
         seq_len
     );
+    return cudaGetLastError();
 }
 
 } // extern "C"

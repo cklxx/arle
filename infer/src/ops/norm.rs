@@ -24,7 +24,8 @@ pub fn rms_norm_into(
             x.len as i32,
             eps,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
     Ok(())
 }
@@ -66,7 +67,8 @@ pub fn fused_add_rms_norm_into(
             hidden.len as i32,
             eps,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
     Ok(())
 }
@@ -100,7 +102,9 @@ pub(crate) fn fused_add_rms_norm_batch_into(
             hidden.seq_len as i32,
             eps,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()
+        .expect("fused_add_rms_norm_batched_cuda failed");
     }
 }
 
@@ -127,7 +131,9 @@ pub(crate) fn rms_norm_batch_into(
             x.seq_len as i32,
             eps,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()
+        .expect("rms_norm_batched_cuda failed");
     }
 }
 
@@ -154,7 +160,8 @@ pub fn rms_norm_batch_offset_into(
             x.seq_len as i32,
             eps,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
     Ok(())
 }
@@ -179,7 +186,8 @@ pub fn rms_norm_offset_into(
             x.len as i32,
             eps,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
     Ok(())
 }
@@ -208,7 +216,8 @@ pub fn fused_add_rms_norm_offset_into(
             hidden.len as i32,
             eps,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
     Ok(())
 }
@@ -243,7 +252,8 @@ pub fn rms_norm_gated_into(
             head_dim as i32,
             eps,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
     Ok(())
 }
@@ -281,6 +291,8 @@ pub(crate) fn rms_norm_gated_batch_into(
             head_dim as i32,
             eps,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()
+        .expect("rms_norm_gated_cuda failed");
     }
 }

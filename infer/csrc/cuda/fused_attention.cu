@@ -625,7 +625,7 @@ __global__ void attention_decode_reduce_batched_kernel(
 // ============================================================================
 extern "C" {
 
-void fused_gqa_attention_decode_batched(
+cudaError_t fused_gqa_attention_decode_batched(
     const __nv_bfloat16* q_batch,
     const __nv_bfloat16* k_batch,
     const __nv_bfloat16* v_batch,
@@ -662,9 +662,10 @@ void fused_gqa_attention_decode_batched(
         num_qheads, num_kvheads, gqa_ratio, head_dim,
         max_seq_len, rms_eps
     );
+    return cudaGetLastError();
 }
 
-void attention_decode_reduce_batched(
+cudaError_t attention_decode_reduce_batched(
     const float* partial_out,
     const float* partial_m,
     const float* partial_l,
@@ -681,6 +682,7 @@ void attention_decode_reduce_batched(
         partial_out, partial_m, partial_l,
         output, num_qheads, head_dim
     );
+    return cudaGetLastError();
 }
 
 void fused_gqa_attention_single_token(

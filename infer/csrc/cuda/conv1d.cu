@@ -80,7 +80,7 @@ __global__ void conv1d_prefill_kernel(
 
 extern "C" {
 
-void conv1d_prefill_cuda(
+cudaError_t conv1d_prefill_cuda(
     const __nv_bfloat16* x_seq,
     const __nv_bfloat16* conv_weight,
     __nv_bfloat16* conv_state,
@@ -95,6 +95,7 @@ void conv1d_prefill_cuda(
     conv1d_prefill_kernel<<<blocks, CONV1D_BLOCK, 0, stream>>>(
         x_seq, conv_weight, conv_state, out_seq, num_channels, seq_len, kernel_size
     );
+    return cudaGetLastError();
 }
 
 } // extern "C"
