@@ -231,31 +231,36 @@ impl<M: ModelForward> Scheduler<M> {
 
     /// Pre-capture CUDA Graphs for batched decode at common batch sizes.
     ///
-    /// Warms up graphs for batch sizes 1..min(num_slots, 32) to support
-    /// larger concurrent batch sizes without runtime capture overhead.
+    /// Uses SGLang-style batch size schedule: 1, 2, 4, 8, 12, 16, 24, 32, 40, ...
+    /// up to min(num_slots, 256). This covers the most common concurrent request
+    /// counts without capturing every single size.
     pub(super) fn warmup_cuda_graphs(&mut self) {
         let num_slots = self.states.len();
         if num_slots < 2 || self.paged_kv_pool.k_buffers.is_empty() {
             return;
         }
 
-        let max_warmup = num_slots.min(32);
+        let max_bs = num_slots.min(256);
+        let warmup_sizes = Self::cuda_graph_batch_sizes(max_bs);
+
         info!(
-            "Warming up CUDA Graphs for batch sizes 1..{}...",
-            max_warmup
+            "Warming up CUDA Graphs for {} batch sizes (max {})...",
+            warmup_sizes.len(),
+            max_bs,
         );
         let t0 = std::time::Instant::now();
 
-        for slot in 0..max_warmup {
+        for slot in 0..max_bs {
             if let Err(e) = self.paged_kv_pool.alloc_tokens(slot, 1) {
                 error!("Warmup: pool alloc for slot {} failed: {}", slot, e);
                 return;
             }
         }
 
-        let dummy_tokens: Vec<u32> = vec![0; max_warmup];
-        let slot_indices: Vec<usize> = (0..max_warmup).collect();
-        for bs in 1..=max_warmup {
+        let dummy_tokens: Vec<u32> = vec![0; max_bs];
+        let slot_indices: Vec<usize> = (0..max_bs).collect();
+        let mut captured = 0;
+        for &bs in &warmup_sizes {
             let tokens = &dummy_tokens[..bs];
             let si = &slot_indices[..bs];
             if let Err(e) = self.model.forward_decode_batch(
@@ -273,17 +278,42 @@ impl<M: ModelForward> Scheduler<M> {
                 break;
             }
             let _ = self.model.device_context().sync();
+            captured += 1;
         }
 
-        for slot in 0..max_warmup {
+        for slot in 0..max_bs {
             self.paged_kv_pool.free_slot(slot);
             let _ = self.states[slot].reset();
         }
 
         info!(
-            "CUDA Graph warmup done in {:.0}ms (batch sizes 1..{})",
+            "CUDA Graph warmup done in {:.0}ms ({} batch sizes captured, max {})",
             t0.elapsed().as_secs_f64() * 1e3,
-            max_warmup,
+            captured,
+            warmup_sizes.last().copied().unwrap_or(0),
         );
+    }
+
+    /// Generate SGLang-style batch size schedule for CUDA Graph warmup.
+    /// Pattern: 1, 2, 4, 8, 12, 16, 24, 32, 40, 48, ..., max_bs
+    fn cuda_graph_batch_sizes(max_bs: usize) -> Vec<usize> {
+        let mut sizes = Vec::new();
+        // Small sizes: 1, 2, 4, 8
+        for &bs in &[1, 2, 4, 8] {
+            if bs <= max_bs {
+                sizes.push(bs);
+            }
+        }
+        // From 12 onward, step by 8
+        let mut bs = 12;
+        while bs <= max_bs {
+            sizes.push(bs);
+            bs += 8;
+        }
+        // Ensure max_bs itself is included
+        if sizes.last() != Some(&max_bs) && max_bs > 8 {
+            sizes.push(max_bs);
+        }
+        sizes
     }
 }

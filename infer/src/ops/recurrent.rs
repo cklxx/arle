@@ -74,6 +74,10 @@ pub(crate) fn conv1d_decode_batch_into(
     debug_assert_eq!(out_batch.hidden_dim, num_channels);
     debug_assert!(batch_size <= x_batch.seq_len);
     debug_assert_eq!(conv_weight.len, num_channels * kernel_size);
+    assert!(
+        (2..=4).contains(&kernel_size),
+        "conv1d_decode_batch kernel requires 2 <= kernel_size <= 4, got {kernel_size}"
+    );
 
     let (x_ptr, _gx) = x_batch.data.device_ptr(&ctx.stream);
     let (w_ptr, _gw) = conv_weight.data.device_ptr(&ctx.stream);
