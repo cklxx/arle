@@ -757,6 +757,12 @@ fn metal_generate(
         FusedPathMode::Fallback
     };
 
+    match fused_mode {
+        FusedPathMode::Dense => log::info!("Metal fused path: Dense"),
+        FusedPathMode::Quantized => log::info!("Metal fused path: Quantized"),
+        FusedPathMode::Fallback => log::info!("Metal fused path: Fallback (Rust)"),
+    }
+
     // TODO: Replace contiguous KV cache with MetalKVPool
     // Current: slice_update to [1, n_kv_heads, max_seq, head_dim] per layer
     // Paged: write_kv to pool, gather_kv before attention
