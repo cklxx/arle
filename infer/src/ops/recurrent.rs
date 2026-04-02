@@ -56,6 +56,96 @@ pub(crate) fn gated_delta_rule_decode_into(
     Ok(())
 }
 
+/// Batched conv1d decode: process B requests' conv1d in one kernel launch.
+///
+/// Per-request conv states are accessed via device pointer array — no gather/scatter.
+/// Specialized for seq_len=1 (decode step).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conv1d_decode_batch_into(
+    ctx: &DeviceContext,
+    x_batch: &HiddenStates,
+    conv_weight: &DeviceVec,
+    conv_state_ptrs: &mut CudaSlice<u64>, // device array of pointers to per-request conv states
+    out_batch: &mut HiddenStates,
+    kernel_size: usize,
+    batch_size: usize,
+) {
+    let num_channels = x_batch.hidden_dim;
+    debug_assert_eq!(out_batch.hidden_dim, num_channels);
+    debug_assert!(batch_size <= x_batch.seq_len);
+    debug_assert_eq!(conv_weight.len, num_channels * kernel_size);
+    assert!(
+        (2..=4).contains(&kernel_size),
+        "conv1d_decode_batch kernel requires 2 <= kernel_size <= 4, got {kernel_size}"
+    );
+
+    let (x_ptr, _gx) = x_batch.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = conv_weight.data.device_ptr(&ctx.stream);
+    let (sp_ptr, _gsp) = conv_state_ptrs.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = out_batch.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::conv1d_decode_batch_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            sp_ptr as *mut *mut ffi::Half,
+            o_ptr as *mut ffi::Half,
+            num_channels as i32,
+            kernel_size as i32,
+            batch_size as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+}
+
+/// Batched GDR decode: process B requests' recurrent state update in one kernel launch.
+///
+/// Per-request recurrent states are accessed via device pointer array.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gdr_decode_batch_into(
+    ctx: &DeviceContext,
+    qkv_batch: &HiddenStates,
+    b_proj_batch: &HiddenStates,
+    a_proj_batch: &HiddenStates,
+    dt_bias: &DeviceVec,
+    a_log: &CudaSlice<f32>,
+    state_ptrs: &mut CudaSlice<u64>, // device array of pointers to per-request states (f32)
+    output_batch: &mut HiddenStates,
+    num_key_heads: usize,
+    num_value_heads: usize,
+    key_dim: usize,
+    val_dim: usize,
+    batch_size: usize,
+) -> Result<()> {
+    let (qkv_ptr, _gq) = qkv_batch.data.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b_proj_batch.data.device_ptr(&ctx.stream);
+    let (a_ptr, _ga) = a_proj_batch.data.device_ptr(&ctx.stream);
+    let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
+    let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
+    let (sp_ptr, _gsp) = state_ptrs.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = output_batch.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::gdr_decode_batch_cuda(
+            qkv_ptr as *const ffi::Half,
+            b_ptr as *const ffi::Half,
+            a_ptr as *const ffi::Half,
+            dt_ptr as *const ffi::Half,
+            alog_ptr as *const f32,
+            sp_ptr as *mut *mut f32,
+            o_ptr as *mut ffi::Half,
+            num_key_heads as i32,
+            num_value_heads as i32,
+            key_dim as i32,
+            val_dim as i32,
+            batch_size as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Causal depthwise conv1d prefill over a HiddenStates batch.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn conv1d_prefill_batch_into(

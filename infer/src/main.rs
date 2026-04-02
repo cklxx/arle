@@ -32,9 +32,10 @@ struct Args {
     #[arg(long)]
     trace_output_path: Option<PathBuf>,
 
-    /// Number of concurrent request slots (each gets its own KV cache)
-    #[arg(long, default_value_t = 4)]
-    num_slots: usize,
+    /// Number of concurrent request slots (each gets its own KV cache).
+    /// If unset, auto-computed from available GPU memory.
+    #[arg(long)]
+    num_slots: Option<usize>,
 
     /// Maximum sequence length (tokens) per KV cache slot. If unset, auto-computed
     /// from available GPU memory to fit all slots without OOM.
@@ -86,11 +87,16 @@ async fn main() {
     info!("=== Infer Server - {} (GPU) ===", model_type);
     info!("Loading model...");
     let start = Instant::now();
+    let num_slots = args.num_slots.unwrap_or_else(|| {
+        auto_num_slots(model_path, args.max_seq_len)
+    });
+
     info!(
-        "Config: model_path={}, cuda_graph={}, num_slots={}",
+        "Config: model_path={}, cuda_graph={}, num_slots={} ({})",
         args.model_path.display(),
         args.cuda_graph,
-        args.num_slots,
+        num_slots,
+        if args.num_slots.is_some() { "explicit" } else { "auto" },
     );
 
     let runtime = ServerRuntimeConfig {
@@ -103,7 +109,7 @@ async fn main() {
             kv_pool_headroom_bytes: args.kv_pool_headroom_mb.saturating_mul(1024 * 1024),
             min_seq_len: args.min_seq_len,
             kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
-            ..SchedulerConfig::runtime_defaults(args.num_slots)
+            ..SchedulerConfig::runtime_defaults(num_slots)
         },
         seed: 42,
         max_seq_len: args.max_seq_len,
@@ -147,4 +153,111 @@ async fn shutdown_signal() {
         .await
         .expect("Failed to install CTRL+C handler");
     info!("Shutdown signal received");
+}
+
+/// Auto-calculate num_slots from GPU memory and model config.
+///
+/// Strategy: estimate model weight size from safetensor files, subtract from GPU free
+/// memory, divide remaining by per-slot cost (KV cache + recurrent state at target
+/// sequence length). Clamp to [4, 128].
+fn auto_num_slots(model_path: &str, max_seq_len: Option<usize>) -> usize {
+    use infer::tensor::DeviceContext;
+    use std::path::Path;
+
+    const DEFAULT_SEQ_LEN: usize = 4096;
+    const RESERVED_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GB headroom
+    const MIN_SLOTS: usize = 4;
+    const MAX_SLOTS: usize = 128;
+
+    let seq_len = max_seq_len.unwrap_or(DEFAULT_SEQ_LEN);
+
+    // Estimate model weight size from safetensor files on disk
+    let weight_bytes: u64 = std::fs::read_dir(Path::new(model_path))
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .is_some_and(|ext| ext == "safetensors")
+                })
+                .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+                .sum()
+        })
+        .unwrap_or(0);
+
+    let (free_bytes, _total) = match DeviceContext::gpu_memory_info() {
+        Ok(info) => info,
+        Err(_) => {
+            info!("auto_num_slots: GPU memory query failed, using default 8 slots");
+            return 8;
+        }
+    };
+
+    // Available = GPU free - weights (already loaded by now? no, not yet) - reserved
+    // Since we're called before model load, we estimate available after load
+    let available = free_bytes
+        .saturating_sub(weight_bytes as usize)
+        .saturating_sub(RESERVED_BYTES);
+
+    // Per-slot cost estimate: KV cache at seq_len tokens
+    // Conservative estimate: 2 (K+V) * layers * heads * head_dim * 2 (bf16) * seq_len
+    // Read from config.json for accuracy
+    let per_slot_bytes = estimate_per_slot_bytes(model_path, seq_len);
+
+    let slots = if per_slot_bytes > 0 {
+        (available / per_slot_bytes).clamp(MIN_SLOTS, MAX_SLOTS)
+    } else {
+        8
+    };
+
+    info!(
+        "auto_num_slots: gpu_free={:.1}GB, weights={:.1}GB, reserved={:.1}GB, \
+         available={:.1}GB, per_slot={:.1}MB (seq_len={}), slots={}",
+        free_bytes as f64 / 1e9,
+        weight_bytes as f64 / 1e9,
+        RESERVED_BYTES as f64 / 1e9,
+        available as f64 / 1e9,
+        per_slot_bytes as f64 / 1e6,
+        seq_len,
+        slots,
+    );
+
+    slots
+}
+
+/// Estimate per-slot memory cost from model config.json.
+fn estimate_per_slot_bytes(model_path: &str, seq_len: usize) -> usize {
+    use std::path::Path;
+
+    let config_path = Path::new(model_path).join("config.json");
+    let config_str = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let config: serde_json::Value = match serde_json::from_str(&config_str) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+
+    let num_layers = config["num_hidden_layers"].as_u64().unwrap_or(32) as usize;
+    let num_kv_heads = config["num_key_value_heads"].as_u64().unwrap_or(4) as usize;
+    let head_dim = config["head_dim"].as_u64().unwrap_or(128) as usize;
+
+    // Check if hybrid model (Qwen3.5): only full-attention layers use KV cache
+    let num_full_attn = config["num_full_attention_layers"].as_u64().unwrap_or(num_layers as u64) as usize;
+    let kv_layers = num_full_attn.min(num_layers);
+
+    // KV cache: 2 (K+V) * kv_layers * num_kv_heads * head_dim * 2 (bf16) * seq_len
+    let kv_bytes = 2 * kv_layers * num_kv_heads * head_dim * 2 * seq_len;
+
+    // Recurrent state (if hybrid): per linear layer, fixed size independent of seq_len
+    let num_linear_layers = num_layers.saturating_sub(kv_layers);
+    let linear_key_dim = config["linear_key_head_dim"].as_u64().unwrap_or(128) as usize;
+    let linear_val_dim = config["linear_value_head_dim"].as_u64().unwrap_or(128) as usize;
+    let linear_val_heads = config["linear_num_value_heads"].as_u64().unwrap_or(32) as usize;
+    let recurrent_bytes = num_linear_layers * linear_val_heads * linear_key_dim * linear_val_dim * 4; // f32
+
+    kv_bytes + recurrent_bytes
 }
