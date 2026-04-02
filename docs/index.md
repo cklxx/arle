@@ -2,6 +2,7 @@
 | --- | --- |
 | **Projects** | |
 | [projects/qwen35-batched-decode.md](projects/qwen35-batched-decode.md) | **Done** — Qwen3.5 batched decode: FlashInfer HD256 + scheduler integration |
+| [projects/quantization-architecture.md](projects/quantization-architecture.md) | **Design Review** — INT4 quantization architecture: LinearWeight enum, GEMV kernel, risk analysis |
 | **Plans** | |
 | [plans/sglang-parity.md](plans/sglang-parity.md) | **Done** — Qwen3-8B sglang parity plan (C=4 exceeded) |
 | [plans/qwen35-sglang-parity.md](plans/qwen35-sglang-parity.md) | **In Progress** — Qwen3.5 sglang parity: ITL gap from per-request recurrent ops |
