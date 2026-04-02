@@ -388,6 +388,35 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Batched conv1d decode (B requests, seq_len=1)
+    pub(crate) fn conv1d_decode_batch_cuda(
+        x_batch: *const Half,
+        conv_weight: *const Half,
+        conv_state_ptrs: *mut *mut Half,
+        out_batch: *mut Half,
+        num_channels: i32,
+        kernel_size: i32,
+        batch_size: i32,
+        stream: CUstream,
+    );
+
+    // Batched gated delta rule decode (B requests)
+    pub(crate) fn gdr_decode_batch_cuda(
+        qkv_batch: *const Half,
+        b_proj_batch: *const Half,
+        a_proj_batch: *const Half,
+        dt_bias: *const Half,
+        A_log: *const f32,
+        state_ptrs: *mut *mut f32,
+        output_batch: *mut Half,
+        num_key_heads: i32,
+        num_value_heads: i32,
+        key_dim: i32,
+        val_dim: i32,
+        batch_size: i32,
+        stream: CUstream,
+    );
+
     // Causal depthwise conv1d prefill (parallel over sequence)
     pub(crate) fn conv1d_prefill_cuda(
         x_seq: *const Half,
