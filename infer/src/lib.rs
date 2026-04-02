@@ -21,6 +21,7 @@ pub mod backend;
 pub mod block_manager;
 pub mod chat;
 pub mod chat_protocol;
+pub mod error;
 pub mod cuda_graph_pool;
 pub mod hf_hub;
 pub mod http_server;

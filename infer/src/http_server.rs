@@ -21,6 +21,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 /// Streaming responses have natural per-chunk flow control and are not capped here.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
+use crate::error::ApiError;
 use crate::metrics::ServerMetrics;
 use crate::sampler::{SamplingParams, sampling_params_from_request};
 use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerHandle};
@@ -162,7 +163,7 @@ fn sse_done_stream() -> impl futures_util::Stream<Item = Result<Event, Infallibl
 async fn collect_buffered_response(
     mut delta_rx: UnboundedReceiver<StreamDelta>,
     request_kind: &str,
-) -> Result<BufferedResponse, StatusCode> {
+) -> Result<BufferedResponse, ApiError> {
     let collect = async {
         let mut buffered = BufferedResponse::default();
         while let Some(delta) = delta_rx.recv().await {
@@ -178,7 +179,7 @@ async fn collect_buffered_response(
                 "Non-streaming {request_kind} timed out after {}s",
                 RESPONSE_TIMEOUT.as_secs()
             );
-            StatusCode::GATEWAY_TIMEOUT
+            ApiError::timeout(RESPONSE_TIMEOUT.as_secs())
         })
 }
 
@@ -186,13 +187,15 @@ fn submit_request(
     handle: &SchedulerHandle,
     options: RequestExecutionOptions,
     prompt: String,
-) -> Result<UnboundedReceiver<StreamDelta>, StatusCode> {
+) -> Result<UnboundedReceiver<StreamDelta>, ApiError> {
     let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel();
     let incoming = options.into_incoming_request(prompt, delta_tx);
 
     if let Err(e) = handle.submit(incoming) {
         error!("Scheduler unavailable or full: {e}");
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+        return Err(ApiError::service_unavailable(format!(
+            "Scheduler unavailable: {e}"
+        )));
     }
 
     Ok(delta_rx)
@@ -237,7 +240,7 @@ where
 async fn completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionRequest>,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ApiError> {
     let options = RequestExecutionOptions::from_completion(&req);
     let max_tokens = options.max_tokens;
     let stream = options.stream;
@@ -246,7 +249,10 @@ async fn completions(
 
     if req.prompt.trim().is_empty() {
         warn!("Rejecting empty prompt request");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError::bad_request(
+            "Prompt must not be empty",
+            "empty_prompt",
+        ));
     }
 
     info!(
@@ -289,10 +295,13 @@ async fn completions(
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ApiError> {
     if req.messages.is_empty() {
         warn!("Rejecting empty messages request");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError::bad_request(
+            "Messages array must not be empty",
+            "empty_messages",
+        ));
     }
 
     let options = RequestExecutionOptions::from_chat(&req);
