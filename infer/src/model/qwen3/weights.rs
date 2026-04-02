@@ -6,9 +6,7 @@ use super::config::Config;
 use crate::model::common::{self, MLP};
 use crate::ops;
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
-use crate::weight_loader::{
-    load_shard_info, load_tensor_1d, load_tensor_2d, mmap_shards, precompute_rope,
-};
+use crate::weight_loader::{load_tensor_1d, load_tensor_2d, precompute_rope};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModelRuntimeConfig {
@@ -67,16 +65,8 @@ impl Qwen3Model {
 
         let config = Config::from_file(model_path)?;
 
-        let (shard_paths, weight_map) = load_shard_info(model_path)?;
-        debug!("Loading {} safetensor shard(s)", shard_paths.len());
-        let mmaps = mmap_shards(&shard_paths)?;
-        let shards: Vec<safetensors::SafeTensors> = mmaps
-            .iter()
-            .map(|m| {
-                safetensors::SafeTensors::deserialize(m)
-                    .map_err(|e| anyhow::anyhow!("Deserialize error: {}", e))
-            })
-            .collect::<Result<_>>()?;
+        let (mmaps, weight_map) = common::load_safetensors(model_path, false)?;
+        let shards = common::deserialize_shards(&mmaps)?;
 
         let t_gpu = Instant::now();
         debug!("Loading embeddings to GPU");

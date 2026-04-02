@@ -7,12 +7,13 @@
 //! - `output_projection` — resolve tied vs untied LM head
 
 use anyhow::Result;
+use memmap2::Mmap;
 use safetensors::SafeTensors;
 use std::collections::HashMap;
 
 use crate::ops;
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
-use crate::weight_loader::load_tensor_2d;
+use crate::weight_loader::{load_shard_info, load_shard_info_fixed, load_tensor_2d, mmap_shards};
 
 // ─── MLP weights ─────────────────────────────────────────────────────────────
 
@@ -129,4 +130,40 @@ pub(crate) fn output_projection<'a>(
     embed_tokens: &'a DeviceMatrix,
 ) -> &'a DeviceMatrix {
     lm_head.as_ref().unwrap_or(embed_tokens)
+}
+
+// ─── Weight loading ──────────────────────────────────────────────────────────
+
+/// Load and memory-map safetensors shards from a model directory.
+///
+/// When `fix_shard_names` is true, applies filename fixup for models whose
+/// index.json has mismatched shard names (e.g. Qwen3.5).
+///
+/// Returns `(mmaps, weight_map)`. Caller should pass `&mmaps` to
+/// [`deserialize_shards`] to get the `SafeTensors` views.
+pub(crate) fn load_safetensors(
+    model_path: &str,
+    fix_shard_names: bool,
+) -> Result<(Vec<Mmap>, HashMap<String, usize>)> {
+    let (shard_paths, weight_map) = if fix_shard_names {
+        load_shard_info_fixed(model_path)?
+    } else {
+        load_shard_info(model_path)?
+    };
+    log::debug!("Loading {} safetensor shard(s)", shard_paths.len());
+    let mmaps = mmap_shards(&shard_paths)?;
+    Ok((mmaps, weight_map))
+}
+
+/// Deserialize `SafeTensors` views from memory-mapped shards.
+///
+/// The returned `SafeTensors` borrow from `mmaps`, so `mmaps` must outlive them.
+pub(crate) fn deserialize_shards(mmaps: &[Mmap]) -> Result<Vec<SafeTensors<'_>>> {
+    mmaps
+        .iter()
+        .map(|m| {
+            SafeTensors::deserialize(m)
+                .map_err(|e| anyhow::anyhow!("Deserialize error: {}", e))
+        })
+        .collect()
 }
