@@ -52,7 +52,8 @@ struct Args {
     gpu_reserved_mb: usize,
 
     /// KV pool headroom (MB) reserved during pool initialization.
-    #[arg(long, default_value_t = 2048)]
+    /// Covers BatchDecodeBuffers (~750MB), CUDA Graph captures (~500MB), and workspace.
+    #[arg(long, default_value_t = 4096)]
     kv_pool_headroom_mb: usize,
 
     /// Minimum sequence length per slot when auto-sizing KV cache.
@@ -169,7 +170,7 @@ fn auto_num_slots(model_path: &str, max_seq_len: Option<usize>) -> usize {
     // CUDA Graph captures (~200MB), paged KV pool overhead, and safety margin.
     const RESERVED_BYTES: usize = 6 * 1024 * 1024 * 1024; // 6 GB headroom
     const MIN_SLOTS: usize = 4;
-    const MAX_SLOTS: usize = 32;
+    const MAX_SLOTS: usize = 128;
 
     let seq_len = max_seq_len.unwrap_or(DEFAULT_SEQ_LEN);
 

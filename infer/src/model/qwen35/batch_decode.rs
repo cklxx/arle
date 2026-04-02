@@ -114,7 +114,7 @@ impl MlpBufs {
 // ── Outer container ─────────────────────────────────────────────────────────
 
 /// Pre-allocated buffers for batched decode, reused across steps.
-pub(crate) struct BatchDecodeBuffers35 {
+pub struct BatchDecodeBuffers35 {
     pub(super) common: CommonBufs,
     pub(super) attn: FullAttnBufs,
     pub(super) recurrent: RecurrentBufs,
