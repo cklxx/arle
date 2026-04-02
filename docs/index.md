@@ -7,6 +7,8 @@
 | [plans/qwen35-sglang-parity.md](plans/qwen35-sglang-parity.md) | **In Progress** — Qwen3.5 sglang parity: ITL gap from per-request recurrent ops |
 | **Experience — Errors** | |
 | [experience/errors/2026-03-31-flashinfer-segfault-debug.md](experience/errors/2026-03-31-flashinfer-segfault-debug.md) | 3 bugs causing FlashInfer batch decode crash: hardcoded MAX_SEQ, GPU plan_info, double alloc |
+| **Experience — Reviews** | |
+| [experience/reviews/2026-04-02-cuda-link-optimization-gaps.md](experience/reviews/2026-04-02-cuda-link-optimization-gaps.md) | CUDA path review: implemented-but-not-landed optimizations, mainly Qwen3.5 batched decode / recurrent / graph gaps |
 | **Experience — Wins** | |
 | [experience/wins/2026-03-31-batched-decode-throughput.md](experience/wins/2026-03-31-batched-decode-throughput.md) | 128 → 811 tok/s (6.3x) via token pool + FlashInfer + buffer reuse + plan-once + CUDA Graph + argmax/scatter |
 | [experience/wins/2026-03-31-nsys-profiling-decode.md](experience/wins/2026-03-31-nsys-profiling-decode.md) | nsys profiling methodology for decode kernel analysis |
