@@ -108,6 +108,7 @@ impl ModelForward for Qwen35Model {
         let z_dim = c.linear_attn_z_dim();
         let b_dim = c.linear_num_value_heads;
         let max_pages = pool.max_total_tokens;
+        let num_linear_layers = c.num_hidden_layers - c.num_full_attention_layers();
         BatchDecodeBuffers35::new(
             &self.ctx,
             c.hidden_size,
@@ -121,6 +122,7 @@ impl ModelForward for Qwen35Model {
             max_batch_size,
             c.num_attention_heads,
             max_pages,
+            num_linear_layers,
         )
     }
 
