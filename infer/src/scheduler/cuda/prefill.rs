@@ -14,11 +14,10 @@ impl<M: ModelForward> Scheduler<M> {
         let cached = &mut self.cached_prompts[si];
         let state = &mut self.states[si];
 
-        let prefix_len = cached
-            .iter()
-            .zip(req.prompt_tokens.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
+        // TODO: prefix cache disabled for Qwen3.5 — recurrent state contamination
+        // from previous request's decode tokens causes CUDA_ERROR_ILLEGAL_ADDRESS
+        // during batched decode. Need to properly reset recurrent state on prefix hit.
+        let prefix_len = 0;
 
         let effective = if prefix_len > 0 && prefix_len == cached.len() {
             info!(
