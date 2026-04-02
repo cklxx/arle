@@ -1,103 +1,72 @@
-# Plan: Qwen3.5 追平 sglang 0.5.9 (Qwen3.5-4B · A100-40GB)
+# Plan: Qwen3.5 追平 sglang 0.5.9 (Qwen3.5-4B · A100-80GB)
 
-> Status: **In Progress** — scheduler support done, ITL gap identified
+> Status: **Steps 1-3 Done** — C=4 exceeds SGLang, C=8 ITL beats SGLang
 > Created: 2026-04-01
+> Updated: 2026-04-02
 > Goal: 在 Qwen3.5-4B 上匹配 sglang 0.5.9 吞吐量
 
 ---
 
-## Baseline 数据
+## Current Results (2026-04-02, A100-80GB)
 
-| 配置 | infer | sglang 0.5.9 | Gap |
-|------|-------|-------------|-----|
-| C=1 throughput | 100 tok/s | 107 tok/s | **-7%** |
-| C=1 ITL | 9.9ms | 8.6ms | **-15%** |
-| C=4 throughput | 290 tok/s | 349 tok/s | **-17%** |
-| C=4 ITL | 13.2ms | 9.4ms | **-40%** |
-| C=8 throughput | 297 tok/s (4 slots) | 680 tok/s | **-56%** |
-| C=1 TTFT | **17ms** | 107ms | +530% (we win) |
-| C=4 TTFT | **45ms** | 270ms | +500% (we win) |
+| 配置 | infer (before) | infer (after) | sglang 0.5.9 | Status |
+|------|---------------|---------------|-------------|--------|
+| C=1 throughput | 110 tok/s | 115 tok/s | 111 tok/s | **✅ +4%** |
+| C=1 ITL p50 | 8.8ms | 8.5ms | 8.9ms | **✅ beats sglang** |
+| C=4 throughput (512/256) | 319 tok/s | 405 tok/s | 369 tok/s | **✅ +10%** |
+| C=4 ITL p50 | 12.0ms | 9.2ms | 9.8ms | **✅ beats sglang** |
+| C=8 throughput (128/256) | 640 tok/s | 772 tok/s | 1230 tok/s | ❌ -37% |
+| C=8 ITL p50 | 23.7ms | 9.8ms | 11.0ms | **✅ beats sglang** |
+| C=1 TTFT p50 | 22ms | 14ms | 72ms | **✅ 5x faster** |
 
-## 差距根因分析
+## Completed Steps
 
-### 1. C=1 ITL 差距 (9.9ms vs 8.6ms, -15%)
+### Step 1: Auto slots + increased concurrency ✅
+- `--num-slots` now optional, auto-computed from GPU memory (default 8)
+- Tested with 8 and 16 slots
 
-**根因**: Qwen3.5 recurrent ops 开销
-- 24 个 linear attention 层的 conv1d + GDR decode kernel
-- 每层 ~50μs (conv1d ~15μs + GDR ~35μs)
-- 24 层 × 50μs = **1.2ms overhead** — 解释了大部分 1.3ms gap
-- sglang 可能有更高效的 recurrent kernel 或 fused conv1d+GDR
+### Step 2: Batched conv1d kernel ✅
+- `infer/csrc/cuda/conv1d_decode_batch.cu`: K=4 specialized, register-cached weights
+- Grid: (channels/256, B), pointer array for per-request conv states
+- Rust ops wrapper with kernel_size ∈ [2,4] assert
 
-**文件**: `infer/csrc/cuda/conv1d_decode.cu`, `infer/csrc/cuda/gated_delta_rule.cu`
+### Step 3: Batched GDR decode kernel ✅
+- `infer/csrc/cuda/gdr_decode_batch.cu`: 2D grid (num_value_heads, B)
+- 512 threads/block, same j-slice parallelism as single-request kernel
+- Pointer array for per-request recurrent states
+- Integrated into `batch_decode.rs`, replacing per-request loop
 
-### 2. C=4 ITL 差距 (13.2ms vs 9.4ms, -40%)
+### CUDA Graph warmup expansion ✅
+- SGLang-style batch sizes: 1,2,4,8,12,16,24,...,min(num_slots,256)
+- Matches SGLang's 36-size warmup schedule
 
-**根因**: per-request recurrent D2D + kernel launch overhead
-- 24 层 × 4 请求 × (3 D2D copies + conv1d + GDR) = 480 extra kernel launches
-- 每个 ~1.5μs → **~720μs launch overhead**
-- 加上 D2D 数据搬运: 24 × 4 × 24KB = 2.3MB → **~115μs bandwidth**
-- 总额外开销: ~835μs per decode step
+## Remaining Gap Analysis
 
-**需要**: batched recurrent kernel (一个 kernel 处理 B 个请求的 recurrent state)
+### C=8 throughput: 772 vs 1230 tok/s (-37%)
 
-### 3. 吞吐上限 (297 vs 680 tok/s)
+**Root cause: slot count, not ITL**. Our ITL (9.8ms) already beats SGLang (11.0ms). The throughput gap is purely from concurrency:
+- agent-infer: 8 slots → max 8 concurrent decode requests
+- SGLang: auto-sized to ~177 concurrent requests
 
-**根因**: slot 数量限制
-- infer 默认 4 slots，sglang 默认更多
-- Qwen3.5-4B 只有 8 KV 层 (vs Qwen3-8B 的 36 层)，KV cache 很小
-- 可以轻松开 8-16 slots
+At 8 concurrent with ITL 9.8ms: theoretical max = 8 / 0.0098 = 816 tok/s. We achieve 772 (94% efficiency).
+SGLang at 16 concurrent with ITL 13.1ms: 16 / 0.0131 = 1221 tok/s. They achieve 1823 (unclear, likely higher effective concurrency).
 
-## 优化步骤
+**Fix**: Increase slots to 32+ or implement dynamic batching (sglang-parity.md Step 4).
 
-### Step 1: 增加 slots (Easy, High Impact on throughput)
+### ITL p99 spikes to ~17ms at some C=1 configs
+- Seen at 512/128 C=1 (ITL p50=17.5ms) and 128/256 C=1 (p99=17.3ms)
+- Likely prefill chunk interference — prefill chunk size 4096 is large
+- SGLang uses 8192 but has better overlap scheduling
 
-**目标**: C=8 throughput 提升到 ~580+ tok/s
-**做法**: 默认 slots 从 4 增到 8 (Qwen3.5 KV cache 很小)
-**预期**: throughput 线性扩展到 slot 数，ITL 不变
-**文件**: `infer/src/scheduler/cuda/core.rs` (num_slots default), `infer/src/bin/bench_serving.rs`
+## Next Steps
 
-### Step 2: Batched conv1d kernel (Medium, Critical for C>1 ITL)
+| Step | Status | Impact |
+|------|--------|--------|
+| Step 4: Fuse conv1d + GDR | Pending | Low — already 2 launches/layer vs 2B+6B D2D |
+| Step 5: CUDA Graph for Qwen3.5 batched decode | Pending | Medium — eliminates remaining launch overhead |
+| More slots / dynamic batching | Pending | High — C=8+ throughput |
+| Investigate ITL p99 spikes | Pending | Medium — prefill interference |
 
-**目标**: C=4 ITL 从 13.2ms 降到 ~10ms
-**做法**: 写新 CUDA kernel `conv1d_decode_batch`
-- 输入: QKV [B, qkv_dim], conv_states [B × num_linear_layers, qkv_dim × (kernel_dim-1)]
-- 一个 kernel launch 处理 B 个请求的 conv state 更新
-- Grid: (qkv_dim, B), Threads: kernel_dim
-- 需要 gather/scatter conv_state 到连续 buffer，或传 per-request pointers
+## Verification Benchmarks
 
-**文件**: 新建 `infer/csrc/cuda/conv1d_decode_batch.cu`
-
-### Step 3: Batched GDR decode kernel (Medium, Critical for C>1 ITL)
-
-**目标**: 配合 Step 2，消除 per-request GDR overhead
-**做法**: 写新 CUDA kernel `gated_delta_rule_decode_batch`
-- 输入: QKV_conv [B, qkv_dim], B/A projections [B, num_v_heads], per-request states [B × ...]
-- 一个 kernel launch 处理 B 个请求的 GDR state update
-- 关键: state 是 f32 [num_v_heads × key_dim × value_dim] per request，需要 pointer array
-
-**文件**: 新建 `infer/csrc/cuda/gdr_decode_batch.cu`
-
-### Step 4: Fuse conv1d + GDR (Hard, diminishing returns)
-
-**目标**: 进一步减少 kernel launch
-**做法**: 合并 conv1d output → GDR input 为一个 fused kernel
-**预期**: 每 linear layer 从 2 launches → 1 launch
-
-### Step 5: CUDA Graph for batched decode (Hard, depends on Step 2-3)
-
-**目标**: 消除剩余 kernel launch overhead
-**做法**: 如果 batched recurrent kernels 的参数都在 pre-allocated buffers 中
-- 需要将 per-request recurrent state 映射到连续的 batch buffers
-- 在 graph capture 前做 gather，graph 后做 scatter
-- Gather/scatter 在 graph 外，graph 内全是 batch kernels
-
-**风险**: recurrent state 很大 (24 layers × 2MB per request = 48MB per request)，gather/scatter 开销可能抵消 graph 收益
-
-## 验收标准
-
-| 指标 | 当前 | 目标 | sglang |
-|------|------|------|--------|
-| C=1 ITL | 9.9ms | ≤9ms | 8.6ms |
-| C=4 ITL | 13.2ms | ≤10ms | 9.4ms |
-| C=4 throughput | 290 tok/s | ≥340 tok/s | 349 tok/s |
-| C=8 throughput | 297 tok/s | ≥600 tok/s | 680 tok/s |
+See `docs/experience/wins/2026-04-02-*.md` for full raw data.
