@@ -53,6 +53,14 @@ struct Args {
     /// KV pool headroom (MB) reserved during pool initialization.
     #[arg(long, default_value_t = 2048)]
     kv_pool_headroom_mb: usize,
+
+    /// Minimum sequence length per slot when auto-sizing KV cache.
+    #[arg(long, default_value_t = 256)]
+    min_seq_len: usize,
+
+    /// Fallback KV pool budget (MB) when GPU memory query fails.
+    #[arg(long, default_value_t = 4096)]
+    kv_pool_fallback_mb: usize,
 }
 
 #[tokio::main]
@@ -93,6 +101,8 @@ async fn main() {
             decode_active_prefill_cap: args.decode_prefill_cap,
             gpu_reserved_bytes: args.gpu_reserved_mb.saturating_mul(1024 * 1024),
             kv_pool_headroom_bytes: args.kv_pool_headroom_mb.saturating_mul(1024 * 1024),
+            min_seq_len: args.min_seq_len,
+            kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
             ..SchedulerConfig::runtime_defaults(args.num_slots)
         },
         seed: 42,

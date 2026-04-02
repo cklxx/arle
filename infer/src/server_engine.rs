@@ -323,10 +323,6 @@ fn generate_streaming_with_callback<M: ModelForward>(
 /// continuous scheduling. It remains for the agent CLI REPL and E2E tests.
 /// New features should target the `Scheduler` path.
 #[cfg(feature = "cuda")]
-#[deprecated(
-    since = "0.2.0",
-    note = "Use crate::scheduler::Scheduler for production serving. GenericServerEngine is single-request only."
-)]
 pub struct GenericServerEngine<M: ModelForward> {
     model_id: String,
     model: M,
@@ -338,7 +334,6 @@ pub struct GenericServerEngine<M: ModelForward> {
 }
 
 #[cfg(feature = "cuda")]
-#[allow(deprecated)]
 impl<M: ModelForward> GenericServerEngine<M> {
     fn from_model_components(
         components: crate::bootstrap::ModelComponents<M>,
@@ -420,7 +415,6 @@ impl<M: ModelForward> GenericServerEngine<M> {
 }
 
 #[cfg(feature = "cuda")]
-#[allow(deprecated)]
 impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
     fn model_id(&self) -> &str {
         &self.model_id
@@ -622,21 +616,17 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
 // ============================================================================
 
 #[cfg(feature = "cuda")]
-#[allow(deprecated)]
 pub type RealServerEngine = GenericServerEngine<Qwen3Model>;
 #[cfg(feature = "cuda")]
-#[allow(deprecated)]
 pub type Qwen35ServerEngine = GenericServerEngine<Qwen35Model>;
 
 #[cfg(feature = "cuda")]
-#[allow(deprecated)]
 pub enum LoadedServerEngine {
     Qwen3(RealServerEngine),
     Qwen35(Qwen35ServerEngine),
 }
 
 #[cfg(feature = "cuda")]
-#[allow(deprecated)]
 impl RealServerEngine {
     pub fn load(model_path: &str, seed: u64) -> Result<Self> {
         Self::load_with_options(model_path, seed, EngineOptions::default())
@@ -653,7 +643,6 @@ impl RealServerEngine {
 }
 
 #[cfg(feature = "cuda")]
-#[allow(deprecated)]
 impl Qwen35ServerEngine {
     pub fn load(model_path: &str, seed: u64) -> Result<Self> {
         Self::load_with_options(model_path, seed, EngineOptions::default())
@@ -670,7 +659,6 @@ impl Qwen35ServerEngine {
 }
 
 #[cfg(feature = "cuda")]
-#[allow(deprecated)]
 impl LoadedServerEngine {
     pub fn load(model_path: &str, seed: u64) -> Result<Self> {
         Self::load_with_options(model_path, seed, EngineOptions::default())
@@ -703,7 +691,6 @@ impl LoadedServerEngine {
 }
 
 #[cfg(feature = "cuda")]
-#[allow(deprecated)]
 impl ServerEngine for LoadedServerEngine {
     fn model_id(&self) -> &str {
         match self {

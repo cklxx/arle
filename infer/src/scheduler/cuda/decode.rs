@@ -52,13 +52,29 @@ impl<M: ModelForward> Scheduler<M> {
         if decode_indices.is_empty() {
             return;
         }
-        let slot_indices: Vec<usize> = decode_indices.iter().map(|&i| active[i].slot_idx).collect();
-
-        for &slot in &slot_indices {
+        // Allocate one pool token per decode request. If allocation fails,
+        // finish that request rather than continuing with stale pool state.
+        let mut alloc_ok_indices: Vec<usize> = Vec::with_capacity(decode_indices.len());
+        let mut alloc_ok_tokens: Vec<u32> = Vec::with_capacity(decode_indices.len());
+        for (j, &i) in decode_indices.iter().enumerate() {
+            let slot = active[i].slot_idx;
             if let Err(e) = paged_kv_pool.alloc_tokens(slot, 1) {
-                error!("Pool alloc for decode token (slot {}) failed: {}", slot, e);
+                error!(
+                    "Request {}: KV pool exhausted (slot {}): {} — finishing request",
+                    active[i].id, slot, e
+                );
+                active[i].finish(FinishReason::Length, tokenizer);
+            } else {
+                alloc_ok_indices.push(i);
+                alloc_ok_tokens.push(token_ids[j]);
             }
         }
+        let decode_indices = alloc_ok_indices;
+        let token_ids = alloc_ok_tokens;
+        if decode_indices.is_empty() {
+            return;
+        }
+        let slot_indices: Vec<usize> = decode_indices.iter().map(|&i| active[i].slot_idx).collect();
 
         let sampling_params: Vec<&crate::sampler::SamplingParams> = decode_indices
             .iter()
