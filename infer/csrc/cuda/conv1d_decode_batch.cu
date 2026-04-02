@@ -31,6 +31,8 @@ __global__ void conv1d_decode_batch_kernel(
     int b = blockIdx.y;
     if (c >= num_channels) return;
 
+    // Note: register unrolling below assumes kernel_size <= 4.
+    // For kernel_size > 4, a generic loop would be needed.
     int sw = kernel_size - 1;  // state_width (3 for K=4)
     __nv_bfloat16* my_state = conv_state_ptrs[b] + c * sw;
     const __nv_bfloat16* my_weight = conv_weight + c * kernel_size;

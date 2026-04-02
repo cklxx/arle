@@ -1,8 +1,7 @@
 //! Batched decode for Qwen3.5: process multiple requests in one forward pass.
 //!
 //! Hybrid architecture: 8 full attention layers use FlashInfer HD256 paged decode,
-//! 24 linear attention layers use batched GEMMs + per-request recurrent ops (conv1d + GDR).
-//! No CUDA Graph (per-request recurrent state pointers vary with batch composition).
+//! 24 linear attention layers use batched recurrent kernels (conv1d + GDR) via pointer arrays.
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
@@ -15,7 +14,7 @@ use crate::flashinfer_metadata::FlashInferDecodeMetadata;
 use crate::model::ModelForward;
 use crate::ops;
 use crate::paged_kv::PagedKVPool;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::tensor::{DeviceContext, HiddenStates};
 
 /// Pre-allocated buffers for batched decode, reused across steps.
 pub(crate) struct BatchDecodeBuffers35 {
@@ -43,12 +42,15 @@ pub(crate) struct BatchDecodeBuffers35 {
     b_batch: HiddenStates,
     a_batch: HiddenStates,
 
-    // ── Linear attention — per-request single-token scratch ──
-    qkv_single: HiddenStates,
-    qkv_conv_single: HiddenStates,
-    b_single: HiddenStates,
-    a_single: HiddenStates,
-    gdr_out_single: HiddenStates,
+    // ── Linear attention — batched recurrent kernel support ──
+    /// Device pointer array for per-request conv states [max_batch_size] u64 pointers
+    conv_state_ptrs_gpu: CudaSlice<u64>,
+    conv_state_ptrs_host: Vec<u64>,
+    /// Device pointer array for per-request GDR states [max_batch_size] u64 pointers
+    gdr_state_ptrs_gpu: CudaSlice<u64>,
+    gdr_state_ptrs_host: Vec<u64>,
+    /// Batched conv1d output [B, qkv_dim] — fed into GDR
+    qkv_conv_batch: HiddenStates,
 
     // ── Linear attention — batched output ──
     gdr_out_batch: HiddenStates,
@@ -114,12 +116,18 @@ impl BatchDecodeBuffers35 {
             b_batch: HiddenStates::zeros(ctx, b_dim, max_batch_size)?,
             a_batch: HiddenStates::zeros(ctx, b_dim, max_batch_size)?,
 
-            // Per-request scratch (seq_len=1)
-            qkv_single: HiddenStates::zeros(ctx, qkv_dim, 1)?,
-            qkv_conv_single: HiddenStates::zeros(ctx, qkv_dim, 1)?,
-            b_single: HiddenStates::zeros(ctx, b_dim, 1)?,
-            a_single: HiddenStates::zeros(ctx, b_dim, 1)?,
-            gdr_out_single: HiddenStates::zeros(ctx, z_dim, 1)?,
+            // Batched recurrent kernel pointer arrays
+            conv_state_ptrs_gpu: ctx
+                .stream
+                .alloc_zeros(max_batch_size)
+                .map_err(|e| anyhow::anyhow!("Alloc conv_state_ptrs: {e}"))?,
+            conv_state_ptrs_host: vec![0u64; max_batch_size],
+            gdr_state_ptrs_gpu: ctx
+                .stream
+                .alloc_zeros(max_batch_size)
+                .map_err(|e| anyhow::anyhow!("Alloc gdr_state_ptrs: {e}"))?,
+            gdr_state_ptrs_host: vec![0u64; max_batch_size],
+            qkv_conv_batch: HiddenStates::zeros(ctx, qkv_dim, max_batch_size)?,
 
             gdr_out_batch: HiddenStates::zeros(ctx, z_dim, max_batch_size)?,
             normed_gated: HiddenStates::zeros(ctx, z_dim, max_batch_size)?,
@@ -168,6 +176,7 @@ impl BatchDecodeBuffers35 {
         self.z_batch.seq_len = bs;
         self.b_batch.seq_len = bs;
         self.a_batch.seq_len = bs;
+        self.qkv_conv_batch.seq_len = bs;
         self.gdr_out_batch.seq_len = bs;
         self.normed_gated.seq_len = bs;
         self.attn_results.seq_len = bs;
@@ -202,7 +211,9 @@ impl Qwen35Model {
     ) -> Result<()> {
         let batch_size = tokens.len();
         debug_assert_eq!(batch_size, slot_indices.len());
-        debug_assert!(batch_size >= 1);
+        if batch_size == 0 {
+            return Ok(());
+        }
         debug_assert!(batch_size <= bufs.max_batch_size);
 
         let c = &self.config;
@@ -463,69 +474,61 @@ impl Qwen35Model {
         ops::gemm_into(&self.ctx, &attn.in_proj_b, &bufs.normed, &mut bufs.b_batch);
         ops::gemm_into(&self.ctx, &attn.in_proj_a, &bufs.normed, &mut bufs.a_batch);
 
-        // 3. Per-request: conv1d + GDR (modifies per-request recurrent state)
-        let qkv_dim = c.linear_attn_qkv_dim();
-        let z_dim = c.linear_attn_z_dim();
-        let b_dim = c.linear_num_value_heads;
+        // 3. Batched conv1d + GDR via pointer arrays (one kernel launch each)
+        //
+        // SAFETY: H2D pointer uploads must NOT be captured in CUDA Graph.
+        // Qwen3.5 batched decode currently runs eagerly (no graph capture)
+        // because pointer arrays change with batch composition each step.
+        {
+            use cudarc::driver::DevicePtrMut;
 
-        for (b, &si) in slot_indices.iter().enumerate() {
-            let recurrent = &mut states[si].recurrent_state;
-            let layer_state = &mut recurrent.layers[linear_idx];
+            // Build pointer arrays: collect per-request state device pointers.
+            // Must use device_ptr_mut since kernels write through these pointers.
+            for (b, &si) in slot_indices.iter().enumerate() {
+                let layer_state = &mut states[si].recurrent_state.layers[linear_idx];
+                let (conv_ptr, _) = layer_state.conv_state.data.device_ptr_mut(&self.ctx.stream);
+                let (gdr_ptr, _) = layer_state.state.device_ptr_mut(&self.ctx.stream);
+                bufs.conv_state_ptrs_host[b] = conv_ptr as u64;
+                bufs.gdr_state_ptrs_host[b] = gdr_ptr as u64;
+            }
 
-            // Extract row b from batched projections
-            let qkv_src = bufs.qkv_batch.data.slice(b * qkv_dim..(b + 1) * qkv_dim);
+            // H2D upload pointer arrays
             self.ctx
                 .stream
-                .memcpy_dtod(&qkv_src, &mut bufs.qkv_single.data)
-                .map_err(|e| anyhow::anyhow!("D2D qkv extract: {e}"))?;
-
-            let b_src = bufs.b_batch.data.slice(b * b_dim..(b + 1) * b_dim);
+                .memcpy_htod(&bufs.conv_state_ptrs_host[..batch_size], &mut bufs.conv_state_ptrs_gpu)
+                .map_err(|e| anyhow::anyhow!("H2D conv_state_ptrs: {e}"))?;
             self.ctx
                 .stream
-                .memcpy_dtod(&b_src, &mut bufs.b_single.data)
-                .map_err(|e| anyhow::anyhow!("D2D b extract: {e}"))?;
+                .memcpy_htod(&bufs.gdr_state_ptrs_host[..batch_size], &mut bufs.gdr_state_ptrs_gpu)
+                .map_err(|e| anyhow::anyhow!("H2D gdr_state_ptrs: {e}"))?;
 
-            let a_src = bufs.a_batch.data.slice(b * b_dim..(b + 1) * b_dim);
-            self.ctx
-                .stream
-                .memcpy_dtod(&a_src, &mut bufs.a_single.data)
-                .map_err(|e| anyhow::anyhow!("D2D a extract: {e}"))?;
-
-            // Conv1d
-            ops::conv1d_prefill_batch_into(
+            // Batched conv1d decode: one kernel launch for all B requests
+            ops::conv1d_decode_batch_into(
                 &self.ctx,
-                &bufs.qkv_single,
+                &bufs.qkv_batch,
                 &attn.conv1d_weight,
-                &mut layer_state.conv_state,
-                &mut bufs.qkv_conv_single,
+                &mut bufs.conv_state_ptrs_gpu,
+                &mut bufs.qkv_conv_batch,
                 c.linear_conv_kernel_dim,
+                batch_size,
             );
 
-            // GDR decode (single-step)
-            ops::gated_delta_rule_decode_into(
+            // Batched GDR decode: one kernel launch for all B requests
+            ops::gdr_decode_batch_into(
                 &self.ctx,
-                &bufs.qkv_conv_single,
-                &bufs.b_single,
-                &bufs.a_single,
+                &bufs.qkv_conv_batch,
+                &bufs.b_batch,
+                &bufs.a_batch,
                 &attn.dt_bias,
                 &attn.a_log,
-                &mut layer_state.state,
-                &mut bufs.gdr_out_single,
+                &mut bufs.gdr_state_ptrs_gpu,
+                &mut bufs.gdr_out_batch,
                 c.linear_num_key_heads,
                 c.linear_num_value_heads,
                 c.linear_key_head_dim,
                 c.linear_value_head_dim,
+                batch_size,
             )?;
-
-            // Write GDR output to batch buffer row b
-            let mut gdr_dst = bufs
-                .gdr_out_batch
-                .data
-                .slice_mut(b * z_dim..(b + 1) * z_dim);
-            self.ctx
-                .stream
-                .memcpy_dtod(&bufs.gdr_out_single.data, &mut gdr_dst)
-                .map_err(|e| anyhow::anyhow!("D2D gdr insert: {e}"))?;
         }
 
         // 4. Batched gated RMSNorm
