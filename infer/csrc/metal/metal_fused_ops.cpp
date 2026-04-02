@@ -46,6 +46,25 @@ static inline mlx::core::array dense_linear(
     return mlx::core::matmul(x, w_t);
 }
 
+// ── Quantized linear: x @ w.T (w is packed [out, packed_in]) ─────────────────
+static inline mlx::core::array quantized_linear(
+    const mlx::core::array& x,
+    const mlx::core::array& w,
+    const mlx::core::array& scales,
+    const mlx::core::array& biases,
+    int group_size,
+    int bits)
+{
+    return mlx::core::quantized_matmul(
+        x,
+        w,
+        scales,
+        biases,
+        /*transpose=*/true,
+        group_size,
+        bits);
+}
+
 extern "C" {
 
 // ── metal_fused_block_cached ──────────────────────────────────────────────────
@@ -138,21 +157,21 @@ void metal_fused_block_cached(
     q_raw = fast::rms_norm(q_raw, std::optional<array>(q_norm_w), norm_eps);
     k_raw = fast::rms_norm(k_raw, std::optional<array>(k_norm_w), norm_eps);
 
-    // ── 4. Reshape to [1, seq, n_heads, head_dim] for RoPE ─────────────────
+    // ── 4+5+6. Reshape → transpose → RoPE (→ [1, n_heads, seq, head_dim]) ───
+    // fast::rope treats the second-to-last axis as the sequence dimension (T).
+    // Transpose first so T = seq, not n_heads.
     array q = reshape(q_raw, {1, seq, n_heads, head_dim});
     array k = reshape(k_raw, {1, seq, n_kv_heads, head_dim});
     array v = reshape(v_raw, {1, seq, n_kv_heads, head_dim});
 
-    // ── 5. RoPE (input layout: [batch, seq, heads, head_dim]) ───────────────
+    q = transpose(q, {0, 2, 1, 3}); // [1, n_heads,   seq, head_dim]
+    k = transpose(k, {0, 2, 1, 3}); // [1, n_kv_heads,seq, head_dim]
+    v = transpose(v, {0, 2, 1, 3}); // [1, n_kv_heads,seq, head_dim]
+
     q = fast::rope(q, rope_dims, /*traditional=*/false,
                    std::optional<float>(rope_base), 1.0f, cache_len);
     k = fast::rope(k, rope_dims, /*traditional=*/false,
                    std::optional<float>(rope_base), 1.0f, cache_len);
-
-    // ── 6. Transpose to [1, n_heads, seq, head_dim] for attention ───────────
-    q = transpose(q, {0, 2, 1, 3});
-    k = transpose(k, {0, 2, 1, 3});
-    v = transpose(v, {0, 2, 1, 3});
 
     // ── 7. KV cache slice_update: write new tokens at [.., .., cache_len..end, ..] ─
     int end_pos = cache_len + seq;
@@ -190,6 +209,137 @@ void metal_fused_block_cached(
     array mlp_out  = dense_linear(down_in, down_proj_t);
 
     // ── 13. MLP residual ─────────────────────────────────────────────────────
+    array output = add(residual2, mlp_out);
+
+    *result_out = arr_own(std::move(output));
+}
+
+// ── metal_fused_block_cached_quantized ───────────────────────────────────────
+//
+// Same fused transformer block as above, but for MLX affine-quantized weights.
+// Uses one merged QKV matmul and one merged gate+up matmul.
+void metal_fused_block_cached_quantized(
+    mlx_array x_h,
+    mlx_array input_norm_w_h,
+    mlx_array post_attn_norm_w_h,
+    mlx_array qkv_w_h,
+    mlx_array qkv_scales_h,
+    mlx_array qkv_biases_h,
+    int q_dim,
+    int k_dim,
+    int v_dim,
+    mlx_array o_proj_w_h,
+    mlx_array o_proj_scales_h,
+    mlx_array o_proj_biases_h,
+    mlx_array q_norm_w_h,
+    mlx_array k_norm_w_h,
+    mlx_array gate_up_w_h,
+    mlx_array gate_up_scales_h,
+    mlx_array gate_up_biases_h,
+    int gate_dim,
+    int up_dim,
+    mlx_array down_proj_w_h,
+    mlx_array down_proj_scales_h,
+    mlx_array down_proj_biases_h,
+    int group_size,
+    int bits,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    float attn_scale,
+    float rope_base,
+    int rope_dims,
+    float norm_eps,
+    mlx_array* k_cache_h,
+    mlx_array* v_cache_h,
+    int cache_len,
+    int seq,
+    mlx_array* result_out)
+{
+    using namespace mlx::core;
+    namespace fast = mlx::core::fast;
+
+    const array& x                = arr_ref(x_h);
+    const array& input_norm_w     = arr_ref(input_norm_w_h);
+    const array& post_attn_norm_w = arr_ref(post_attn_norm_w_h);
+    const array& qkv_w            = arr_ref(qkv_w_h);
+    const array& qkv_scales       = arr_ref(qkv_scales_h);
+    const array& qkv_biases       = arr_ref(qkv_biases_h);
+    const array& o_proj_w         = arr_ref(o_proj_w_h);
+    const array& o_proj_scales    = arr_ref(o_proj_scales_h);
+    const array& o_proj_biases    = arr_ref(o_proj_biases_h);
+    const array& q_norm_w         = arr_ref(q_norm_w_h);
+    const array& k_norm_w         = arr_ref(k_norm_w_h);
+    const array& gate_up_w        = arr_ref(gate_up_w_h);
+    const array& gate_up_scales   = arr_ref(gate_up_scales_h);
+    const array& gate_up_biases   = arr_ref(gate_up_biases_h);
+    const array& down_proj_w      = arr_ref(down_proj_w_h);
+    const array& down_proj_scales = arr_ref(down_proj_scales_h);
+    const array& down_proj_biases = arr_ref(down_proj_biases_h);
+    array&       k_cache          = arr_ref(*k_cache_h);
+    array&       v_cache          = arr_ref(*v_cache_h);
+
+    const array residual = x;
+    array normed = fast::rms_norm(x, std::optional<array>(input_norm_w), norm_eps);
+
+    // One quantized matmul for QKV, then split back by output width.
+    array qkv = quantized_linear(normed, qkv_w, qkv_scales, qkv_biases, group_size, bits);
+    array q_raw = slice(qkv, {0, 0}, {seq, q_dim});
+    array k_raw = slice(qkv, {0, q_dim}, {seq, q_dim + k_dim});
+    array v_raw = slice(qkv, {0, q_dim + k_dim}, {seq, q_dim + k_dim + v_dim});
+
+    q_raw = reshape(q_raw, {seq, n_heads, head_dim});
+    k_raw = reshape(k_raw, {seq, n_kv_heads, head_dim});
+    v_raw = reshape(v_raw, {seq, n_kv_heads, head_dim});
+
+    q_raw = fast::rms_norm(q_raw, std::optional<array>(q_norm_w), norm_eps);
+    k_raw = fast::rms_norm(k_raw, std::optional<array>(k_norm_w), norm_eps);
+
+    array q = reshape(q_raw, {1, seq, n_heads, head_dim});
+    array k = reshape(k_raw, {1, seq, n_kv_heads, head_dim});
+    array v = reshape(v_raw, {1, seq, n_kv_heads, head_dim});
+
+    // Transpose before rope: fast::rope uses second-to-last axis as T (sequence).
+    q = transpose(q, {0, 2, 1, 3}); // [1, n_heads,   seq, head_dim]
+    k = transpose(k, {0, 2, 1, 3}); // [1, n_kv_heads,seq, head_dim]
+    v = transpose(v, {0, 2, 1, 3}); // [1, n_kv_heads,seq, head_dim]
+
+    q = fast::rope(q, rope_dims, /*traditional=*/false,
+                   std::optional<float>(rope_base), 1.0f, cache_len);
+    k = fast::rope(k, rope_dims, /*traditional=*/false,
+                   std::optional<float>(rope_base), 1.0f, cache_len);
+
+    int end_pos = cache_len + seq;
+    k_cache = slice_update(k_cache, k, {0, 0, cache_len, 0}, {1, n_kv_heads, end_pos, head_dim});
+    v_cache = slice_update(v_cache, v, {0, 0, cache_len, 0}, {1, n_kv_heads, end_pos, head_dim});
+
+    array k_full = slice(k_cache, {0, 0, 0, 0}, {1, n_kv_heads, end_pos, head_dim});
+    array v_full = slice(v_cache, {0, 0, 0, 0}, {1, n_kv_heads, end_pos, head_dim});
+
+    bool use_causal = (cache_len == 0 && seq > 1);
+    std::string mask_mode = use_causal ? "causal" : "";
+    array attn_out = fast::scaled_dot_product_attention(
+        q, k_full, v_full, attn_scale, mask_mode);
+
+    attn_out = transpose(attn_out, {0, 2, 1, 3});
+    attn_out = reshape(attn_out, {seq, n_heads * head_dim});
+    attn_out = quantized_linear(
+        attn_out, o_proj_w, o_proj_scales, o_proj_biases, group_size, bits);
+
+    array h = add(residual, attn_out);
+
+    const array residual2 = h;
+    array xn = fast::rms_norm(h, std::optional<array>(post_attn_norm_w), norm_eps);
+
+    array gate_up = quantized_linear(
+        xn, gate_up_w, gate_up_scales, gate_up_biases, group_size, bits);
+    array gate = slice(gate_up, {0, 0}, {seq, gate_dim});
+    array up = slice(gate_up, {0, gate_dim}, {seq, gate_dim + up_dim});
+    array gate_act = multiply(gate, sigmoid(gate));
+    array down_in = multiply(gate_act, up);
+    array mlp_out = quantized_linear(
+        down_in, down_proj_w, down_proj_scales, down_proj_biases, group_size, bits);
+
     array output = add(residual2, mlp_out);
 
     *result_out = arr_own(std::move(output));
