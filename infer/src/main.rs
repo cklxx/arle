@@ -40,6 +40,19 @@ struct Args {
     /// from available GPU memory to fit all slots without OOM.
     #[arg(long)]
     max_seq_len: Option<usize>,
+
+    /// Prefill chunk cap (tokens) when decode requests are active.
+    /// Lower values reduce decode latency at the cost of prefill throughput.
+    #[arg(long, default_value_t = 512)]
+    decode_prefill_cap: usize,
+
+    /// GPU memory (MB) reserved as headroom when auto-sizing KV cache.
+    #[arg(long, default_value_t = 512)]
+    gpu_reserved_mb: usize,
+
+    /// KV pool headroom (MB) reserved during pool initialization.
+    #[arg(long, default_value_t = 2048)]
+    kv_pool_headroom_mb: usize,
 }
 
 #[tokio::main]
@@ -76,7 +89,12 @@ async fn main() {
         engine: EngineOptions {
             enable_cuda_graph: args.cuda_graph,
         },
-        scheduler: SchedulerConfig::runtime_defaults(args.num_slots),
+        scheduler: SchedulerConfig {
+            decode_active_prefill_cap: args.decode_prefill_cap,
+            gpu_reserved_bytes: args.gpu_reserved_mb * 1024 * 1024,
+            kv_pool_headroom_bytes: args.kv_pool_headroom_mb * 1024 * 1024,
+            ..SchedulerConfig::runtime_defaults(args.num_slots)
+        },
         seed: 42,
         max_seq_len: args.max_seq_len,
     };

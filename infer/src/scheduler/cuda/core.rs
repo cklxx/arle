@@ -82,7 +82,7 @@ impl<M: ModelForward> Scheduler<M> {
 
         let (tx, rx) = mpsc::unbounded_channel();
         let effective_max_seq_len =
-            Self::compute_max_seq_len(&model, config.max_slots, max_seq_len_override);
+            Self::compute_max_seq_len(&model, &config, max_seq_len_override);
 
         let mut states = Vec::with_capacity(config.max_slots);
         let mut cached_prompts = Vec::with_capacity(config.max_slots);
@@ -100,16 +100,17 @@ impl<M: ModelForward> Scheduler<M> {
             let contiguous_max = effective_max_seq_len.unwrap_or(1024);
             let bytes_per_token = model.kv_cache_bytes_per_token();
             let contiguous_cost = config.max_slots * contiguous_max * bytes_per_token;
-            let headroom: usize = 2 * 1024 * 1024 * 1024;
+            let headroom = config.kv_pool_headroom_bytes;
             let budget_bytes = match crate::tensor::DeviceContext::gpu_memory_info() {
                 Ok((free, _)) => free.saturating_sub(contiguous_cost + headroom),
-                Err(_) => 4 * 1024 * 1024 * 1024,
+                Err(_) => config.kv_pool_fallback_bytes,
             };
 
             info!(
-                "TokenKVPool budget: {:.1} GB (contiguous KV={:.1} GB, headroom=2 GB)",
+                "TokenKVPool budget: {:.1} GB (contiguous KV={:.1} GB, headroom={:.1} GB)",
                 budget_bytes as f64 / 1e9,
                 contiguous_cost as f64 / 1e9,
+                headroom as f64 / 1e9,
             );
 
             let ctx = model.device_context();
@@ -162,14 +163,12 @@ impl<M: ModelForward> Scheduler<M> {
     /// Compute the effective max_seq_len per slot based on available GPU memory.
     fn compute_max_seq_len(
         model: &M,
-        num_slots: usize,
+        config: &SchedulerConfig,
         override_val: Option<usize>,
     ) -> Option<usize> {
         use crate::tensor::DeviceContext;
 
         const DEFAULT_MAX_SEQ: usize = 4096;
-        const RESERVED_BYTES: usize = 512 * 1024 * 1024;
-        const MIN_SEQ_LEN: usize = 256;
 
         if let Some(val) = override_val {
             info!("KV cache: using explicit --max-seq-len={}", val);
@@ -187,12 +186,14 @@ impl<M: ModelForward> Scheduler<M> {
             }
         };
 
-        let available = free_bytes.saturating_sub(RESERVED_BYTES);
+        let reserved = config.gpu_reserved_bytes;
+        let min_seq = config.min_seq_len;
+        let available = free_bytes.saturating_sub(reserved);
         let bytes_per_token = model.kv_cache_bytes_per_token();
         let total_kv_budget = available;
-        let per_slot_budget = total_kv_budget / num_slots.max(1);
+        let per_slot_budget = total_kv_budget / config.max_slots.max(1);
         let affordable_seq_len = per_slot_budget / bytes_per_token.max(1);
-        let effective = affordable_seq_len.clamp(MIN_SEQ_LEN, DEFAULT_MAX_SEQ);
+        let effective = affordable_seq_len.clamp(min_seq, DEFAULT_MAX_SEQ);
 
         info!(
             "KV cache auto-sizing: gpu_free={:.1} GB, gpu_total={:.1} GB, \
@@ -200,18 +201,18 @@ impl<M: ModelForward> Scheduler<M> {
              affordable_seq_len={}, effective_max_seq_len={}",
             free_bytes as f64 / 1e9,
             total_bytes as f64 / 1e9,
-            RESERVED_BYTES as f64 / 1e9,
+            reserved as f64 / 1e9,
             bytes_per_token,
-            num_slots,
+            config.max_slots,
             affordable_seq_len,
             effective,
         );
 
-        if affordable_seq_len < MIN_SEQ_LEN {
+        if affordable_seq_len < min_seq {
             error!(
                 "KV cache: only {} tokens affordable per slot (need at least {}). \
                  Reduce --num-slots or free GPU memory.",
-                affordable_seq_len, MIN_SEQ_LEN,
+                affordable_seq_len, min_seq,
             );
         }
 
@@ -222,7 +223,7 @@ impl<M: ModelForward> Scheduler<M> {
         if decode_active {
             self.config
                 .prefill_chunk_size
-                .min(DECODE_ACTIVE_PREFILL_CHUNK_CAP)
+                .min(self.config.decode_active_prefill_cap)
         } else {
             self.config.prefill_chunk_size
         }

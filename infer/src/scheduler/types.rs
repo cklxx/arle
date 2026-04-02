@@ -31,6 +31,17 @@ pub struct SchedulerConfig {
     pub max_waiting_requests: usize,
     /// Strategy to use when a running request must be preempted.
     pub preemption_mode: PreemptionMode,
+    /// Prefill chunk size cap when decode requests are active.
+    /// Smaller values reduce decode latency at the cost of prefill throughput.
+    pub decode_active_prefill_cap: usize,
+    /// GPU memory (bytes) reserved as headroom when auto-sizing KV cache.
+    pub gpu_reserved_bytes: usize,
+    /// Minimum sequence length per slot when auto-sizing KV cache.
+    pub min_seq_len: usize,
+    /// GPU memory (bytes) reserved for KV pool headroom.
+    pub kv_pool_headroom_bytes: usize,
+    /// Fallback KV pool budget (bytes) when GPU memory query fails.
+    pub kv_pool_fallback_bytes: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -40,6 +51,11 @@ impl Default for SchedulerConfig {
             prefill_chunk_size: 512,
             max_waiting_requests: 256,
             preemption_mode: PreemptionMode::Recompute,
+            decode_active_prefill_cap: 512,
+            gpu_reserved_bytes: 512 * 1024 * 1024,
+            min_seq_len: 256,
+            kv_pool_headroom_bytes: 2 * 1024 * 1024 * 1024,
+            kv_pool_fallback_bytes: 4 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -54,8 +70,7 @@ impl SchedulerConfig {
         Self {
             max_slots,
             prefill_chunk_size: 4096,
-            max_waiting_requests: 256,
-            preemption_mode: PreemptionMode::Recompute,
+            ..Self::default()
         }
     }
 

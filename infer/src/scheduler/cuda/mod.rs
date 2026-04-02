@@ -25,7 +25,5 @@ mod runtime;
 pub use core::Scheduler;
 pub(super) use request::{ActiveRequest, Phase, StopCheckResult, check_stop_sequences};
 
-/// Cap the prefill chunk when decode is active to avoid blocking decode latency.
-pub(super) const DECODE_ACTIVE_PREFILL_CHUNK_CAP: usize = 512;
 /// Interval (in completed requests) at which stats are logged.
 pub(super) const STATS_LOG_INTERVAL: u64 = 10;
