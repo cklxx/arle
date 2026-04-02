@@ -6,10 +6,7 @@ use std::time::Instant;
 use super::config::{Config35, LayerType};
 use crate::model::common::{self, MLP};
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
-use crate::weight_loader::{
-    load_shard_info_fixed, load_tensor_1d, load_tensor_1d_f32, load_tensor_2d, mmap_shards,
-    precompute_rope,
-};
+use crate::weight_loader::{load_tensor_1d, load_tensor_1d_f32, load_tensor_2d, precompute_rope};
 
 /// Full attention layer weights (8 layers in Qwen3.5-4B).
 pub(super) struct FullAttentionLayer {
@@ -98,16 +95,8 @@ impl Qwen35Model {
             config.num_hidden_layers - config.num_full_attention_layers()
         );
 
-        let (shard_paths, weight_map) = load_shard_info_fixed(model_path)?;
-        debug!("Loading {} safetensor shard(s)", shard_paths.len());
-        let mmaps = mmap_shards(&shard_paths)?;
-        let shards: Vec<safetensors::SafeTensors> = mmaps
-            .iter()
-            .map(|m| {
-                safetensors::SafeTensors::deserialize(m)
-                    .map_err(|e| anyhow::anyhow!("Deserialize error: {}", e))
-            })
-            .collect::<Result<_>>()?;
+        let (mmaps, weight_map) = common::load_safetensors(model_path, true)?;
+        let shards = common::deserialize_shards(&mmaps)?;
 
         let t_gpu = Instant::now();
         // Weight prefix for Qwen3.5 text model
