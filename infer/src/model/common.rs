@@ -112,7 +112,10 @@ pub(crate) fn compute_logits_batch(
     eps: f32,
     use_offset_norm: bool,
 ) -> Result<DeviceVec> {
-    anyhow::ensure!(hidden.seq_len > 0, "compute_logits_batch: empty hidden states");
+    anyhow::ensure!(
+        hidden.seq_len > 0,
+        "compute_logits_batch: empty hidden states"
+    );
     let last_hidden = ops::extract_vec(ctx, hidden, hidden.seq_len - 1)?;
     let normed = if use_offset_norm {
         let mut out = DeviceVec::zeros(ctx, last_hidden.len)?;
@@ -163,8 +166,7 @@ pub(crate) fn deserialize_shards(mmaps: &[Mmap]) -> Result<Vec<SafeTensors<'_>>>
     mmaps
         .iter()
         .map(|m| {
-            SafeTensors::deserialize(m)
-                .map_err(|e| anyhow::anyhow!("Deserialize error: {}", e))
+            SafeTensors::deserialize(m).map_err(|e| anyhow::anyhow!("Deserialize error: {}", e))
         })
         .collect()
 }

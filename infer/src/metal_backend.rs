@@ -314,9 +314,7 @@ impl AttentionInputProjection {
     /// Returns the merged quantized QKV weight components plus split dimensions,
     /// or `None` if the projection is not `MergedQuantized`.
     #[allow(clippy::type_complexity)]
-    fn fused_quantized_parts(
-        &self,
-    ) -> Option<(&Array, &Array, &Array, i32, i32, i32, i32, i32)> {
+    fn fused_quantized_parts(&self) -> Option<(&Array, &Array, &Array, i32, i32, i32, i32, i32)> {
         match self {
             Self::MergedQuantized {
                 qkv_proj:
@@ -330,7 +328,16 @@ impl AttentionInputProjection {
                 q_dim,
                 k_dim,
                 v_dim,
-            } => Some((w, scales, biases, *q_dim, *k_dim, *v_dim, *group_size, *bits)),
+            } => Some((
+                w,
+                scales,
+                biases,
+                *q_dim,
+                *k_dim,
+                *v_dim,
+                *group_size,
+                *bits,
+            )),
             _ => None,
         }
     }
@@ -1009,10 +1016,10 @@ fn build_forward_graph(
                     layer.attention_inputs.fused_quantized_parts().expect(
                         "FusedPathMode::Quantized only when attention inputs are MergedQuantized",
                     );
-                let (gate_up_w, gate_up_scales, gate_up_biases, gate_dim, up_dim, gs2, b2) =
-                    layer.mlp_inputs.fused_quantized_parts().expect(
-                        "FusedPathMode::Quantized only when mlp inputs are MergedQuantized",
-                    );
+                let (gate_up_w, gate_up_scales, gate_up_biases, gate_dim, up_dim, gs2, b2) = layer
+                    .mlp_inputs
+                    .fused_quantized_parts()
+                    .expect("FusedPathMode::Quantized only when mlp inputs are MergedQuantized");
                 debug_assert_eq!(group_size, gs2, "group_size mismatch between attn and mlp");
                 debug_assert_eq!(bits, b2, "bits mismatch between attn and mlp");
                 let (o_w, o_scales, o_biases, _, _) = layer

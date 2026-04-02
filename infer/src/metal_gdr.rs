@@ -308,7 +308,9 @@ pub fn metal_gdr_decode_step(
 
     // ── 1. Projections ───────────────────────────────────────────────────
     // x: [1, hidden_size] → flat [hidden_size] for projections
-    let x_flat = x.reshape(&[1, config.hidden_size as i32]).context("reshape x")?;
+    let x_flat = x
+        .reshape(&[1, config.hidden_size as i32])
+        .context("reshape x")?;
 
     // QKV projection: [1, qkv_dim]
     let qkv_raw = linear(&x_flat, &layer_weights.in_proj_qkv).context("in_proj_qkv")?;
@@ -342,9 +344,7 @@ pub fn metal_gdr_decode_step(
     // ── 3. Split QKV and L2-normalize q, k ───────────────────────────────
     // qkv_conv: [qkv_dim] → split into q [q_dim], k [k_dim], v [v_dim]
     use mlx_rs::ops::indexing::TryIndexOp;
-    let q_raw = qkv_conv
-        .try_index(0i32..q_dim as i32)
-        .context("split q")?;
+    let q_raw = qkv_conv.try_index(0i32..q_dim as i32).context("split q")?;
     let k_raw = qkv_conv
         .try_index(q_dim as i32..(q_dim + k_dim) as i32)
         .context("split k")?;
@@ -358,11 +358,7 @@ pub fn metal_gdr_decode_step(
 
     // Scale q by 1/sqrt(key_dim) — matches CUDA kernel line 90
     let scale = 1.0 / (key_dim as f32).sqrt();
-    let q_scaled = ops::multiply(
-        &q_norm,
-        &Array::from_slice(&[scale], &[1]),
-    )
-    .context("scale q")?;
+    let q_scaled = ops::multiply(&q_norm, &Array::from_slice(&[scale], &[1])).context("scale q")?;
 
     // ── 4. Compute gate (g) and beta ─────────────────────────────────────
     // Flatten alpha and beta to [num_value_heads]
@@ -413,9 +409,7 @@ pub fn metal_gdr_decode_step(
     // Repeat each key head `heads_per_key` times → [num_value_heads, key_dim]
     let k_expanded = if heads_per_key > 1 {
         // [num_key_heads, key_dim] → [num_key_heads, 1, key_dim] → [num_key_heads, heads_per_key, key_dim]
-        let k_unsq = k_per_key_head
-            .expand_dims(1)
-            .context("k expand_dims")?;
+        let k_unsq = k_per_key_head.expand_dims(1).context("k expand_dims")?;
         let k_broadcast = mlx_rs::ops::broadcast_to(
             &k_unsq,
             &[num_key_heads as i32, heads_per_key as i32, key_dim as i32],
@@ -433,9 +427,7 @@ pub fn metal_gdr_decode_step(
         .reshape(&[num_key_heads as i32, key_dim as i32])
         .context("reshape q per head")?;
     let q_expanded = if heads_per_key > 1 {
-        let q_unsq = q_per_key_head
-            .expand_dims(1)
-            .context("q expand_dims")?;
+        let q_unsq = q_per_key_head.expand_dims(1).context("q expand_dims")?;
         let q_broadcast = mlx_rs::ops::broadcast_to(
             &q_unsq,
             &[num_key_heads as i32, heads_per_key as i32, key_dim as i32],
@@ -471,9 +463,7 @@ pub fn metal_gdr_decode_step(
     // S_decayed: [H, K, V], k_3d: [H, K, 1]
     // kv_mem = sum over K: S_decayed * k_3d → [H, V]
     let s_times_k = ops::multiply(&s_decayed, &k_3d).context("s * k")?;
-    let kv_mem = s_times_k
-        .sum_axis(1, None)
-        .context("kv_mem sum")?; // [H, V]
+    let kv_mem = s_times_k.sum_axis(1, None).context("kv_mem sum")?; // [H, V]
 
     // delta = (v - kv_mem) * beta
     let v_minus_kv = ops::subtract(&v_heads, &kv_mem).context("v - kv_mem")?;
@@ -501,9 +491,7 @@ pub fn metal_gdr_decode_step(
         .reshape(&[num_value_heads as i32, key_dim as i32, 1])
         .context("reshape q 3d")?;
     let s_times_q = ops::multiply(&s_updated, &q_3d).context("s * q")?;
-    let output_heads = s_times_q
-        .sum_axis(1, None)
-        .context("output sum")?; // [H, V]
+    let output_heads = s_times_q.sum_axis(1, None).context("output sum")?; // [H, V]
 
     // ── 7. Per-head RMSNorm + output gate ────────────────────────────────
     // output_heads: [num_value_heads, val_dim]
@@ -512,8 +500,12 @@ pub fn metal_gdr_decode_step(
 
     // RMSNorm per head: for each head h, normalize output_heads[h, :] and scale by norm_weight
     // mlx_rs::fast::rms_norm operates on the last axis, so with shape [H, V] it norms over V.
-    let normed = mlx_rs::fast::rms_norm(&output_heads, &layer_weights.norm_weight, config.rms_norm_eps)
-        .context("gdr rms_norm")?; // [H, V]
+    let normed = mlx_rs::fast::rms_norm(
+        &output_heads,
+        &layer_weights.norm_weight,
+        config.rms_norm_eps,
+    )
+    .context("gdr rms_norm")?; // [H, V]
 
     // Flatten: [H, V] → [1, z_dim]
     let normed_flat = normed
@@ -521,9 +513,7 @@ pub fn metal_gdr_decode_step(
         .context("flatten normed")?;
 
     // Output gate: o = normed * silu(z)
-    let z_f32 = z
-        .as_dtype(mlx_rs::Dtype::Float32)
-        .context("z to f32")?;
+    let z_f32 = z.as_dtype(mlx_rs::Dtype::Float32).context("z to f32")?;
     let z_silu = mlx_rs::nn::silu(&z_f32).context("silu z")?;
     let gated = ops::multiply(&normed_flat, &z_silu).context("output gate")?;
 
@@ -545,10 +535,7 @@ mod tests {
         let kernel_size = 4;
         let state_width = kernel_size - 1;
 
-        let x = Array::from_slice(
-            &vec![1.0f32; qkv_dim],
-            &[qkv_dim as i32],
-        );
+        let x = Array::from_slice(&vec![1.0f32; qkv_dim], &[qkv_dim as i32]);
         let mut conv_state = Array::from_slice(
             &vec![0.0f32; qkv_dim * state_width],
             &[qkv_dim as i32, state_width as i32],

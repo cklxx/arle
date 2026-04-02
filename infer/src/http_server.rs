@@ -9,7 +9,6 @@ use axum::response::{IntoResponse, Response};
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
     routing::{get, post},
 };
 use futures_util::{StreamExt, stream};
@@ -410,7 +409,7 @@ mod tests {
     use super::*;
 
     use axum::body::{Body, to_bytes};
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
     use tower::util::ServiceExt;
 
     fn mock_scheduler(model_id: &str) -> SchedulerHandle {

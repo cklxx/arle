@@ -238,17 +238,17 @@ impl MetalKVPool {
         // Reshape to [1, n_kv_heads, seq_len, head_dim] for attention.
         let n_kv = self.num_kv_heads as i32;
         let hd = self.head_dim as i32;
-        let k_out = reshape(&k_gathered, &[1, seq_len, n_kv, hd])
-            .map_err(|e| anyhow!("reshape k: {e}"))?;
-        let v_out = reshape(&v_gathered, &[1, seq_len, n_kv, hd])
-            .map_err(|e| anyhow!("reshape v: {e}"))?;
+        let k_out =
+            reshape(&k_gathered, &[1, seq_len, n_kv, hd]).map_err(|e| anyhow!("reshape k: {e}"))?;
+        let v_out =
+            reshape(&v_gathered, &[1, seq_len, n_kv, hd]).map_err(|e| anyhow!("reshape v: {e}"))?;
 
         // Transpose from [1, seq_len, n_kv_heads, head_dim] to
         //                 [1, n_kv_heads, seq_len, head_dim].
-        let k_out = transpose_axes(&k_out, &[0, 2, 1, 3])
-            .map_err(|e| anyhow!("transpose k: {e}"))?;
-        let v_out = transpose_axes(&v_out, &[0, 2, 1, 3])
-            .map_err(|e| anyhow!("transpose v: {e}"))?;
+        let k_out =
+            transpose_axes(&k_out, &[0, 2, 1, 3]).map_err(|e| anyhow!("transpose k: {e}"))?;
+        let v_out =
+            transpose_axes(&v_out, &[0, 2, 1, 3]).map_err(|e| anyhow!("transpose v: {e}"))?;
 
         Ok((k_out, v_out))
     }

@@ -1373,6 +1373,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "thiserror",
  "tokenizers",
  "tokio",
  "tokio-stream",
