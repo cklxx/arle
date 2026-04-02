@@ -1,5 +1,6 @@
 //! Qwen3 model: full attention transformer.
 
+#[cfg(feature = "cuda")]
 mod batch_decode;
 mod config;
 mod decode;
