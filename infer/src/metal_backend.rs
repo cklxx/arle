@@ -496,11 +496,54 @@ impl MetalBackend {
         }
     }
 
+    pub fn generate_stream<F>(
+        &self,
+        prompt: &str,
+        params: &SamplingParams,
+        mut on_chunk: F,
+    ) -> Result<GenerateResult>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .context("model not loaded — call load() first")?;
+        let input_ids = tokenizer.encode(prompt)?;
+        let mut decoder = tokenizer.incremental_decoder();
+
+        let result =
+            self.generate_from_token_ids_with_callback(&input_ids, params, |token_id| {
+                if let Some(chunk) = decoder.step(token_id)? {
+                    on_chunk(&chunk)?;
+                }
+                Ok(())
+            })?;
+
+        if let Some(tail) = decoder.finish()? {
+            on_chunk(&tail)?;
+        }
+
+        Ok(result)
+    }
+
     pub fn generate_from_token_ids(
         &self,
         input_ids: &[u32],
         params: &SamplingParams,
     ) -> Result<GenerateResult> {
+        self.generate_from_token_ids_with_callback(input_ids, params, |_token_id| Ok(()))
+    }
+
+    fn generate_from_token_ids_with_callback<F>(
+        &self,
+        input_ids: &[u32],
+        params: &SamplingParams,
+        mut on_token: F,
+    ) -> Result<GenerateResult>
+    where
+        F: FnMut(u32) -> Result<()>,
+    {
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -514,7 +557,15 @@ impl MetalBackend {
             let max_new_tokens = params.max_new_tokens.unwrap_or(512);
             let t0 = Instant::now();
 
-            let generated = metal_generate(input_ids, weights, config, params, max_new_tokens, t0)?;
+            let generated = metal_generate(
+                input_ids,
+                weights,
+                config,
+                params,
+                max_new_tokens,
+                t0,
+                &mut on_token,
+            )?;
 
             let ttft_s = generated.ttft_ms / 1000.0;
             let total_s = generated.total_time_ms / 1000.0;
@@ -544,7 +595,7 @@ impl MetalBackend {
 
         #[cfg(not(feature = "metal"))]
         {
-            let _ = (tokenizer, config, params, prompt_tokens);
+            let _ = (tokenizer, config, params, prompt_tokens, on_token);
             todo!(
                 "Metal GPU required: rebuild with --no-default-features \
                  --features metal,no-cuda to enable Metal inference"
@@ -723,6 +774,7 @@ fn metal_generate(
     params: &SamplingParams,
     max_new_tokens: usize,
     t0: Instant,
+    on_token: &mut impl FnMut(u32) -> Result<()>,
 ) -> Result<MetalGenerateOutput> {
     use mlx_rs::{StreamOrDevice, ops::zeros_dtype_device};
 
@@ -846,6 +898,7 @@ fn metal_generate(
         let stop = (!params.ignore_eos && next_token == eos_id)
             || params.stop_token_ids.contains(&next_token);
         generated.push(next_token);
+        on_token(next_token)?;
 
         if stop {
             break "stop";
