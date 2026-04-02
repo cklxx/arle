@@ -1449,6 +1449,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tokenizers",
  "tokio",
  "tokio-stream",

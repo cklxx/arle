@@ -6,8 +6,8 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::safe::CudaGraph;
-use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 use log::info;
 
 use super::forward::Qwen35State;
@@ -360,12 +360,10 @@ impl Qwen35Model {
             for layer in &self.layers {
                 if matches!(layer.attn, LayerKind::LinearAttention(_)) {
                     for (b, &si) in slot_indices.iter().enumerate() {
-                        let layer_state =
-                            &mut states[si].recurrent_state.layers[linear_idx];
+                        let layer_state = &mut states[si].recurrent_state.layers[linear_idx];
                         let (conv_ptr, _) =
                             layer_state.conv_state.data.device_ptr_mut(&self.ctx.stream);
-                        let (gdr_ptr, _) =
-                            layer_state.state.device_ptr_mut(&self.ctx.stream);
+                        let (gdr_ptr, _) = layer_state.state.device_ptr_mut(&self.ctx.stream);
                         bufs.recurrent.conv_state_ptrs_host[b] = conv_ptr as u64;
                         bufs.recurrent.gdr_state_ptrs_host[b] = gdr_ptr as u64;
                     }
@@ -468,7 +466,12 @@ impl Qwen35Model {
         // Flush final linear group if layers end with linear
         if let Some(start) = group_start.take() {
             self.run_linear_group_graphed(
-                bufs, start, self.layers.len(), linear_idx, group_idx, batch_size,
+                bufs,
+                start,
+                self.layers.len(),
+                linear_idx,
+                group_idx,
+                batch_size,
             )?;
         }
 
@@ -510,11 +513,9 @@ impl Qwen35Model {
         if group_idx < bufs.graph_cache.len() {
             if let Some(ref graph) = bufs.graph_cache[group_idx][batch_size - 1] {
                 // Replay existing graph
-                graph
-                    .launch()
-                    .map_err(|e| anyhow::anyhow!(
-                        "Graph replay (group={}, B={}): {e}", group_idx, batch_size
-                    ))?;
+                graph.launch().map_err(|e| {
+                    anyhow::anyhow!("Graph replay (group={}, B={}): {e}", group_idx, batch_size)
+                })?;
                 return Ok(());
             }
         }
@@ -549,14 +550,19 @@ impl Qwen35Model {
                 .map_err(|e| anyhow::anyhow!("end_capture: {e}"))?;
 
             if let Some(graph) = graph_opt {
-                graph
-                    .launch()
-                    .map_err(|e| anyhow::anyhow!(
-                        "Graph first launch (group={}, B={}): {e}", group_idx, batch_size
-                    ))?;
+                graph.launch().map_err(|e| {
+                    anyhow::anyhow!(
+                        "Graph first launch (group={}, B={}): {e}",
+                        group_idx,
+                        batch_size
+                    )
+                })?;
                 info!(
                     "Piecewise CUDA Graph captured: group={}, layers={}-{}, B={}",
-                    group_idx, layer_start, layer_end - 1, batch_size
+                    group_idx,
+                    layer_start,
+                    layer_end - 1,
+                    batch_size
                 );
                 bufs.graph_cache[group_idx][batch_size - 1] = Some(graph);
             }
@@ -582,39 +588,84 @@ impl Qwen35Model {
 
         // 1. Input RMSNorm
         ops::rms_norm_batch_offset_into(
-            &self.ctx, hidden, &layer.input_layernorm, eps, &mut bufs.common.normed,
+            &self.ctx,
+            hidden,
+            &layer.input_layernorm,
+            eps,
+            &mut bufs.common.normed,
         )?;
 
         // 2. Projections
-        ops::gemm_into(&self.ctx, &attn.in_proj_qkv, &bufs.common.normed, &mut bufs.recurrent.qkv_batch);
-        ops::gemm_into(&self.ctx, &attn.in_proj_z, &bufs.common.normed, &mut bufs.recurrent.z_batch);
-        ops::gemm_into(&self.ctx, &attn.in_proj_b, &bufs.common.normed, &mut bufs.recurrent.b_batch);
-        ops::gemm_into(&self.ctx, &attn.in_proj_a, &bufs.common.normed, &mut bufs.recurrent.a_batch);
+        ops::gemm_into(
+            &self.ctx,
+            &attn.in_proj_qkv,
+            &bufs.common.normed,
+            &mut bufs.recurrent.qkv_batch,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &attn.in_proj_z,
+            &bufs.common.normed,
+            &mut bufs.recurrent.z_batch,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &attn.in_proj_b,
+            &bufs.common.normed,
+            &mut bufs.recurrent.b_batch,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &attn.in_proj_a,
+            &bufs.common.normed,
+            &mut bufs.recurrent.a_batch,
+        );
 
         // 3. Conv1d + GDR using pre-uploaded per-layer pointer arrays
         ops::conv1d_decode_batch_into(
-            &self.ctx, &bufs.recurrent.qkv_batch, &attn.conv1d_weight,
+            &self.ctx,
+            &bufs.recurrent.qkv_batch,
+            &attn.conv1d_weight,
             &mut bufs.recurrent.conv_state_ptrs_per_layer[linear_idx],
-            &mut bufs.recurrent.qkv_conv_batch, c.linear_conv_kernel_dim, batch_size,
+            &mut bufs.recurrent.qkv_conv_batch,
+            c.linear_conv_kernel_dim,
+            batch_size,
         );
         ops::gdr_decode_batch_into(
-            &self.ctx, &bufs.recurrent.qkv_conv_batch, &bufs.recurrent.b_batch,
-            &bufs.recurrent.a_batch, &attn.dt_bias, &attn.a_log,
+            &self.ctx,
+            &bufs.recurrent.qkv_conv_batch,
+            &bufs.recurrent.b_batch,
+            &bufs.recurrent.a_batch,
+            &attn.dt_bias,
+            &attn.a_log,
             &mut bufs.recurrent.gdr_state_ptrs_per_layer[linear_idx],
             &mut bufs.recurrent.gdr_out_batch,
-            c.linear_num_key_heads, c.linear_num_value_heads,
-            c.linear_key_head_dim, c.linear_value_head_dim, batch_size,
+            c.linear_num_key_heads,
+            c.linear_num_value_heads,
+            c.linear_key_head_dim,
+            c.linear_value_head_dim,
+            batch_size,
         )?;
 
         // 4. Gated RMSNorm
         ops::rms_norm_gated_batch_into(
-            &self.ctx, &bufs.recurrent.gdr_out_batch, &attn.norm_weight,
-            &bufs.recurrent.z_batch, &mut bufs.recurrent.normed_gated,
-            c.linear_num_value_heads, c.linear_value_head_dim, eps,
+            &self.ctx,
+            &bufs.recurrent.gdr_out_batch,
+            &attn.norm_weight,
+            &bufs.recurrent.z_batch,
+            &mut bufs.recurrent.normed_gated,
+            c.linear_num_value_heads,
+            c.linear_value_head_dim,
+            eps,
         );
 
         // 5. Out projection
-        ops::gemm_into(&self.ctx, &attn.out_proj, &bufs.recurrent.normed_gated, &mut bufs.common.attn_results);
+        ops::gemm_into(
+            &self.ctx,
+            &attn.out_proj,
+            &bufs.recurrent.normed_gated,
+            &mut bufs.common.attn_results,
+        );
 
         // 6. Residual + MLP
         self.decode_batch_mlp(layer, hidden, bufs, batch_size)?;
