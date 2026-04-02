@@ -5,6 +5,10 @@
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use cudarc::driver::safe::CudaGraph;
+use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
+use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+use log::info;
 
 use super::forward::Qwen35State;
 use super::weights::{
@@ -69,9 +73,13 @@ pub(crate) struct RecurrentBufs {
     pub(super) z_batch: HiddenStates,
     pub(super) b_batch: HiddenStates,
     pub(super) a_batch: HiddenStates,
-    pub(super) conv_state_ptrs_gpu: CudaSlice<u64>,
+    /// Per-layer GPU pointer arrays for conv1d state.
+    /// Pre-uploaded before decode body to enable future CUDA Graph capture.
+    pub(super) conv_state_ptrs_per_layer: Vec<CudaSlice<u64>>,
+    /// Per-layer GPU pointer arrays for GDR state.
+    pub(super) gdr_state_ptrs_per_layer: Vec<CudaSlice<u64>>,
+    /// Shared host staging buffer for pointer array uploads.
     pub(super) conv_state_ptrs_host: Vec<u64>,
-    pub(super) gdr_state_ptrs_gpu: CudaSlice<u64>,
     pub(super) gdr_state_ptrs_host: Vec<u64>,
     pub(super) qkv_conv_batch: HiddenStates,
     pub(super) gdr_out_batch: HiddenStates,
@@ -114,7 +122,7 @@ impl MlpBufs {
 // ── Outer container ─────────────────────────────────────────────────────────
 
 /// Pre-allocated buffers for batched decode, reused across steps.
-pub(crate) struct BatchDecodeBuffers35 {
+pub struct BatchDecodeBuffers35 {
     pub(super) common: CommonBufs,
     pub(super) attn: FullAttnBufs,
     pub(super) recurrent: RecurrentBufs,
@@ -131,6 +139,11 @@ pub(crate) struct BatchDecodeBuffers35 {
 
     // ── FlashInfer metadata (for full attention layers) ──
     pub(crate) metadata: FlashInferDecodeMetadata,
+
+    /// Piecewise CUDA Graph cache for groups of consecutive linear layers.
+    /// Indexed by [group_idx][batch_size - 1].
+    /// Full attention layers run eagerly between groups.
+    graph_cache: Vec<Vec<Option<CudaGraph>>>,
 
     max_batch_size: usize,
 }
@@ -153,6 +166,7 @@ impl BatchDecodeBuffers35 {
         max_batch_size: usize,
         num_qheads: usize,
         max_total_pages: usize,
+        num_linear_layers: usize,
     ) -> Result<Self> {
         let common = CommonBufs {
             hidden_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
@@ -171,20 +185,31 @@ impl BatchDecodeBuffers35 {
             attn_output: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
         };
 
+        // Per-layer pointer arrays enable future CUDA Graph capture by moving
+        // all H2D pointer uploads before the graph-capturable section.
+        let mut conv_ptrs = Vec::with_capacity(num_linear_layers);
+        let mut gdr_ptrs = Vec::with_capacity(num_linear_layers);
+        for _ in 0..num_linear_layers {
+            conv_ptrs.push(
+                ctx.stream
+                    .alloc_zeros::<u64>(max_batch_size)
+                    .map_err(|e| anyhow::anyhow!("Alloc conv_state_ptrs_per_layer: {e}"))?,
+            );
+            gdr_ptrs.push(
+                ctx.stream
+                    .alloc_zeros::<u64>(max_batch_size)
+                    .map_err(|e| anyhow::anyhow!("Alloc gdr_state_ptrs_per_layer: {e}"))?,
+            );
+        }
+
         let recurrent = RecurrentBufs {
             qkv_batch: HiddenStates::zeros(ctx, qkv_dim, max_batch_size)?,
             z_batch: HiddenStates::zeros(ctx, z_dim, max_batch_size)?,
             b_batch: HiddenStates::zeros(ctx, b_dim, max_batch_size)?,
             a_batch: HiddenStates::zeros(ctx, b_dim, max_batch_size)?,
-            conv_state_ptrs_gpu: ctx
-                .stream
-                .alloc_zeros(max_batch_size)
-                .map_err(|e| anyhow::anyhow!("Alloc conv_state_ptrs: {e}"))?,
+            conv_state_ptrs_per_layer: conv_ptrs,
+            gdr_state_ptrs_per_layer: gdr_ptrs,
             conv_state_ptrs_host: vec![0u64; max_batch_size],
-            gdr_state_ptrs_gpu: ctx
-                .stream
-                .alloc_zeros(max_batch_size)
-                .map_err(|e| anyhow::anyhow!("Alloc gdr_state_ptrs: {e}"))?,
             gdr_state_ptrs_host: vec![0u64; max_batch_size],
             qkv_conv_batch: HiddenStates::zeros(ctx, qkv_dim, max_batch_size)?,
             gdr_out_batch: HiddenStates::zeros(ctx, z_dim, max_batch_size)?,
@@ -222,6 +247,21 @@ impl BatchDecodeBuffers35 {
                 max_total_pages,
                 num_qheads,
             )?,
+
+            // Piecewise graph cache: one entry per group of consecutive linear layers.
+            // For Qwen3.5: full_attention_interval=4 → 8 groups of 3 linear layers.
+            graph_cache: {
+                let num_groups = if num_linear_layers > 0 {
+                    // Groups of consecutive linear layers between full attention layers
+                    // For interval=4: groups = num_hidden_layers / interval
+                    (num_linear_layers + 2) / 3 // ceil(num_linear_layers / 3)
+                } else {
+                    0
+                };
+                (0..num_groups)
+                    .map(|_| (0..max_batch_size).map(|_| None).collect())
+                    .collect()
+            },
 
             max_batch_size,
         })
@@ -312,7 +352,47 @@ impl Qwen35Model {
             )?);
         }
 
-        // ── Forward pass: no CUDA graph (per-request recurrent state varies) ──
+        // ── Pre-upload all recurrent state pointer arrays ──
+        // Moving all H2D before the forward pass enables future CUDA Graph capture.
+        {
+            use cudarc::driver::DevicePtrMut;
+            let mut linear_idx = 0usize;
+            for layer in &self.layers {
+                if matches!(layer.attn, LayerKind::LinearAttention(_)) {
+                    for (b, &si) in slot_indices.iter().enumerate() {
+                        let layer_state =
+                            &mut states[si].recurrent_state.layers[linear_idx];
+                        let (conv_ptr, _) =
+                            layer_state.conv_state.data.device_ptr_mut(&self.ctx.stream);
+                        let (gdr_ptr, _) =
+                            layer_state.state.device_ptr_mut(&self.ctx.stream);
+                        bufs.recurrent.conv_state_ptrs_host[b] = conv_ptr as u64;
+                        bufs.recurrent.gdr_state_ptrs_host[b] = gdr_ptr as u64;
+                    }
+                    self.ctx
+                        .stream
+                        .memcpy_htod(
+                            &bufs.recurrent.conv_state_ptrs_host[..batch_size],
+                            &mut bufs.recurrent.conv_state_ptrs_per_layer[linear_idx],
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("H2D conv_state_ptrs layer {linear_idx}: {e}")
+                        })?;
+                    self.ctx
+                        .stream
+                        .memcpy_htod(
+                            &bufs.recurrent.gdr_state_ptrs_host[..batch_size],
+                            &mut bufs.recurrent.gdr_state_ptrs_per_layer[linear_idx],
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("H2D gdr_state_ptrs layer {linear_idx}: {e}")
+                        })?;
+                    linear_idx += 1;
+                }
+            }
+        }
+
+        // ── Forward pass ──
         self.decode_batch_body(bufs, states, slot_indices, paged_kv_pool, batch_size)?;
 
         // Scatter per-slot logits when needed (non-greedy fallback)
@@ -341,9 +421,8 @@ impl Qwen35Model {
         batch_size: usize,
     ) -> Result<()> {
         let c = &self.config;
-        let eps = c.rms_norm_eps;
 
-        // Embedding
+        // Embedding (eager, before any graph)
         ops::embedding_batch(
             &self.ctx,
             &self.embed_tokens,
@@ -353,41 +432,53 @@ impl Qwen35Model {
 
         let hidden_ptr = &mut bufs.common.embedding_out as *mut HiddenStates;
 
+        // Process layers in groups: each group is consecutive linear layers
+        // followed by one full attention layer. Linear groups are graph-captured.
         let mut full_idx = 0usize;
         let mut linear_idx = 0usize;
+        let mut group_idx = 0usize;
+        let mut group_start: Option<usize> = None;
 
-        for layer in &self.layers {
-            let hidden = unsafe { &mut *hidden_ptr };
+        for (layer_i, layer) in self.layers.iter().enumerate() {
             match &layer.attn {
+                LayerKind::LinearAttention(_) => {
+                    if group_start.is_none() {
+                        group_start = Some(layer_i);
+                    }
+                    linear_idx += 1;
+                }
                 LayerKind::FullAttention(attn) => {
+                    // Flush any pending linear group with graph capture
+                    if let Some(start) = group_start.take() {
+                        self.run_linear_group_graphed(
+                            bufs, start, layer_i, linear_idx, group_idx, batch_size,
+                        )?;
+                        group_idx += 1;
+                    }
+
+                    // Full attention: always eager (FlashInfer metadata changes)
+                    let hidden = unsafe { &mut *hidden_ptr };
                     self.decode_batch_full_attn_layer(
                         layer, attn, hidden, bufs, kv_pool, full_idx, batch_size,
                     )?;
                     full_idx += 1;
                 }
-                LayerKind::LinearAttention(attn) => {
-                    self.decode_batch_linear_attn_layer(
-                        layer,
-                        attn,
-                        hidden,
-                        bufs,
-                        states,
-                        slot_indices,
-                        linear_idx,
-                        batch_size,
-                    )?;
-                    linear_idx += 1;
-                }
             }
         }
+        // Flush final linear group if layers end with linear
+        if let Some(start) = group_start.take() {
+            self.run_linear_group_graphed(
+                bufs, start, self.layers.len(), linear_idx, group_idx, batch_size,
+            )?;
+        }
 
-        // Final norm (offset variant) + logits GEMM
+        // Final norm (offset variant) + logits GEMM (eager)
         let hidden = unsafe { &*hidden_ptr };
         ops::rms_norm_batch_offset_into(
             &self.ctx,
             hidden,
             &self.norm,
-            eps,
+            c.rms_norm_eps,
             &mut bufs.common.normed,
         )?;
         let logits_buf = bufs.logits_batch.as_mut().unwrap();
@@ -398,6 +489,135 @@ impl Qwen35Model {
             &bufs.common.normed,
             logits_buf,
         );
+
+        Ok(())
+    }
+
+    /// Run a group of consecutive linear layers, using CUDA Graph capture/replay.
+    fn run_linear_group_graphed(
+        &self,
+        bufs: &mut BatchDecodeBuffers35,
+        layer_start: usize,
+        layer_end: usize,
+        linear_idx_end: usize,
+        group_idx: usize,
+        batch_size: usize,
+    ) -> Result<()> {
+        let linear_count = layer_end - layer_start;
+        let linear_idx_start = linear_idx_end - linear_count;
+
+        // Graph capture/replay for this group
+        if group_idx < bufs.graph_cache.len() {
+            if let Some(ref graph) = bufs.graph_cache[group_idx][batch_size - 1] {
+                // Replay existing graph
+                graph
+                    .launch()
+                    .map_err(|e| anyhow::anyhow!(
+                        "Graph replay (group={}, B={}): {e}", group_idx, batch_size
+                    ))?;
+                return Ok(());
+            }
+        }
+
+        // No graph cached — try to capture
+        if group_idx < bufs.graph_cache.len() {
+            self.ctx
+                .stream
+                .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                .map_err(|e| anyhow::anyhow!("begin_capture: {e}"))?;
+        }
+
+        // Run the linear layers
+        let hidden_ptr = &mut bufs.common.embedding_out as *mut HiddenStates;
+        let mut li = linear_idx_start;
+        for layer in &self.layers[layer_start..layer_end] {
+            if let LayerKind::LinearAttention(attn) = &layer.attn {
+                let hidden = unsafe { &mut *hidden_ptr };
+                self.decode_batch_linear_attn_layer_graphable(
+                    layer, attn, hidden, bufs, li, batch_size,
+                )?;
+                li += 1;
+            }
+        }
+
+        // End capture
+        if group_idx < bufs.graph_cache.len() {
+            let graph_opt = self
+                .ctx
+                .stream
+                .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+                .map_err(|e| anyhow::anyhow!("end_capture: {e}"))?;
+
+            if let Some(graph) = graph_opt {
+                graph
+                    .launch()
+                    .map_err(|e| anyhow::anyhow!(
+                        "Graph first launch (group={}, B={}): {e}", group_idx, batch_size
+                    ))?;
+                info!(
+                    "Piecewise CUDA Graph captured: group={}, layers={}-{}, B={}",
+                    group_idx, layer_start, layer_end - 1, batch_size
+                );
+                bufs.graph_cache[group_idx][batch_size - 1] = Some(graph);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Linear attention layer for graph-capturable execution.
+    /// No H2D, no state access — uses pre-uploaded per-layer pointer arrays.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_batch_linear_attn_layer_graphable(
+        &self,
+        layer: &TransformerBlock35,
+        attn: &LinearAttentionLayer,
+        hidden: &mut HiddenStates,
+        bufs: &mut BatchDecodeBuffers35,
+        linear_idx: usize,
+        batch_size: usize,
+    ) -> Result<()> {
+        let c = &self.config;
+        let eps = c.rms_norm_eps;
+
+        // 1. Input RMSNorm
+        ops::rms_norm_batch_offset_into(
+            &self.ctx, hidden, &layer.input_layernorm, eps, &mut bufs.common.normed,
+        )?;
+
+        // 2. Projections
+        ops::gemm_into(&self.ctx, &attn.in_proj_qkv, &bufs.common.normed, &mut bufs.recurrent.qkv_batch);
+        ops::gemm_into(&self.ctx, &attn.in_proj_z, &bufs.common.normed, &mut bufs.recurrent.z_batch);
+        ops::gemm_into(&self.ctx, &attn.in_proj_b, &bufs.common.normed, &mut bufs.recurrent.b_batch);
+        ops::gemm_into(&self.ctx, &attn.in_proj_a, &bufs.common.normed, &mut bufs.recurrent.a_batch);
+
+        // 3. Conv1d + GDR using pre-uploaded per-layer pointer arrays
+        ops::conv1d_decode_batch_into(
+            &self.ctx, &bufs.recurrent.qkv_batch, &attn.conv1d_weight,
+            &mut bufs.recurrent.conv_state_ptrs_per_layer[linear_idx],
+            &mut bufs.recurrent.qkv_conv_batch, c.linear_conv_kernel_dim, batch_size,
+        );
+        ops::gdr_decode_batch_into(
+            &self.ctx, &bufs.recurrent.qkv_conv_batch, &bufs.recurrent.b_batch,
+            &bufs.recurrent.a_batch, &attn.dt_bias, &attn.a_log,
+            &mut bufs.recurrent.gdr_state_ptrs_per_layer[linear_idx],
+            &mut bufs.recurrent.gdr_out_batch,
+            c.linear_num_key_heads, c.linear_num_value_heads,
+            c.linear_key_head_dim, c.linear_value_head_dim, batch_size,
+        )?;
+
+        // 4. Gated RMSNorm
+        ops::rms_norm_gated_batch_into(
+            &self.ctx, &bufs.recurrent.gdr_out_batch, &attn.norm_weight,
+            &bufs.recurrent.z_batch, &mut bufs.recurrent.normed_gated,
+            c.linear_num_value_heads, c.linear_value_head_dim, eps,
+        );
+
+        // 5. Out projection
+        ops::gemm_into(&self.ctx, &attn.out_proj, &bufs.recurrent.normed_gated, &mut bufs.common.attn_results);
+
+        // 6. Residual + MLP
+        self.decode_batch_mlp(layer, hidden, bufs, batch_size)?;
 
         Ok(())
     }
@@ -562,46 +782,15 @@ impl Qwen35Model {
             &mut bufs.recurrent.a_batch,
         );
 
-        // 3. Batched conv1d + GDR via pointer arrays (one kernel launch each)
-        //
-        // SAFETY: H2D pointer uploads must NOT be captured in CUDA Graph.
-        // Qwen3.5 batched decode currently runs eagerly (no graph capture)
-        // because pointer arrays change with batch composition each step.
+        // 3. Batched conv1d + GDR using pre-uploaded per-layer pointer arrays.
+        // H2D uploads were done in decode_batch() before this body runs.
         {
-            use cudarc::driver::DevicePtrMut;
-
-            // Build pointer arrays: collect per-request state device pointers.
-            // Must use device_ptr_mut since kernels write through these pointers.
-            for (b, &si) in slot_indices.iter().enumerate() {
-                let layer_state = &mut states[si].recurrent_state.layers[linear_idx];
-                let (conv_ptr, _) = layer_state.conv_state.data.device_ptr_mut(&self.ctx.stream);
-                let (gdr_ptr, _) = layer_state.state.device_ptr_mut(&self.ctx.stream);
-                bufs.recurrent.conv_state_ptrs_host[b] = conv_ptr as u64;
-                bufs.recurrent.gdr_state_ptrs_host[b] = gdr_ptr as u64;
-            }
-
-            // H2D upload pointer arrays
-            self.ctx
-                .stream
-                .memcpy_htod(
-                    &bufs.recurrent.conv_state_ptrs_host[..batch_size],
-                    &mut bufs.recurrent.conv_state_ptrs_gpu,
-                )
-                .map_err(|e| anyhow::anyhow!("H2D conv_state_ptrs: {e}"))?;
-            self.ctx
-                .stream
-                .memcpy_htod(
-                    &bufs.recurrent.gdr_state_ptrs_host[..batch_size],
-                    &mut bufs.recurrent.gdr_state_ptrs_gpu,
-                )
-                .map_err(|e| anyhow::anyhow!("H2D gdr_state_ptrs: {e}"))?;
-
             // Batched conv1d decode: one kernel launch for all B requests
             ops::conv1d_decode_batch_into(
                 &self.ctx,
                 &bufs.recurrent.qkv_batch,
                 &attn.conv1d_weight,
-                &mut bufs.recurrent.conv_state_ptrs_gpu,
+                &mut bufs.recurrent.conv_state_ptrs_per_layer[linear_idx],
                 &mut bufs.recurrent.qkv_conv_batch,
                 c.linear_conv_kernel_dim,
                 batch_size,
@@ -615,7 +804,7 @@ impl Qwen35Model {
                 &bufs.recurrent.a_batch,
                 &attn.dt_bias,
                 &attn.a_log,
-                &mut bufs.recurrent.gdr_state_ptrs_gpu,
+                &mut bufs.recurrent.gdr_state_ptrs_per_layer[linear_idx],
                 &mut bufs.recurrent.gdr_out_batch,
                 c.linear_num_key_heads,
                 c.linear_num_value_heads,

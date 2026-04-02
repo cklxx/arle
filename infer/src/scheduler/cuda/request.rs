@@ -30,6 +30,9 @@ pub(crate) struct ActiveRequest {
     /// Number of characters already sent to the client.
     pub(crate) sent_len: usize,
     pub(crate) phase: Phase,
+    /// Cached byte length of the decoded prefix (tokens[0..safe_point]).
+    /// Avoids O(N) re-decode of prefix in emit_delta.
+    pub(crate) prefix_byte_len: usize,
 }
 
 impl ActiveRequest {
@@ -52,14 +55,28 @@ impl ActiveRequest {
         };
 
         if safe_point > 0 {
-            let prefix_text = tokenizer
-                .decode(&self.generated_tokens[..safe_point])
-                .unwrap_or_default();
-            self.full_decoded.truncate(prefix_text.len());
+            // Use cached prefix byte length instead of re-decoding all prefix tokens.
+            // The cache is valid because safe_point == previous decoded_token_count - overlap,
+            // which is exactly where the previous call cached the prefix length.
+            self.full_decoded.truncate(self.prefix_byte_len);
             self.full_decoded.push_str(&new_text);
         } else {
             self.full_decoded = new_text;
         }
+
+        // Cache prefix byte length for next call: the prefix is tokens[0..n-overlap],
+        // which in full_decoded starts at byte 0 and has the length we just computed.
+        let new_safe = n.saturating_sub(overlap);
+        if new_safe > 0 {
+            // prefix byte len = total decoded len - suffix len (suffix = tokens[new_safe..n])
+            let suffix = tokenizer
+                .decode(&self.generated_tokens[new_safe..])
+                .unwrap_or_default();
+            self.prefix_byte_len = self.full_decoded.len().saturating_sub(suffix.len());
+        } else {
+            self.prefix_byte_len = 0;
+        }
+
         self.decoded_token_count = n;
 
         if let Some(ref stops) = self.stop {

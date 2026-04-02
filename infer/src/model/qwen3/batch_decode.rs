@@ -22,7 +22,7 @@ use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Pre-allocated buffers for batched decode, reused across steps.
 /// Allocated once for `max_batch_size`; smaller batches set `seq_len` on HiddenStates.
-pub(crate) struct BatchDecodeBuffers {
+pub struct BatchDecodeBuffers {
     hidden_out: HiddenStates,
     normed: HiddenStates,
     q_batch: HiddenStates,

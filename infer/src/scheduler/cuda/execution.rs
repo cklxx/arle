@@ -49,12 +49,15 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let new_us = new_t.elapsed().as_micros();
 
-        // Phase 4: Prefill chunks — process all pending prefill requests,
-        // one chunk each, to maximize prefill throughput while still yielding
-        // to the next decode step.
+        // Phase 4: Prefill chunks — process a limited number of pending prefill
+        // requests to avoid blocking decode for too long. When decode requests
+        // are active, limit to 1 prefill per step (like SGLang). When idle,
+        // process up to 8 to speed up batch admission.
         let prefill_t = std::time::Instant::now();
+        let max_prefills = if has_decode { 1 } else { 8 };
         let prefill_indices: Vec<usize> = (0..self.active.len())
             .filter(|&i| matches!(self.active[i].phase, Phase::Prefilling { .. }))
+            .take(max_prefills)
             .collect();
         for idx in prefill_indices {
             // Re-check phase since step_prefill_chunk may transition to Decoding/Finished
