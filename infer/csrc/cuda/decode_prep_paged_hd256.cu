@@ -193,7 +193,7 @@ __global__ void attention_gate_paged_hd256_kernel(
 
 extern "C" {
 
-void decode_prep_paged_hd256_cuda(
+cudaError_t decode_prep_paged_hd256_cuda(
     const __nv_bfloat16* q_full_batch,
     __nv_bfloat16* q_out_batch,
     const __nv_bfloat16* k_batch,
@@ -231,9 +231,10 @@ void decode_prep_paged_hd256_cuda(
         page_size, stride_page,
         rotary_dim, rms_eps
     );
+    return cudaGetLastError();
 }
 
-void attention_gate_paged_hd256_cuda(
+cudaError_t attention_gate_paged_hd256_cuda(
     const __nv_bfloat16* q_full_batch,
     __nv_bfloat16* attn_out,
     int num_q_heads,
@@ -247,6 +248,7 @@ void attention_gate_paged_hd256_cuda(
     attention_gate_paged_hd256_kernel<<<blocks, threads, 0, stream>>>(
         q_full_batch, attn_out, num_q_heads, batch_size
     );
+    return cudaGetLastError();
 }
 
 } // extern "C"

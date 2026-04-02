@@ -22,7 +22,8 @@ pub fn gemv(ctx: &DeviceContext, a: &DeviceMatrix, x: &DeviceVec, y: &mut Device
             a.rows as i32,
             a.cols as i32,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
 
     Ok(())
@@ -82,7 +83,8 @@ pub fn fused_mlp_into(
             hidden_size as i32,
             intermediate_size as i32,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
 
     Ok(())
@@ -135,7 +137,9 @@ pub(crate) fn gemm_into(
                 1,
                 weight.cols as i32,
                 ctx.stream.cu_stream(),
-            );
+            )
+            .result()
+            .expect("gemm_graphsafe_cuda failed");
         } else {
             ffi::gemm_cuda(
                 w_ptr as *const ffi::Half,
@@ -145,7 +149,9 @@ pub(crate) fn gemm_into(
                 x.seq_len as i32,
                 weight.cols as i32,
                 ctx.stream.cu_stream(),
-            );
+            )
+            .result()
+            .expect("gemm_cuda failed");
         }
     }
 }

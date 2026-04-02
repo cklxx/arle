@@ -12,7 +12,7 @@ unsafe extern "C" {
         n: i32,
         eps: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub(crate) fn rms_norm_batched_cuda(
         x: *const Half,
@@ -22,7 +22,7 @@ unsafe extern "C" {
         seq_len: i32,
         eps: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub(crate) fn add_cuda(
         a: *const Half,
@@ -40,7 +40,7 @@ unsafe extern "C" {
         n: i32,
         eps: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub(crate) fn fused_add_rms_norm_batched_cuda(
         hidden: *mut Half,
@@ -51,7 +51,7 @@ unsafe extern "C" {
         seq_len: i32,
         eps: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub(crate) fn silu_mul_triton_aot_cuda(
         gate: *const Half,
@@ -70,7 +70,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn argmax_cuda(x: *const Half, out: *mut i32, n: i32, stream: CUstream);
+    pub(crate) fn argmax_cuda(x: *const Half, out: *mut i32, n: i32, stream: CUstream) -> CUresult;
 
     pub(crate) fn argmax_batch_cuda(
         logits: *const Half,
@@ -78,7 +78,7 @@ unsafe extern "C" {
         batch_size: i32,
         vocab_size: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub(crate) fn gpu_sample_cuda(
         logits: *const Half,
@@ -90,7 +90,7 @@ unsafe extern "C" {
         top_p: f32,
         random_val: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub(crate) fn gemv_cuda(
         A: *const Half,
@@ -99,7 +99,7 @@ unsafe extern "C" {
         M: i32,
         K: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub(crate) fn gemm_cuda(
         W: *const Half,
@@ -109,7 +109,7 @@ unsafe extern "C" {
         N: i32,
         K: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub(crate) fn gemm_graphsafe_cuda(
         W: *const Half,
@@ -119,7 +119,7 @@ unsafe extern "C" {
         N: i32,
         K: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub(crate) fn fused_mlp_cuda(
         x: *const Half,
@@ -131,7 +131,7 @@ unsafe extern "C" {
         hidden_size: i32,
         intermediate_size: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
     pub(crate) fn embedding_decode_cuda(
@@ -164,7 +164,7 @@ unsafe extern "C" {
         max_seq_len: i32,
         rms_eps: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // FlashAttention-2 prefill (Triton AOT): fused QK + softmax + V for all query tokens.
     // Q/Output are col-major [q_dim, seq_len]. K/V cache are per-head [max_seq, HEAD_DIM].
@@ -238,7 +238,7 @@ unsafe extern "C" {
         rms_eps: f32,
         max_seq_len: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // Apply sigmoid(gate) from interleaved q_full onto attention output in-place.
     pub(crate) fn attention_gate_batch_hd256_cuda(
@@ -247,7 +247,7 @@ unsafe extern "C" {
         num_q_heads: i32,
         seq_len: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // Batched fused GQA decode attention (CUDA, split-KV, HEAD_DIM=128)
     // Processes B requests in one launch using per-request KV cache pointers.
@@ -275,7 +275,7 @@ unsafe extern "C" {
         batch_size: i32,
         rms_eps: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // Batched attention reduce: merge split-KV partials for B requests.
     // Grid: (num_qheads, batch_size).
@@ -288,7 +288,7 @@ unsafe extern "C" {
         head_dim: i32,
         batch_size: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // Fused GQA Attention — decode variant (Triton AOT, split-KV, HEAD_DIM=128)
     // Reads pos/seq_len from decode_meta; scale and rms_eps computed inside kernel.
@@ -337,7 +337,7 @@ unsafe extern "C" {
         seq_len: i32,
         eps: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // (1+weight) RMSNorm — Qwen3.5 / Gemma style
     pub(crate) fn rms_norm_offset_cuda(
@@ -347,7 +347,7 @@ unsafe extern "C" {
         n: i32,
         eps: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // Fused add + (1+weight) RMSNorm
     pub(crate) fn fused_add_rms_norm_offset_cuda(
@@ -358,7 +358,7 @@ unsafe extern "C" {
         n: i32,
         eps: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // Per-head RMSNorm with F32 weight + SiLU gate
     pub(crate) fn rms_norm_gated_cuda(
@@ -370,7 +370,7 @@ unsafe extern "C" {
         head_dim: i32,
         eps: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // Gated delta rule recurrent decode (single step)
     pub(crate) fn gated_delta_rule_decode_cuda(
@@ -386,7 +386,7 @@ unsafe extern "C" {
         key_dim: i32,
         val_dim: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // Batched conv1d decode (B requests, seq_len=1)
     pub(crate) fn conv1d_decode_batch_cuda(
@@ -398,7 +398,7 @@ unsafe extern "C" {
         kernel_size: i32,
         batch_size: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // Batched gated delta rule decode (B requests)
     pub(crate) fn gdr_decode_batch_cuda(
@@ -415,7 +415,7 @@ unsafe extern "C" {
         val_dim: i32,
         batch_size: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // Causal depthwise conv1d prefill (parallel over sequence)
     pub(crate) fn conv1d_prefill_cuda(
@@ -427,7 +427,7 @@ unsafe extern "C" {
         seq_len: i32,
         kernel_size: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub(crate) fn gated_delta_rule_prefill_chunk_prepare_cuda(
         qkv: *const Half,
@@ -549,7 +549,7 @@ unsafe extern "C" {
         batch_size: i32,
         rms_eps: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // ─── Contiguous KV → paged KV copy ───
 
@@ -566,7 +566,7 @@ unsafe extern "C" {
         head_dim: i32,
         stride_page: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // ─── Paged KV cache append ───
 
@@ -583,7 +583,7 @@ unsafe extern "C" {
         page_size: i32,
         head_dim: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // ─── Scatter-write prefill K/V to token pool ───
 
@@ -597,7 +597,7 @@ unsafe extern "C" {
         num_kv_heads: i32,
         head_dim: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // ─── FlashInfer batch decode with paged KV cache ───
 
@@ -702,7 +702,7 @@ unsafe extern "C" {
         rotary_dim: i32,
         rms_eps: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub(crate) fn attention_gate_paged_hd256_cuda(
         q_full_batch: *const Half,
@@ -710,7 +710,7 @@ unsafe extern "C" {
         num_q_heads: i32,
         batch_size: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // Tensor-core decode: uses prefill kernel for decode (flat ITL at long contexts).
     // Plan step (CPU-side scheduling for BatchPrefillWithPagedKVCache).
@@ -763,7 +763,7 @@ unsafe extern "C" {
         q_dim: i32,
         kv_dim: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     // Fused silu_mul from merged gate+up buffer.
     pub(crate) fn silu_mul_fused_cuda(
@@ -772,6 +772,6 @@ unsafe extern "C" {
         batch_size: i32,
         inter_dim: i32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
 }

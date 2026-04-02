@@ -146,7 +146,8 @@ pub(crate) fn split_qkv_batch(
             q_dim as i32,
             kv_dim as i32,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
     Ok(())
 }
@@ -172,7 +173,8 @@ pub(crate) fn silu_mul_fused_batch_into(
             batch_size as i32,
             inter_dim as i32,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
     Ok(())
 }

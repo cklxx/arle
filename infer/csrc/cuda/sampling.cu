@@ -417,19 +417,22 @@ __global__ void gpu_sample_kernel(
 }
 
 extern "C" {
-void argmax_cuda(const __nv_bfloat16 *x, int *out, int n, cudaStream_t stream) {
+cudaError_t argmax_cuda(const __nv_bfloat16 *x, int *out, int n, cudaStream_t stream) {
   argmax_kernel_fast<<<1, ARGMAX_BLOCK, 0, stream>>>(x, out, n);
+    return cudaGetLastError();
 }
 
-void argmax_batch_cuda(const __nv_bfloat16 *logits, int *token_ids,
+cudaError_t argmax_batch_cuda(const __nv_bfloat16 *logits, int *token_ids,
                        int batch_size, int vocab_size, cudaStream_t stream) {
   argmax_batch_kernel<<<batch_size, ARGMAX_BLOCK, 0, stream>>>(logits, token_ids, vocab_size);
+    return cudaGetLastError();
 }
 
-void gpu_sample_cuda(const __nv_bfloat16 *logits, float *probs_scratch, int *output,
+cudaError_t gpu_sample_cuda(const __nv_bfloat16 *logits, float *probs_scratch, int *output,
                      int vocab_size, float inv_temperature, int top_k, float top_p,
                      float random_val, cudaStream_t stream) {
   gpu_sample_kernel<<<1, SAMPLE_BLOCK, 0, stream>>>(
       logits, probs_scratch, output, vocab_size, inv_temperature, top_k, top_p, random_val);
+    return cudaGetLastError();
 }
 }

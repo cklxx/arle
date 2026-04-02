@@ -65,7 +65,7 @@ __global__ void paged_kv_append_kernel(
 }
 
 // C entry point
-extern "C" void paged_kv_append_cuda(
+extern "C" cudaError_t paged_kv_append_cuda(
     const __nv_bfloat16* k_batch,
     const __nv_bfloat16* v_batch,
     __nv_bfloat16* k_data,
@@ -85,4 +85,5 @@ extern "C" void paged_kv_append_cuda(
         k_batch, v_batch, k_data, v_data,
         page_indices, indptr, positions,
         num_kv_heads, page_size, head_dim);
+    return cudaGetLastError();
 }

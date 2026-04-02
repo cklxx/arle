@@ -424,48 +424,52 @@ __global__ void fused_add_rms_norm_batched_kernel(
 }
 
 extern "C" {
-void rms_norm_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight, __nv_bfloat16 *out, int n,
+cudaError_t rms_norm_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight, __nv_bfloat16 *out, int n,
                    float eps, cudaStream_t stream) {
   rms_norm_kernel<<<1, NORM_BLOCK, 0, stream>>>(x, weight, out, n, eps);
+    return cudaGetLastError();
 }
 
-void fused_add_rms_norm_cuda(__nv_bfloat16 *hidden, const __nv_bfloat16 *residual,
+cudaError_t fused_add_rms_norm_cuda(__nv_bfloat16 *hidden, const __nv_bfloat16 *residual,
                               const __nv_bfloat16 *weight, __nv_bfloat16 *out, int n,
                               float eps, cudaStream_t stream) {
   fused_add_rms_norm_kernel<<<1, NORM_BLOCK, 0, stream>>>(hidden, residual, weight, out, n, eps);
+    return cudaGetLastError();
 }
 
-void fused_add_rms_norm_batched_cuda(__nv_bfloat16 *hidden, const __nv_bfloat16 *residual,
+cudaError_t fused_add_rms_norm_batched_cuda(__nv_bfloat16 *hidden, const __nv_bfloat16 *residual,
                                       const __nv_bfloat16 *weight, __nv_bfloat16 *out,
                                       int hidden_dim, int seq_len,
                                       float eps, cudaStream_t stream) {
   fused_add_rms_norm_batched_kernel<<<seq_len, NORM_BLOCK, 0, stream>>>(
       hidden, residual, weight, out, hidden_dim, eps);
+    return cudaGetLastError();
 }
 
-void rms_norm_batched_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
+cudaError_t rms_norm_batched_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
                             __nv_bfloat16 *out, int hidden_dim, int seq_len,
                             float eps, cudaStream_t stream) {
   rms_norm_batched_kernel<<<seq_len, NORM_BLOCK, 0, stream>>>(
       x, weight, out, hidden_dim, eps);
+    return cudaGetLastError();
 }
 
 // ============================================================================
 // RMSNorm with (1+weight) offset — Qwen3.5 / Gemma style
 // out[i] = x[i] * (1 + weight[i]) / sqrt(mean(x^2) + eps)
 // ============================================================================
-void rms_norm_offset_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
+cudaError_t rms_norm_offset_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
                            __nv_bfloat16 *out, int n, float eps, cudaStream_t stream);
 
-void fused_add_rms_norm_offset_cuda(__nv_bfloat16 *hidden, const __nv_bfloat16 *residual,
+cudaError_t fused_add_rms_norm_offset_cuda(__nv_bfloat16 *hidden, const __nv_bfloat16 *residual,
                                       const __nv_bfloat16 *weight, __nv_bfloat16 *out, int n,
                                       float eps, cudaStream_t stream);
 
-void rms_norm_batched_offset_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
+cudaError_t rms_norm_batched_offset_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
                                     __nv_bfloat16 *out, int hidden_dim, int seq_len,
                                     float eps, cudaStream_t stream);
 
-void rms_norm_gated_cuda(const __nv_bfloat16 *x, const float *weight,
+cudaError_t rms_norm_gated_cuda(const __nv_bfloat16 *x, const float *weight,
                           const __nv_bfloat16 *gate, __nv_bfloat16 *out,
                           int num_heads, int head_dim, float eps, cudaStream_t stream);
 } // extern "C"
@@ -771,28 +775,32 @@ __global__ void rms_norm_gated_kernel(
 // C API implementations
 extern "C" {
 
-void rms_norm_offset_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
+cudaError_t rms_norm_offset_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
                            __nv_bfloat16 *out, int n, float eps, cudaStream_t stream) {
   rms_norm_offset_kernel<<<1, NORM_BLOCK, 0, stream>>>(x, weight, out, n, eps);
+    return cudaGetLastError();
 }
 
-void fused_add_rms_norm_offset_cuda(__nv_bfloat16 *hidden, const __nv_bfloat16 *residual,
+cudaError_t fused_add_rms_norm_offset_cuda(__nv_bfloat16 *hidden, const __nv_bfloat16 *residual,
                                       const __nv_bfloat16 *weight, __nv_bfloat16 *out, int n,
                                       float eps, cudaStream_t stream) {
   fused_add_rms_norm_offset_kernel<<<1, NORM_BLOCK, 0, stream>>>(hidden, residual, weight, out, n, eps);
+    return cudaGetLastError();
 }
 
-void rms_norm_batched_offset_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
+cudaError_t rms_norm_batched_offset_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
                                     __nv_bfloat16 *out, int hidden_dim, int seq_len,
                                     float eps, cudaStream_t stream) {
   rms_norm_batched_offset_kernel<<<seq_len, NORM_BLOCK, 0, stream>>>(
       x, weight, out, hidden_dim, eps);
+    return cudaGetLastError();
 }
 
-void rms_norm_gated_cuda(const __nv_bfloat16 *x, const float *weight,
+cudaError_t rms_norm_gated_cuda(const __nv_bfloat16 *x, const float *weight,
                           const __nv_bfloat16 *gate, __nv_bfloat16 *out,
                           int num_heads, int head_dim, float eps, cudaStream_t stream) {
   rms_norm_gated_kernel<<<num_heads, head_dim, 0, stream>>>(x, weight, gate, out, head_dim, eps);
+    return cudaGetLastError();
 }
 
 } // extern "C"

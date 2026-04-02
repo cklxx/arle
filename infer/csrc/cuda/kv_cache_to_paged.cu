@@ -50,7 +50,7 @@ __global__ void kv_cache_to_paged_kernel(
     v_paged[dst_offset] = v_contiguous[src_offset];
 }
 
-extern "C" void kv_cache_to_paged_cuda(
+extern "C" cudaError_t kv_cache_to_paged_cuda(
     const __nv_bfloat16* k_contiguous,
     const __nv_bfloat16* v_contiguous,
     __nv_bfloat16* k_paged,
@@ -69,4 +69,5 @@ extern "C" void kv_cache_to_paged_cuda(
     kv_cache_to_paged_kernel<<<grid, block, 0, stream>>>(
         k_contiguous, v_contiguous, k_paged, v_paged, page_indices,
         max_seq_len, seq_len, num_kv_heads, page_size, head_dim, stride_page);
+    return cudaGetLastError();
 }

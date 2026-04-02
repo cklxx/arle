@@ -189,16 +189,17 @@ void gemv_batched_qkv_cuda(const __nv_bfloat16 *Wq, const __nv_bfloat16 *Wk, con
   gemv_handwritten_kernel<<<blocks_k, GEMV_BLOCK, 0, stream>>>(Wv, x, v_out, Mk, K);
 }
 
-void gemv_cuda(const __nv_bfloat16 *A, const __nv_bfloat16 *x, __nv_bfloat16 *y, int M, int K,
+cudaError_t gemv_cuda(const __nv_bfloat16 *A, const __nv_bfloat16 *x, __nv_bfloat16 *y, int M, int K,
                cudaStream_t stream) {
   int num_blocks = (M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
   gemv_handwritten_kernel<<<num_blocks, GEMV_BLOCK, 0, stream>>>(A, x, y, M, K);
+    return cudaGetLastError();
 }
 
 // General GEMM: Y = W @ X where W is [M, K] row-major, X is [K, N] col-major, Y is [M, N] col-major
 // N=1 is equivalent to GEMV. N>1 enables batched prefill.
 // Uses prefill handle (with workspace) — only called from prefill path, never under CUDA Graphs.
-void gemm_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
+cudaError_t gemm_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
                int M, int N, int K, cudaStream_t stream) {
   const float h_alpha = 1.0f;
   const float h_beta = 0.0f;
@@ -211,11 +212,12 @@ void gemm_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
                &h_beta,
                Y, CUDA_R_16BF, M,
                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return cudaGetLastError();
 }
 
 // Graph-safe GEMM: same math as gemm_cuda but uses the workspace-free handle.
 // Safe for CUDA Graph capture and decode path.
-void gemm_graphsafe_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
+cudaError_t gemm_graphsafe_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
                           int M, int N, int K, cudaStream_t stream) {
   const float h_alpha = 1.0f;
   const float h_beta = 0.0f;
@@ -228,6 +230,7 @@ void gemm_graphsafe_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bf
                &h_beta,
                Y, CUDA_R_16BF, M,
                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return cudaGetLastError();
 }
 
 void attention_scores_cuda(const __nv_bfloat16 *q, const __nv_bfloat16 *k_cache, __nv_bfloat16 *scores,

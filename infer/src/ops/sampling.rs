@@ -25,7 +25,8 @@ pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
                 out_ptr as *mut i32,
                 x.len as i32,
                 ctx.stream.cu_stream(),
-            );
+            )
+            .result()?;
         }
     }
 
@@ -56,7 +57,8 @@ pub(crate) fn argmax_batch_launch(
             batch_size as i32,
             vocab_size as i32,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
     Ok(())
 }
@@ -144,7 +146,9 @@ unsafe fn launch_sample_kernel_inner(
     stream: CUstream,
 ) {
     if params.is_greedy() {
-        unsafe { ffi::argmax_cuda(logits_ptr, out_ptr, logits_len, stream) };
+        unsafe { ffi::argmax_cuda(logits_ptr, out_ptr, logits_len, stream) }
+            .result()
+            .expect("argmax_cuda failed");
     } else {
         unsafe {
             ffi::gpu_sample_cuda(
@@ -158,7 +162,9 @@ unsafe fn launch_sample_kernel_inner(
                 random_val,
                 stream,
             )
-        };
+        }
+        .result()
+        .expect("gpu_sample_cuda failed");
     }
 }
 

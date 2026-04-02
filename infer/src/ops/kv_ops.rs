@@ -63,7 +63,8 @@ pub fn scatter_write_kv(
             num_kv_heads as i32,
             head_dim as i32,
             ctx.stream.cu_stream(),
-        );
+        )
+        .result()?;
     }
 
     Ok(())

@@ -167,7 +167,7 @@ __global__ void gated_delta_rule_decode_kernel(
 
 extern "C" {
 
-void gated_delta_rule_decode_cuda(
+cudaError_t gated_delta_rule_decode_cuda(
     const __nv_bfloat16* qkv,
     const __nv_bfloat16* b_proj,
     const __nv_bfloat16* a_proj,
@@ -187,6 +187,7 @@ void gated_delta_rule_decode_cuda(
         state, output,
         num_key_heads, num_value_heads, key_dim, val_dim
     );
+    return cudaGetLastError();
 }
 
 } // extern "C"

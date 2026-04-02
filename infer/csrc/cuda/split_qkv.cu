@@ -53,7 +53,7 @@ __global__ void silu_mul_fused_kernel(
 
 extern "C" {
 
-void split_qkv_cuda(
+cudaError_t split_qkv_cuda(
     const __nv_bfloat16* qkv,
     __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v,
     int batch_size, int q_dim, int kv_dim,
@@ -65,9 +65,10 @@ void split_qkv_cuda(
     split_qkv_kernel<<<grid, threads, 0, stream>>>(
         qkv, q, k, v, q_dim, kv_dim, qkv_dim
     );
+    return cudaGetLastError();
 }
 
-void silu_mul_fused_cuda(
+cudaError_t silu_mul_fused_cuda(
     const __nv_bfloat16* gate_up,
     __nv_bfloat16* out,
     int batch_size, int inter_dim,
@@ -78,6 +79,7 @@ void silu_mul_fused_cuda(
     silu_mul_fused_kernel<<<grid, threads, 0, stream>>>(
         gate_up, out, inter_dim
     );
+    return cudaGetLastError();
 }
 
 } // extern "C"

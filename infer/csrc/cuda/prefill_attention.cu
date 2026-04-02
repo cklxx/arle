@@ -118,7 +118,7 @@ __global__ void prefill_kv_cache_write_kernel(
 // ============================================================================
 extern "C" {
 
-void prefill_attention_prep_cuda(
+cudaError_t prefill_attention_prep_cuda(
     __nv_bfloat16* q_batch,          // [q_dim, seq_len] modified in-place (normed+RoPE'd)
     __nv_bfloat16* k_batch,          // [kv_dim, seq_len] modified in-place (normed+RoPE'd)
     const __nv_bfloat16* v_batch,    // [kv_dim, seq_len]
@@ -155,6 +155,7 @@ void prefill_attention_prep_cuda(
         k_batch, v_batch, k_cache, v_cache,
         head_dim, kv_dim, max_seq_len, start_pos
     );
+    return cudaGetLastError();
 }
 
 } // extern "C"

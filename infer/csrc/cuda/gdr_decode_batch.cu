@@ -167,7 +167,7 @@ __global__ void gdr_decode_batch_kernel(
 
 extern "C" {
 
-void gdr_decode_batch_cuda(
+cudaError_t gdr_decode_batch_cuda(
     const __nv_bfloat16* qkv_batch,
     const __nv_bfloat16* b_proj_batch,
     const __nv_bfloat16* a_proj_batch,
@@ -188,6 +188,7 @@ void gdr_decode_batch_cuda(
         state_ptrs, output_batch,
         num_key_heads, num_value_heads, key_dim, val_dim
     );
+    return cudaGetLastError();
 }
 
 } // extern "C"

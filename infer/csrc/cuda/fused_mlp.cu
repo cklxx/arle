@@ -232,7 +232,7 @@ __global__ void fused_mlp_output_kernel(
 }
 
 extern "C" {
-void fused_mlp_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *gate_proj, const __nv_bfloat16 *up_proj,
+cudaError_t fused_mlp_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *gate_proj, const __nv_bfloat16 *up_proj,
                     const __nv_bfloat16 *down_proj, __nv_bfloat16 *act, __nv_bfloat16 *out,
                     int hidden_size, int intermediate_size, cudaStream_t stream) {
   // Phase 1: Compute gate, up, and activation
@@ -244,5 +244,6 @@ void fused_mlp_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *gate_proj, cons
   int out_blocks = (hidden_size + FUSED_MLP_OUT_PER_BLOCK - 1) / FUSED_MLP_OUT_PER_BLOCK;
   fused_mlp_output_kernel<<<out_blocks, FUSED_MLP_TILE, 0, stream>>>(
       act, down_proj, out, hidden_size, intermediate_size);
+    return cudaGetLastError();
 }
 }
