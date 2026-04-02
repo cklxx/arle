@@ -91,6 +91,63 @@ mod metal_ffi {
             result_out: *mut mlx_array,
         );
 
+        /// Quantized transformer block: same structure as `metal_fused_block_cached`
+        /// but uses `quantized_matmul` for all projections.
+        ///
+        /// Merged projections: qkv_proj (split by q/k/v dims), gate_up_proj (split
+        /// by gate/up dims).  `group_size` and `bits` are shared across all weights.
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn metal_quantized_fused_block_cached(
+            // input hidden state
+            x: mlx_array,
+            // layer-norm weights
+            input_norm_w: mlx_array,
+            post_attn_norm_w: mlx_array,
+            // quantized QKV projection (merged)
+            qkv_w: mlx_array,
+            qkv_scales: mlx_array,
+            qkv_biases: mlx_array,
+            // quantized output projection
+            o_w: mlx_array,
+            o_scales: mlx_array,
+            o_biases: mlx_array,
+            // per-head QK norms
+            q_norm_w: mlx_array,
+            k_norm_w: mlx_array,
+            // quantized MLP gate+up projection (merged)
+            gate_up_w: mlx_array,
+            gate_up_scales: mlx_array,
+            gate_up_biases: mlx_array,
+            // quantized MLP down projection
+            down_w: mlx_array,
+            down_scales: mlx_array,
+            down_biases: mlx_array,
+            // quantization parameters
+            group_size: i32,
+            bits: i32,
+            // split dimensions
+            q_dim: i32,
+            k_dim: i32,
+            v_dim: i32,
+            gate_dim: i32,
+            up_dim: i32,
+            // attention hyper-params
+            n_heads: i32,
+            n_kv_heads: i32,
+            head_dim: i32,
+            attn_scale: f32,
+            rope_base: f32,
+            rope_dims: i32,
+            norm_eps: f32,
+            // KV cache (in/out)
+            k_cache: *mut mlx_array,
+            v_cache: *mut mlx_array,
+            cache_len: i32,
+            seq: i32,
+            // output
+            result_out: *mut mlx_array,
+        );
+
     }
 }
 
@@ -179,6 +236,20 @@ impl WeightTensor {
         }
     }
 
+    /// Returns the quantized weight components, or `None` if this is a dense weight.
+    fn quantized_parts(&self) -> Option<(&Array, &Array, &Array, i32, i32)> {
+        match self {
+            WeightTensor::Quantized {
+                w,
+                scales,
+                biases,
+                group_size,
+                bits,
+            } => Some((w, scales, biases, *group_size, *bits)),
+            WeightTensor::Dense(_) => None,
+        }
+    }
+
     /// Logical output width of the projection.
     ///
     /// Dense tensors are stored transposed as `[in, out]`; quantized tensors
@@ -236,6 +307,30 @@ impl AttentionInputProjection {
                 k_proj: WeightTensor::Dense(k_proj_t),
                 v_proj: WeightTensor::Dense(v_proj_t),
             } => Some((q_proj_t, k_proj_t, v_proj_t)),
+            _ => None,
+        }
+    }
+
+    /// Returns the merged quantized QKV weight components plus split dimensions,
+    /// or `None` if the projection is not `MergedQuantized`.
+    #[allow(clippy::type_complexity)]
+    fn fused_quantized_parts(
+        &self,
+    ) -> Option<(&Array, &Array, &Array, i32, i32, i32, i32, i32)> {
+        match self {
+            Self::MergedQuantized {
+                qkv_proj:
+                    WeightTensor::Quantized {
+                        w,
+                        scales,
+                        biases,
+                        group_size,
+                        bits,
+                    },
+                q_dim,
+                k_dim,
+                v_dim,
+            } => Some((w, scales, biases, *q_dim, *k_dim, *v_dim, *group_size, *bits)),
             _ => None,
         }
     }
@@ -298,6 +393,27 @@ impl MlpInputProjection {
                 gate_proj: WeightTensor::Dense(gate_proj_t),
                 up_proj: WeightTensor::Dense(up_proj_t),
             } => Some((gate_proj_t, up_proj_t)),
+            _ => None,
+        }
+    }
+
+    /// Returns the merged quantized gate+up weight components plus split dimensions,
+    /// or `None` if the projection is not `MergedQuantized`.
+    #[allow(clippy::type_complexity)]
+    fn fused_quantized_parts(&self) -> Option<(&Array, &Array, &Array, i32, i32, i32, i32)> {
+        match self {
+            Self::MergedQuantized {
+                gate_up_proj:
+                    WeightTensor::Quantized {
+                        w,
+                        scales,
+                        biases,
+                        group_size,
+                        bits,
+                    },
+                gate_dim,
+                up_dim,
+            } => Some((w, scales, biases, *gate_dim, *up_dim, *group_size, *bits)),
             _ => None,
         }
     }
@@ -554,9 +670,10 @@ impl InferenceBackend for MetalBackend {
 ///
 /// Optimisations applied:
 /// - **P1**: Dense weights are pre-transposed at load time (no per-step transpose).
-/// - **P2**: Full transformer block is one C++ FFI call (`metal_fused_block_cached`),
-///   eliminating ~40 mlx-rs round-trips per layer. Falls back to the
-///   Rust path for quantized models (quantized_matmul not fused yet).
+/// - **P2**: Full transformer block is one C++ FFI call (`metal_fused_block_cached`
+///   for dense, `metal_quantized_fused_block_cached` for quantized models),
+///   eliminating ~40 mlx-rs round-trips per layer. Falls back to the Rust
+///   path for mixed dense/quantized models.
 /// - **P3/P6**: async_eval double-buffering: GPU computes step N while CPU processes
 ///   step N-1's token. Graph construction (CPU-only) overlaps GPU execution.
 /// - **P4**: argmax / categorical sampling stays on GPU (no 152 K float transfer).
@@ -568,6 +685,19 @@ impl InferenceBackend for MetalBackend {
 const KV_CACHE_CHUNK: i32 = 256;
 
 const BENCHMARK_PROMPT_CHUNK: &str = " benchmark throughput";
+
+/// Which fused C++ path to use for transformer layers.
+#[cfg(feature = "metal")]
+#[derive(Clone, Copy)]
+enum FusedPathMode {
+    /// All weights are dense — use the dense fused C++ block.
+    Dense,
+    /// All weights are quantized with matching group_size/bits — use the
+    /// quantized fused C++ block.
+    Quantized,
+    /// Mixed or fused ops unavailable — fall back to Rust/MLX per-op path.
+    Fallback,
+}
 
 #[cfg(feature = "metal")]
 struct MetalGenerateOutput {
@@ -607,11 +737,25 @@ fn metal_generate(
     let eos_id = config.eos_token_id;
     let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
 
-    let use_fused = METAL_FUSED_OPS_AVAILABLE
-        && weights.layers.iter().all(|layer| {
-            layer.attention_inputs.fused_dense_parts().is_some()
-                && layer.mlp_inputs.fused_dense_parts().is_some()
-        });
+    let fused_mode = if !METAL_FUSED_OPS_AVAILABLE {
+        FusedPathMode::Fallback
+    } else if weights.layers.iter().all(|layer| {
+        layer.attention_inputs.fused_dense_parts().is_some()
+            && layer.mlp_inputs.fused_dense_parts().is_some()
+            && matches!(&layer.o_proj, WeightTensor::Dense(_))
+            && matches!(&layer.down_proj, WeightTensor::Dense(_))
+    }) {
+        FusedPathMode::Dense
+    } else if weights.layers.iter().all(|layer| {
+        layer.attention_inputs.fused_quantized_parts().is_some()
+            && layer.mlp_inputs.fused_quantized_parts().is_some()
+            && layer.o_proj.quantized_parts().is_some()
+            && layer.down_proj.quantized_parts().is_some()
+    }) {
+        FusedPathMode::Quantized
+    } else {
+        FusedPathMode::Fallback
+    };
 
     // P5: KV cache starts at the next 256-token boundary above the prefill length,
     // plus one chunk for initial decode steps.  Grown lazily in KV_CACHE_CHUNK steps.
@@ -647,7 +791,7 @@ fn metal_generate(
         attn_scale,
         rope_base,
         eps,
-        use_fused,
+        fused_mode,
         params,
     )?;
     // P6: schedule GPU execution without blocking CPU.
@@ -713,7 +857,7 @@ fn metal_generate(
             attn_scale,
             rope_base,
             eps,
-            use_fused,
+            fused_mode,
             params,
         )?;
         cache_len += 1;
@@ -787,7 +931,7 @@ fn build_forward_graph(
     attn_scale: f32,
     rope_base: f32,
     eps: f32,
-    use_fused: bool,
+    fused_mode: FusedPathMode,
     params: &SamplingParams,
 ) -> Result<Array> {
     use mlx_rs::{fast, ops::indexing::take_axis};
@@ -800,51 +944,110 @@ fn build_forward_graph(
     let mut x = take_axis(&weights.embed_tokens, &idx_arr, 0).context("embedding take_axis")?;
 
     // ── Transformer layers ────────────────────────────────────────────────────
-    if use_fused {
-        for (li, layer) in weights.layers.iter().enumerate() {
-            let (q_proj_t, k_proj_t, v_proj_t) = layer
-                .attention_inputs
-                .fused_dense_parts()
-                .expect("use_fused only when attention inputs are Dense");
-            let (gate_proj_t, up_proj_t) = layer
-                .mlp_inputs
-                .fused_dense_parts()
-                .expect("use_fused only when mlp inputs are Dense");
-            let WeightTensor::Dense(o_proj_t) = &layer.o_proj else {
-                unreachable!("use_fused only when o_proj is Dense")
-            };
-            let WeightTensor::Dense(down_proj_t) = &layer.down_proj else {
-                unreachable!("use_fused only when down_proj is Dense")
-            };
+    match fused_mode {
+        FusedPathMode::Dense => {
+            for (li, layer) in weights.layers.iter().enumerate() {
+                let (q_proj_t, k_proj_t, v_proj_t) = layer
+                    .attention_inputs
+                    .fused_dense_parts()
+                    .expect("FusedPathMode::Dense only when attention inputs are Dense");
+                let (gate_proj_t, up_proj_t) = layer
+                    .mlp_inputs
+                    .fused_dense_parts()
+                    .expect("FusedPathMode::Dense only when mlp inputs are Dense");
+                let WeightTensor::Dense(o_proj_t) = &layer.o_proj else {
+                    unreachable!("FusedPathMode::Dense only when o_proj is Dense")
+                };
+                let WeightTensor::Dense(down_proj_t) = &layer.down_proj else {
+                    unreachable!("FusedPathMode::Dense only when down_proj is Dense")
+                };
 
-            x = fused_transformer_layer(
-                &x,
-                layer,
-                q_proj_t,
-                k_proj_t,
-                v_proj_t,
-                o_proj_t,
-                gate_proj_t,
-                up_proj_t,
-                down_proj_t,
-                &mut k_caches[li],
-                &mut v_caches[li],
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                attn_scale,
-                rope_base,
-                eps,
-                cache_len,
-                seq,
-            )?;
+                x = fused_transformer_layer(
+                    &x,
+                    layer,
+                    q_proj_t,
+                    k_proj_t,
+                    v_proj_t,
+                    o_proj_t,
+                    gate_proj_t,
+                    up_proj_t,
+                    down_proj_t,
+                    &mut k_caches[li],
+                    &mut v_caches[li],
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    attn_scale,
+                    rope_base,
+                    eps,
+                    cache_len,
+                    seq,
+                )?;
+            }
         }
-    } else {
-        for (li, layer) in weights.layers.iter().enumerate() {
-            x = rust_transformer_layer(
-                x, layer, li, k_caches, v_caches, seq, cache_len, n_heads, n_kv_heads, head_dim,
-                attn_scale, rope_base, eps,
-            )?;
+        FusedPathMode::Quantized => {
+            for (li, layer) in weights.layers.iter().enumerate() {
+                let (qkv_w, qkv_scales, qkv_biases, q_dim, k_dim, v_dim, group_size, bits) =
+                    layer.attention_inputs.fused_quantized_parts().expect(
+                        "FusedPathMode::Quantized only when attention inputs are MergedQuantized",
+                    );
+                let (gate_up_w, gate_up_scales, gate_up_biases, gate_dim, up_dim, gs2, b2) =
+                    layer.mlp_inputs.fused_quantized_parts().expect(
+                        "FusedPathMode::Quantized only when mlp inputs are MergedQuantized",
+                    );
+                debug_assert_eq!(group_size, gs2, "group_size mismatch between attn and mlp");
+                debug_assert_eq!(bits, b2, "bits mismatch between attn and mlp");
+                let (o_w, o_scales, o_biases, _, _) = layer
+                    .o_proj
+                    .quantized_parts()
+                    .expect("FusedPathMode::Quantized only when o_proj is Quantized");
+                let (down_w, down_scales, down_biases, _, _) = layer
+                    .down_proj
+                    .quantized_parts()
+                    .expect("FusedPathMode::Quantized only when down_proj is Quantized");
+
+                x = quantized_fused_transformer_layer(
+                    &x,
+                    layer,
+                    qkv_w,
+                    qkv_scales,
+                    qkv_biases,
+                    o_w,
+                    o_scales,
+                    o_biases,
+                    gate_up_w,
+                    gate_up_scales,
+                    gate_up_biases,
+                    down_w,
+                    down_scales,
+                    down_biases,
+                    group_size,
+                    bits,
+                    q_dim,
+                    k_dim,
+                    v_dim,
+                    gate_dim,
+                    up_dim,
+                    &mut k_caches[li],
+                    &mut v_caches[li],
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    attn_scale,
+                    rope_base,
+                    eps,
+                    cache_len,
+                    seq,
+                )?;
+            }
+        }
+        FusedPathMode::Fallback => {
+            for (li, layer) in weights.layers.iter().enumerate() {
+                x = rust_transformer_layer(
+                    x, layer, li, k_caches, v_caches, seq, cache_len, n_heads, n_kv_heads,
+                    head_dim, attn_scale, rope_base, eps,
+                )?;
+            }
         }
     }
 
@@ -945,7 +1148,142 @@ fn fused_transformer_layer(
     unreachable!("fused transformer path requires metal_fused_ops")
 }
 
-/// Single transformer layer — used as fallback for quantized models.
+/// Quantized fused transformer layer — single C++ FFI call for quantized models.
+///
+/// Mirrors `fused_transformer_layer` but uses `quantized_matmul` for all
+/// projections.  Requires merged QKV and gate+up projections.
+#[cfg(all(feature = "metal", metal_fused_ops))]
+#[allow(clippy::unnecessary_wraps)]
+#[allow(clippy::too_many_arguments)]
+fn quantized_fused_transformer_layer(
+    x: &Array,
+    layer: &MetalLayerWeights,
+    // Quantized QKV projection (merged)
+    qkv_w: &Array,
+    qkv_scales: &Array,
+    qkv_biases: &Array,
+    // Quantized output projection
+    o_w: &Array,
+    o_scales: &Array,
+    o_biases: &Array,
+    // Quantized gate+up projection (merged)
+    gate_up_w: &Array,
+    gate_up_scales: &Array,
+    gate_up_biases: &Array,
+    // Quantized down projection
+    down_w: &Array,
+    down_scales: &Array,
+    down_biases: &Array,
+    // Quantization parameters
+    group_size: i32,
+    bits: i32,
+    // Split dimensions
+    q_dim: i32,
+    k_dim: i32,
+    v_dim: i32,
+    gate_dim: i32,
+    up_dim: i32,
+    // KV cache
+    k_cache: &mut Array,
+    v_cache: &mut Array,
+    // Attention hyper-params
+    n_heads: i32,
+    n_kv_heads: i32,
+    head_dim: i32,
+    attn_scale: f32,
+    rope_base: f32,
+    eps: f32,
+    cache_len: i32,
+    seq: i32,
+) -> Result<Array> {
+    // SAFETY: metal_quantized_fused_block_cached borrows all inputs and writes a
+    // fresh array into `result_raw`, which is transferred to Rust ownership below.
+    let result_raw: mlx_sys::mlx_array = unsafe {
+        let mut r = std::mem::MaybeUninit::<mlx_sys::mlx_array>::uninit();
+        metal_ffi::metal_quantized_fused_block_cached(
+            x.as_ptr(),
+            layer.input_layernorm.as_ptr(),
+            layer.post_attention_layernorm.as_ptr(),
+            qkv_w.as_ptr(),
+            qkv_scales.as_ptr(),
+            qkv_biases.as_ptr(),
+            o_w.as_ptr(),
+            o_scales.as_ptr(),
+            o_biases.as_ptr(),
+            layer.q_norm.as_ptr(),
+            layer.k_norm.as_ptr(),
+            gate_up_w.as_ptr(),
+            gate_up_scales.as_ptr(),
+            gate_up_biases.as_ptr(),
+            down_w.as_ptr(),
+            down_scales.as_ptr(),
+            down_biases.as_ptr(),
+            group_size,
+            bits,
+            q_dim,
+            k_dim,
+            v_dim,
+            gate_dim,
+            up_dim,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            attn_scale,
+            rope_base,
+            head_dim, // rope_dims = head_dim
+            eps,
+            std::ptr::from_mut(k_cache).cast::<mlx_sys::mlx_array>(),
+            std::ptr::from_mut(v_cache).cast::<mlx_sys::mlx_array>(),
+            cache_len,
+            seq,
+            r.as_mut_ptr(),
+        );
+        r.assume_init()
+    };
+
+    // SAFETY: C++ heap-allocated array transferred to Rust ownership.
+    Ok(unsafe { Array::from_ptr(result_raw) })
+}
+
+#[cfg(all(feature = "metal", not(metal_fused_ops)))]
+#[allow(clippy::too_many_arguments)]
+fn quantized_fused_transformer_layer(
+    _x: &Array,
+    _layer: &MetalLayerWeights,
+    _qkv_w: &Array,
+    _qkv_scales: &Array,
+    _qkv_biases: &Array,
+    _o_w: &Array,
+    _o_scales: &Array,
+    _o_biases: &Array,
+    _gate_up_w: &Array,
+    _gate_up_scales: &Array,
+    _gate_up_biases: &Array,
+    _down_w: &Array,
+    _down_scales: &Array,
+    _down_biases: &Array,
+    _group_size: i32,
+    _bits: i32,
+    _q_dim: i32,
+    _k_dim: i32,
+    _v_dim: i32,
+    _gate_dim: i32,
+    _up_dim: i32,
+    _k_cache: &mut Array,
+    _v_cache: &mut Array,
+    _n_heads: i32,
+    _n_kv_heads: i32,
+    _head_dim: i32,
+    _attn_scale: f32,
+    _rope_base: f32,
+    _eps: f32,
+    _cache_len: i32,
+    _seq: i32,
+) -> Result<Array> {
+    unreachable!("quantized fused transformer path requires metal_fused_ops")
+}
+
+/// Single transformer layer — used as fallback when fused paths are unavailable.
 // GPU required
 #[cfg(feature = "metal")]
 #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
