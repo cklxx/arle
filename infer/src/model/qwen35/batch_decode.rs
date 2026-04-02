@@ -69,9 +69,13 @@ pub(crate) struct RecurrentBufs {
     pub(super) z_batch: HiddenStates,
     pub(super) b_batch: HiddenStates,
     pub(super) a_batch: HiddenStates,
-    pub(super) conv_state_ptrs_gpu: CudaSlice<u64>,
+    /// Per-layer GPU pointer arrays for conv1d state.
+    /// Pre-uploaded before decode body to enable future CUDA Graph capture.
+    pub(super) conv_state_ptrs_per_layer: Vec<CudaSlice<u64>>,
+    /// Per-layer GPU pointer arrays for GDR state.
+    pub(super) gdr_state_ptrs_per_layer: Vec<CudaSlice<u64>>,
+    /// Shared host staging buffer for pointer array uploads.
     pub(super) conv_state_ptrs_host: Vec<u64>,
-    pub(super) gdr_state_ptrs_gpu: CudaSlice<u64>,
     pub(super) gdr_state_ptrs_host: Vec<u64>,
     pub(super) qkv_conv_batch: HiddenStates,
     pub(super) gdr_out_batch: HiddenStates,
@@ -153,6 +157,7 @@ impl BatchDecodeBuffers35 {
         max_batch_size: usize,
         num_qheads: usize,
         max_total_pages: usize,
+        num_linear_layers: usize,
     ) -> Result<Self> {
         let common = CommonBufs {
             hidden_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
@@ -171,20 +176,31 @@ impl BatchDecodeBuffers35 {
             attn_output: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
         };
 
+        // Per-layer pointer arrays enable future CUDA Graph capture by moving
+        // all H2D pointer uploads before the graph-capturable section.
+        let mut conv_ptrs = Vec::with_capacity(num_linear_layers);
+        let mut gdr_ptrs = Vec::with_capacity(num_linear_layers);
+        for _ in 0..num_linear_layers {
+            conv_ptrs.push(
+                ctx.stream
+                    .alloc_zeros::<u64>(max_batch_size)
+                    .map_err(|e| anyhow::anyhow!("Alloc conv_state_ptrs_per_layer: {e}"))?,
+            );
+            gdr_ptrs.push(
+                ctx.stream
+                    .alloc_zeros::<u64>(max_batch_size)
+                    .map_err(|e| anyhow::anyhow!("Alloc gdr_state_ptrs_per_layer: {e}"))?,
+            );
+        }
+
         let recurrent = RecurrentBufs {
             qkv_batch: HiddenStates::zeros(ctx, qkv_dim, max_batch_size)?,
             z_batch: HiddenStates::zeros(ctx, z_dim, max_batch_size)?,
             b_batch: HiddenStates::zeros(ctx, b_dim, max_batch_size)?,
             a_batch: HiddenStates::zeros(ctx, b_dim, max_batch_size)?,
-            conv_state_ptrs_gpu: ctx
-                .stream
-                .alloc_zeros(max_batch_size)
-                .map_err(|e| anyhow::anyhow!("Alloc conv_state_ptrs: {e}"))?,
+            conv_state_ptrs_per_layer: conv_ptrs,
+            gdr_state_ptrs_per_layer: gdr_ptrs,
             conv_state_ptrs_host: vec![0u64; max_batch_size],
-            gdr_state_ptrs_gpu: ctx
-                .stream
-                .alloc_zeros(max_batch_size)
-                .map_err(|e| anyhow::anyhow!("Alloc gdr_state_ptrs: {e}"))?,
             gdr_state_ptrs_host: vec![0u64; max_batch_size],
             qkv_conv_batch: HiddenStates::zeros(ctx, qkv_dim, max_batch_size)?,
             gdr_out_batch: HiddenStates::zeros(ctx, z_dim, max_batch_size)?,
@@ -312,7 +328,47 @@ impl Qwen35Model {
             )?);
         }
 
-        // ── Forward pass: no CUDA graph (per-request recurrent state varies) ──
+        // ── Pre-upload all recurrent state pointer arrays ──
+        // Moving all H2D before the forward pass enables future CUDA Graph capture.
+        {
+            use cudarc::driver::DevicePtrMut;
+            let mut linear_idx = 0usize;
+            for layer in &self.layers {
+                if matches!(layer.attn, LayerKind::LinearAttention(_)) {
+                    for (b, &si) in slot_indices.iter().enumerate() {
+                        let layer_state =
+                            &mut states[si].recurrent_state.layers[linear_idx];
+                        let (conv_ptr, _) =
+                            layer_state.conv_state.data.device_ptr_mut(&self.ctx.stream);
+                        let (gdr_ptr, _) =
+                            layer_state.state.device_ptr_mut(&self.ctx.stream);
+                        bufs.recurrent.conv_state_ptrs_host[b] = conv_ptr as u64;
+                        bufs.recurrent.gdr_state_ptrs_host[b] = gdr_ptr as u64;
+                    }
+                    self.ctx
+                        .stream
+                        .memcpy_htod(
+                            &bufs.recurrent.conv_state_ptrs_host[..batch_size],
+                            &mut bufs.recurrent.conv_state_ptrs_per_layer[linear_idx],
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("H2D conv_state_ptrs layer {linear_idx}: {e}")
+                        })?;
+                    self.ctx
+                        .stream
+                        .memcpy_htod(
+                            &bufs.recurrent.gdr_state_ptrs_host[..batch_size],
+                            &mut bufs.recurrent.gdr_state_ptrs_per_layer[linear_idx],
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("H2D gdr_state_ptrs layer {linear_idx}: {e}")
+                        })?;
+                    linear_idx += 1;
+                }
+            }
+        }
+
+        // ── Forward pass ──
         self.decode_batch_body(bufs, states, slot_indices, paged_kv_pool, batch_size)?;
 
         // Scatter per-slot logits when needed (non-greedy fallback)
@@ -562,46 +618,15 @@ impl Qwen35Model {
             &mut bufs.recurrent.a_batch,
         );
 
-        // 3. Batched conv1d + GDR via pointer arrays (one kernel launch each)
-        //
-        // SAFETY: H2D pointer uploads must NOT be captured in CUDA Graph.
-        // Qwen3.5 batched decode currently runs eagerly (no graph capture)
-        // because pointer arrays change with batch composition each step.
+        // 3. Batched conv1d + GDR using pre-uploaded per-layer pointer arrays.
+        // H2D uploads were done in decode_batch() before this body runs.
         {
-            use cudarc::driver::DevicePtrMut;
-
-            // Build pointer arrays: collect per-request state device pointers.
-            // Must use device_ptr_mut since kernels write through these pointers.
-            for (b, &si) in slot_indices.iter().enumerate() {
-                let layer_state = &mut states[si].recurrent_state.layers[linear_idx];
-                let (conv_ptr, _) = layer_state.conv_state.data.device_ptr_mut(&self.ctx.stream);
-                let (gdr_ptr, _) = layer_state.state.device_ptr_mut(&self.ctx.stream);
-                bufs.recurrent.conv_state_ptrs_host[b] = conv_ptr as u64;
-                bufs.recurrent.gdr_state_ptrs_host[b] = gdr_ptr as u64;
-            }
-
-            // H2D upload pointer arrays
-            self.ctx
-                .stream
-                .memcpy_htod(
-                    &bufs.recurrent.conv_state_ptrs_host[..batch_size],
-                    &mut bufs.recurrent.conv_state_ptrs_gpu,
-                )
-                .map_err(|e| anyhow::anyhow!("H2D conv_state_ptrs: {e}"))?;
-            self.ctx
-                .stream
-                .memcpy_htod(
-                    &bufs.recurrent.gdr_state_ptrs_host[..batch_size],
-                    &mut bufs.recurrent.gdr_state_ptrs_gpu,
-                )
-                .map_err(|e| anyhow::anyhow!("H2D gdr_state_ptrs: {e}"))?;
-
             // Batched conv1d decode: one kernel launch for all B requests
             ops::conv1d_decode_batch_into(
                 &self.ctx,
                 &bufs.recurrent.qkv_batch,
                 &attn.conv1d_weight,
-                &mut bufs.recurrent.conv_state_ptrs_gpu,
+                &mut bufs.recurrent.conv_state_ptrs_per_layer[linear_idx],
                 &mut bufs.recurrent.qkv_conv_batch,
                 c.linear_conv_kernel_dim,
                 batch_size,
@@ -615,7 +640,7 @@ impl Qwen35Model {
                 &bufs.recurrent.a_batch,
                 &attn.dt_bias,
                 &attn.a_log,
-                &mut bufs.recurrent.gdr_state_ptrs_gpu,
+                &mut bufs.recurrent.gdr_state_ptrs_per_layer[linear_idx],
                 &mut bufs.recurrent.gdr_out_batch,
                 c.linear_num_key_heads,
                 c.linear_num_value_heads,
