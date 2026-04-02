@@ -29,6 +29,12 @@ pub struct SchedulerMetrics {
     pub total_tokens_prefilled: u64,
 }
 
+impl Default for SchedulerMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SchedulerMetrics {
     pub fn new() -> Self {
         Self {

@@ -88,16 +88,20 @@ async fn main() {
     info!("=== Infer Server - {} (GPU) ===", model_type);
     info!("Loading model...");
     let start = Instant::now();
-    let num_slots = args.num_slots.unwrap_or_else(|| {
-        auto_num_slots(model_path, args.max_seq_len)
-    });
+    let num_slots = args
+        .num_slots
+        .unwrap_or_else(|| auto_num_slots(model_path, args.max_seq_len));
 
     info!(
         "Config: model_path={}, cuda_graph={}, num_slots={} ({})",
         args.model_path.display(),
         args.cuda_graph,
         num_slots,
-        if args.num_slots.is_some() { "explicit" } else { "auto" },
+        if args.num_slots.is_some() {
+            "explicit"
+        } else {
+            "auto"
+        },
     );
 
     let runtime = ServerRuntimeConfig {
@@ -180,11 +184,7 @@ fn auto_num_slots(model_path: &str, max_seq_len: Option<usize>) -> usize {
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .is_some_and(|ext| ext == "safetensors")
-                })
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
                 .filter_map(|e| e.metadata().ok().map(|m| m.len()))
                 .sum()
         })
@@ -259,7 +259,9 @@ fn estimate_per_slot_bytes(model_path: &str, seq_len: usize) -> usize {
     let head_dim = config["head_dim"].as_u64().unwrap_or(128) as usize;
 
     // Check if hybrid model (Qwen3.5): only full-attention layers use KV cache
-    let num_full_attn = config["num_full_attention_layers"].as_u64().unwrap_or(num_layers as u64) as usize;
+    let num_full_attn = config["num_full_attention_layers"]
+        .as_u64()
+        .unwrap_or(num_layers as u64) as usize;
     let kv_layers = num_full_attn.min(num_layers);
 
     // Per-slot contiguous KV: 2 (K+V) * kv_layers * num_kv_heads * head_dim * 2 (bf16) * seq_len
@@ -273,7 +275,8 @@ fn estimate_per_slot_bytes(model_path: &str, seq_len: usize) -> usize {
     let linear_key_dim = config["linear_key_head_dim"].as_u64().unwrap_or(128) as usize;
     let linear_val_dim = config["linear_value_head_dim"].as_u64().unwrap_or(128) as usize;
     let linear_val_heads = config["linear_num_value_heads"].as_u64().unwrap_or(32) as usize;
-    let recurrent_bytes = num_linear_layers * linear_val_heads * linear_key_dim * linear_val_dim * 4; // f32
+    let recurrent_bytes =
+        num_linear_layers * linear_val_heads * linear_key_dim * linear_val_dim * 4; // f32
 
     kv_bytes + recurrent_bytes
 }

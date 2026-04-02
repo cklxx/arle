@@ -539,7 +539,7 @@ impl MetalBackend {
         &self,
         input_ids: &[u32],
         params: &SamplingParams,
-        mut on_token: F,
+        on_token: F,
     ) -> Result<GenerateResult>
     where
         F: FnMut(u32) -> Result<()>,
