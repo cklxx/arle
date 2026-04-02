@@ -757,6 +757,18 @@ fn metal_generate(
         FusedPathMode::Fallback
     };
 
+    // TODO: Replace contiguous KV cache with MetalKVPool
+    // Current: slice_update to [1, n_kv_heads, max_seq, head_dim] per layer
+    // Paged: write_kv to pool, gather_kv before attention
+    // This enables multi-sequence support when wired to a scheduler
+    //
+    // Integration sketch:
+    //   let pool = MetalKVPool::new(n_layers, n_kv_heads, head_dim, max_tokens, kv_dtype)?;
+    //   pool.alloc_tokens(request_id, seq_len)?;
+    //   pool.write_kv(layer, request_id, &k_new, &v_new)?;
+    //   let (k_full, v_full) = pool.gather_kv(layer, request_id)?;
+    //   fast::scaled_dot_product_attention(&q, &k_full, &v_full, scale, mask);
+
     // P5: KV cache starts at the next 256-token boundary above the prefill length,
     // plus one chunk for initial decode steps.  Grown lazily in KV_CACHE_CHUNK steps.
     let prefill_len = input_ids.len() as i32;
