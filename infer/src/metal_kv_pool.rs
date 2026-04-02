@@ -21,6 +21,7 @@
 #[cfg(feature = "metal")]
 use std::collections::HashMap;
 
+#[cfg(feature = "metal")]
 use anyhow::{Result, anyhow};
 
 #[cfg(feature = "metal")]
