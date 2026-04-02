@@ -25,20 +25,11 @@ impl Qwen35Model {
         kv_cache.init_if_needed(&self.ctx, c.head_dim)?;
 
         // Get embeddings for all tokens
-        let token_ids_i32: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
-        let token_ids_gpu = self
-            .ctx
-            .stream
-            .clone_htod(&token_ids_i32)
-            .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
-
-        let hidden_dim = c.hidden_size;
-        let mut hidden_batch = HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?;
-        ops::embedding_batch(
+        let mut hidden_batch = crate::model::common::get_embeddings_batch(
             &self.ctx,
             &self.embed_tokens,
-            &token_ids_gpu,
-            &mut hidden_batch,
+            token_ids,
+            c.hidden_size,
         )?;
 
         // Process layers
@@ -63,24 +54,15 @@ impl Qwen35Model {
         kv_cache.advance_seq_len(seq_len);
         recurrent.seq_len += seq_len;
 
-        // Extract last token's hidden state
-        let last_hidden = ops::extract_vec(&self.ctx, &hidden_batch, seq_len - 1)?;
-
-        // Final norm (1+weight offset)
-        let normed = {
-            let mut out = DeviceVec::zeros(&self.ctx, hidden_dim)?;
-            ops::rms_norm_offset_into(
-                &self.ctx,
-                &last_hidden,
-                &self.norm,
-                c.rms_norm_eps,
-                &mut out,
-            )?;
-            out
-        };
-
-        // LM head (tied embeddings)
-        ops::linear(&self.ctx, &normed, &self.embed_tokens)
+        // Final norm (1+weight offset) + LM head (tied embeddings)
+        crate::model::common::compute_logits_batch(
+            &self.ctx,
+            &hidden_batch,
+            &self.norm,
+            &self.embed_tokens,
+            c.rms_norm_eps,
+            true, // offset RMSNorm (1+weight)
+        )
     }
 
     /// Process one layer during prefill. Returns updated hidden_batch.

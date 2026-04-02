@@ -7,6 +7,7 @@ use crate::paged_kv::{PagedKVPool, TokenKVPool};
 use crate::sampler::SamplingParams;
 use crate::tensor::{DeviceContext, DeviceVec};
 
+pub(crate) mod common;
 pub(crate) mod cuda_graph;
 pub(crate) mod generation_state;
 mod kv_cache;
