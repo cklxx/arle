@@ -165,9 +165,9 @@ fn auto_num_slots(model_path: &str, max_seq_len: Option<usize>) -> usize {
     use std::path::Path;
 
     const DEFAULT_SEQ_LEN: usize = 4096;
-    const RESERVED_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GB headroom
+    const RESERVED_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4 GB headroom (paged pool + overhead)
     const MIN_SLOTS: usize = 4;
-    const MAX_SLOTS: usize = 128;
+    const MAX_SLOTS: usize = 64;
 
     let seq_len = max_seq_len.unwrap_or(DEFAULT_SEQ_LEN);
 
@@ -186,6 +186,16 @@ fn auto_num_slots(model_path: &str, max_seq_len: Option<usize>) -> usize {
                 .sum()
         })
         .unwrap_or(0);
+
+    // Ensure CUDA context is initialized before querying memory.
+    // DeviceContext::new() creates the cudarc CudaDevice which inits CUDA.
+    let _ctx = match DeviceContext::new() {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            info!("auto_num_slots: CUDA init failed, using default 8 slots");
+            return 8;
+        }
+    };
 
     let (free_bytes, _total) = match DeviceContext::gpu_memory_info() {
         Ok(info) => info,
@@ -249,8 +259,11 @@ fn estimate_per_slot_bytes(model_path: &str, seq_len: usize) -> usize {
     let num_full_attn = config["num_full_attention_layers"].as_u64().unwrap_or(num_layers as u64) as usize;
     let kv_layers = num_full_attn.min(num_layers);
 
-    // KV cache: 2 (K+V) * kv_layers * num_kv_heads * head_dim * 2 (bf16) * seq_len
+    // Per-slot contiguous KV: 2 (K+V) * kv_layers * num_kv_heads * head_dim * 2 (bf16) * seq_len
+    // This is pre-allocated by the scheduler for each slot.
     let kv_bytes = 2 * kv_layers * num_kv_heads * head_dim * 2 * seq_len;
+    // Also account for paged KV pool share (roughly 1x contiguous cost per slot)
+    let kv_bytes = kv_bytes * 2;
 
     // Recurrent state (if hybrid): per linear layer, fixed size independent of seq_len
     let num_linear_layers = num_layers.saturating_sub(kv_layers);
