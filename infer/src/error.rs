@@ -75,7 +75,9 @@ impl IntoResponse for ApiError {
         let wrapper = ErrorWrapper {
             error: &self.body,
         };
-        let body = serde_json::to_string(&wrapper).expect("ApiError serialization");
+        let body = serde_json::to_string(&wrapper).unwrap_or_else(|_| {
+            r#"{"error":{"message":"Internal error","type":"server_error","code":"serialization_failed"}}"#.to_string()
+        });
         (
             self.status,
             [(

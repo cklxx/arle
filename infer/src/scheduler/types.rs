@@ -81,6 +81,15 @@ impl SchedulerConfig {
         if self.prefill_chunk_size == 0 {
             anyhow::bail!("prefill_chunk_size must be ≥ 1");
         }
+        if self.decode_active_prefill_cap == 0 {
+            anyhow::bail!("decode_active_prefill_cap must be ≥ 1");
+        }
+        if self.min_seq_len == 0 {
+            anyhow::bail!("min_seq_len must be ≥ 1");
+        }
+        if self.min_seq_len > 32768 {
+            anyhow::bail!("min_seq_len must be ≤ 32768");
+        }
         Ok(())
     }
 }

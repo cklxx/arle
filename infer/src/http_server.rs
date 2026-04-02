@@ -193,9 +193,9 @@ fn submit_request(
 
     if let Err(e) = handle.submit(incoming) {
         error!("Scheduler unavailable or full: {e}");
-        return Err(ApiError::service_unavailable(format!(
-            "Scheduler unavailable: {e}"
-        )));
+        return Err(ApiError::service_unavailable(
+            "Server is at capacity, please retry later",
+        ));
     }
 
     Ok(delta_rx)
