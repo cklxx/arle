@@ -702,6 +702,21 @@ fn find_mlx_include_dirs() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     None
 }
 
+fn find_mlx_include_dirs_with_retry() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    const RETRY_DELAYS_MS: [u64; 5] = [0, 200, 500, 1000, 2000];
+
+    for delay_ms in RETRY_DELAYS_MS {
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        if let Some(paths) = find_mlx_include_dirs() {
+            return Some(paths);
+        }
+    }
+
+    None
+}
+
 /// Returns `true` when `xcrun metal` is available (Xcode / CLT installed on macOS).
 fn xcrun_metal_available() -> bool {
     Command::new("xcrun")
@@ -798,7 +813,7 @@ fn main() {
         let can_build = force_source || xcrun_metal_available();
 
         if can_build {
-            match find_mlx_include_dirs() {
+            match find_mlx_include_dirs_with_retry() {
                 Some((cpp_hdr, c_hdr)) => {
                     let mut build = cc::Build::new();
                     build

@@ -91,26 +91,6 @@ mod metal_ffi {
             result_out: *mut mlx_array,
         );
 
-        /// Schedule async GPU evaluation of `arr` without blocking the CPU.
-        pub(super) fn metal_async_eval(arr: mlx_array);
-
-        /// GPU argmax over last axis of `logits`.  Returns scalar int32 array.
-        pub(super) fn metal_argmax(logits: mlx_array) -> mlx_array;
-
-        /// GPU categorical sample from temperature-scaled logits.  Returns scalar int32 array.
-        pub(super) fn metal_categorical_sample(scaled_logits: mlx_array) -> mlx_array;
-
-        /// Release accumulated temporary Metal buffer allocations from MLX's cache (P5).
-        pub(super) fn metal_clear_cache();
-
-        /// Grow KV cache from [1, n_kv, old_cap, head_dim] to [1, n_kv, new_cap, head_dim]
-        /// by appending zeros along axis 2 (P5 chunked KV).
-        pub(super) fn metal_kv_extend(
-            cache: *mut mlx_array,
-            n_kv_heads: i32,
-            head_dim: i32,
-            new_cap: i32,
-        );
     }
 }
 
@@ -218,6 +198,25 @@ impl WeightTensor {
                 .first()
                 .copied()
                 .context("quantized projection missing output dimension"),
+        }
+    }
+
+    fn dense_array(&self) -> Option<&Array> {
+        match self {
+            Self::Dense(w_t) => Some(w_t),
+            Self::Quantized { .. } => None,
+        }
+    }
+
+}
+
+#[cfg(feature = "metal")]
+impl WeightTensor {
+    #[inline]
+    fn dense_array(&self) -> Option<&Array> {
+        match self {
+            Self::Dense(w_t) => Some(w_t),
+            Self::Quantized { .. } => None,
         }
     }
 }
@@ -635,6 +634,8 @@ fn metal_generate(
         && weights.layers.iter().all(|layer| {
             layer.attention_inputs.fused_dense_parts().is_some()
                 && layer.mlp_inputs.fused_dense_parts().is_some()
+                && layer.o_proj.dense_array().is_some()
+                && layer.down_proj.dense_array().is_some()
         });
 
     // P5: KV cache starts at the next 256-token boundary above the prefill length,
@@ -763,50 +764,17 @@ fn metal_generate(
     })
 }
 
-#[cfg(all(feature = "metal", metal_fused_ops))]
-#[allow(clippy::unnecessary_wraps)]
-fn metal_async_eval(arr: &Array) -> Result<()> {
-    // SAFETY: `arr` is a valid lazy MLX array; the fused shim only borrows it.
-    unsafe {
-        metal_ffi::metal_async_eval(arr.as_ptr());
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "metal", not(metal_fused_ops)))]
+#[cfg(feature = "metal")]
 fn metal_async_eval(arr: &Array) -> Result<()> {
     mlx_rs::transforms::async_eval([arr]).context("mlx async_eval")
 }
 
-#[cfg(all(feature = "metal", metal_fused_ops))]
-fn clear_metal_cache() {
-    // SAFETY: pure cache management; no Array handles are invalidated.
-    unsafe {
-        metal_ffi::metal_clear_cache();
-    }
-}
-
-#[cfg(all(feature = "metal", not(metal_fused_ops)))]
+#[cfg(feature = "metal")]
 fn clear_metal_cache() {
     mlx_rs::transforms::compile::clear_cache();
 }
 
-#[cfg(all(feature = "metal", metal_fused_ops))]
-#[allow(clippy::unnecessary_wraps)]
-fn extend_kv_cache(cache: &mut Array, n_kv_heads: i32, head_dim: i32, new_cap: i32) -> Result<()> {
-    // SAFETY: metal_kv_extend replaces the Array ctx pointer in-place.
-    unsafe {
-        metal_ffi::metal_kv_extend(
-            std::ptr::from_mut(cache).cast::<mlx_sys::mlx_array>(),
-            n_kv_heads,
-            head_dim,
-            new_cap,
-        );
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "metal", not(metal_fused_ops)))]
+#[cfg(feature = "metal")]
 fn extend_kv_cache(cache: &mut Array, n_kv_heads: i32, head_dim: i32, new_cap: i32) -> Result<()> {
     use mlx_rs::{StreamOrDevice, ops::concatenate_axis, ops::zeros_dtype_device};
 
@@ -844,7 +812,7 @@ fn build_forward_graph(
     attn_scale: f32,
     rope_base: f32,
     eps: f32,
-    use_fused: bool,
+    fused_mode: Option<FusedMode>,
     params: &SamplingParams,
 ) -> Result<Array> {
     use mlx_rs::{fast, ops::indexing::take_axis};
@@ -857,54 +825,101 @@ fn build_forward_graph(
     let mut x = take_axis(&weights.embed_tokens, &idx_arr, 0).context("embedding take_axis")?;
 
     // ── Transformer layers ────────────────────────────────────────────────────
-    if use_fused {
-        // P2 + P7: one C++ FFI call per layer; all intermediate Arrays are C++-scoped.
-        // Rust only holds the layer input (x) and output (x_next) Array handles.
-        for (li, layer) in weights.layers.iter().enumerate() {
-            let (q_proj_t, k_proj_t, v_proj_t) = layer
-                .attention_inputs
-                .fused_dense_parts()
-                .expect("use_fused only when attention inputs are Dense");
-            let (gate_proj_t, up_proj_t) = layer
-                .mlp_inputs
-                .fused_dense_parts()
-                .expect("use_fused only when mlp inputs are Dense");
-            let WeightTensor::Dense(o_proj_t) = &layer.o_proj else {
-                unreachable!("use_fused only when o_proj is Dense")
-            };
-            let WeightTensor::Dense(down_proj_t) = &layer.down_proj else {
-                unreachable!("use_fused only when down_proj is Dense")
-            };
+    match fused_mode {
+        Some(FusedMode::Dense) => {
+            // One C++ FFI call per layer; all intermediate Arrays are C++-scoped.
+            for (li, layer) in weights.layers.iter().enumerate() {
+                let (q_proj_t, k_proj_t, v_proj_t) = layer
+                    .attention_inputs
+                    .fused_dense_parts()
+                    .expect("dense fused mode requires dense attention inputs");
+                let (gate_proj_t, up_proj_t) = layer
+                    .mlp_inputs
+                    .fused_dense_parts()
+                    .expect("dense fused mode requires dense mlp inputs");
+                let o_proj_t = layer
+                    .o_proj
+                    .dense_array()
+                    .expect("dense fused mode requires dense o_proj");
+                let down_proj_t = layer
+                    .down_proj
+                    .dense_array()
+                    .expect("dense fused mode requires dense down_proj");
 
-            x = fused_transformer_layer(
-                &x,
-                layer,
-                q_proj_t,
-                k_proj_t,
-                v_proj_t,
-                o_proj_t,
-                gate_proj_t,
-                up_proj_t,
-                down_proj_t,
-                &mut k_caches[li],
-                &mut v_caches[li],
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                attn_scale,
-                rope_base,
-                eps,
-                cache_len,
-                seq,
-            )?;
+                x = fused_transformer_layer(
+                    &x,
+                    layer,
+                    q_proj_t,
+                    k_proj_t,
+                    v_proj_t,
+                    o_proj_t,
+                    gate_proj_t,
+                    up_proj_t,
+                    down_proj_t,
+                    &mut k_caches[li],
+                    &mut v_caches[li],
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    attn_scale,
+                    rope_base,
+                    eps,
+                    cache_len,
+                    seq,
+                )?;
+            }
         }
-    } else {
-        // Fallback: Rust-level layer loop (quantized models).
-        for (li, layer) in weights.layers.iter().enumerate() {
-            x = rust_transformer_layer(
-                x, layer, li, k_caches, v_caches, seq, cache_len, n_heads, n_kv_heads, head_dim,
-                attn_scale, rope_base, eps,
-            )?;
+        Some(FusedMode::Quantized) => {
+            for (li, layer) in weights.layers.iter().enumerate() {
+                let (qkv_proj, q_dim, k_dim, v_dim) = layer
+                    .attention_inputs
+                    .fused_quantized_parts()
+                    .expect("quantized fused mode requires merged qkv");
+                let (gate_up_proj, gate_dim, up_dim) = layer
+                    .mlp_inputs
+                    .fused_quantized_parts()
+                    .expect("quantized fused mode requires merged gate_up");
+                let o_proj = layer
+                    .o_proj
+                    .quantized_parts()
+                    .expect("quantized fused mode requires quantized o_proj");
+                let down_proj = layer
+                    .down_proj
+                    .quantized_parts()
+                    .expect("quantized fused mode requires quantized down_proj");
+
+                x = fused_transformer_layer_quantized(
+                    &x,
+                    layer,
+                    qkv_proj,
+                    q_dim,
+                    k_dim,
+                    v_dim,
+                    o_proj,
+                    gate_up_proj,
+                    gate_dim,
+                    up_dim,
+                    down_proj,
+                    &mut k_caches[li],
+                    &mut v_caches[li],
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    attn_scale,
+                    rope_base,
+                    eps,
+                    cache_len,
+                    seq,
+                )?;
+            }
+        }
+        None => {
+            for (li, layer) in weights.layers.iter().enumerate() {
+                x = rust_transformer_layer(
+                    x, layer, li, k_caches, v_caches, seq, cache_len, n_heads, n_kv_heads,
+                    head_dim, attn_scale, rope_base, eps,
+                )?;
+            }
         }
     }
 
@@ -979,6 +994,84 @@ fn fused_transformer_layer(
     Ok(unsafe { Array::from_ptr(result_raw) })
 }
 
+#[cfg(all(feature = "metal", metal_fused_ops))]
+#[allow(clippy::unnecessary_wraps, clippy::too_many_arguments)]
+fn fused_transformer_layer_quantized(
+    x: &Array,
+    layer: &MetalLayerWeights,
+    qkv_proj: QuantizedWeightRef<'_>,
+    q_dim: i32,
+    k_dim: i32,
+    v_dim: i32,
+    o_proj: QuantizedWeightRef<'_>,
+    gate_up_proj: QuantizedWeightRef<'_>,
+    gate_dim: i32,
+    up_dim: i32,
+    down_proj: QuantizedWeightRef<'_>,
+    k_cache: &mut Array,
+    v_cache: &mut Array,
+    n_heads: i32,
+    n_kv_heads: i32,
+    head_dim: i32,
+    attn_scale: f32,
+    rope_base: f32,
+    eps: f32,
+    cache_len: i32,
+    seq: i32,
+) -> Result<Array> {
+    debug_assert_eq!(qkv_proj.group_size, o_proj.group_size);
+    debug_assert_eq!(qkv_proj.group_size, gate_up_proj.group_size);
+    debug_assert_eq!(qkv_proj.group_size, down_proj.group_size);
+    debug_assert_eq!(qkv_proj.bits, o_proj.bits);
+    debug_assert_eq!(qkv_proj.bits, gate_up_proj.bits);
+    debug_assert_eq!(qkv_proj.bits, down_proj.bits);
+
+    let result_raw: mlx_sys::mlx_array = unsafe {
+        let mut r = std::mem::MaybeUninit::<mlx_sys::mlx_array>::uninit();
+        metal_ffi::metal_fused_block_cached_quantized(
+            x.as_ptr(),
+            layer.input_layernorm.as_ptr(),
+            layer.post_attention_layernorm.as_ptr(),
+            qkv_proj.w.as_ptr(),
+            qkv_proj.scales.as_ptr(),
+            qkv_proj.biases.as_ptr(),
+            q_dim,
+            k_dim,
+            v_dim,
+            o_proj.w.as_ptr(),
+            o_proj.scales.as_ptr(),
+            o_proj.biases.as_ptr(),
+            layer.q_norm.as_ptr(),
+            layer.k_norm.as_ptr(),
+            gate_up_proj.w.as_ptr(),
+            gate_up_proj.scales.as_ptr(),
+            gate_up_proj.biases.as_ptr(),
+            gate_dim,
+            up_dim,
+            down_proj.w.as_ptr(),
+            down_proj.scales.as_ptr(),
+            down_proj.biases.as_ptr(),
+            qkv_proj.group_size,
+            qkv_proj.bits,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            attn_scale,
+            rope_base,
+            head_dim,
+            eps,
+            std::ptr::from_mut(k_cache).cast::<mlx_sys::mlx_array>(),
+            std::ptr::from_mut(v_cache).cast::<mlx_sys::mlx_array>(),
+            cache_len,
+            seq,
+            r.as_mut_ptr(),
+        );
+        r.assume_init()
+    };
+
+    Ok(unsafe { Array::from_ptr(result_raw) })
+}
+
 #[cfg(all(feature = "metal", not(metal_fused_ops)))]
 #[allow(clippy::too_many_arguments)]
 fn fused_transformer_layer(
@@ -1003,6 +1096,34 @@ fn fused_transformer_layer(
     _seq: i32,
 ) -> Result<Array> {
     unreachable!("fused transformer path requires metal_fused_ops")
+}
+
+#[cfg(all(feature = "metal", not(metal_fused_ops)))]
+#[allow(clippy::too_many_arguments)]
+fn fused_transformer_layer_quantized(
+    _x: &Array,
+    _layer: &MetalLayerWeights,
+    _qkv_proj: QuantizedWeightRef<'_>,
+    _q_dim: i32,
+    _k_dim: i32,
+    _v_dim: i32,
+    _o_proj: QuantizedWeightRef<'_>,
+    _gate_up_proj: QuantizedWeightRef<'_>,
+    _gate_dim: i32,
+    _up_dim: i32,
+    _down_proj: QuantizedWeightRef<'_>,
+    _k_cache: &mut Array,
+    _v_cache: &mut Array,
+    _n_heads: i32,
+    _n_kv_heads: i32,
+    _head_dim: i32,
+    _attn_scale: f32,
+    _rope_base: f32,
+    _eps: f32,
+    _cache_len: i32,
+    _seq: i32,
+) -> Result<Array> {
+    unreachable!("quantized fused transformer path requires metal_fused_ops")
 }
 
 /// Single transformer layer — used as fallback for quantized models.
@@ -1038,25 +1159,26 @@ fn rust_transformer_layer(
     // 2. QKV projections
     let (q_raw, k_raw, v_raw) = layer.attention_inputs.project(&x)?;
 
-    // 3. Per-head QK norm
-    let q_raw = apply_head_norm(&q_raw, seq, n_heads, head_dim, &layer.q_norm, eps)?;
-    let k_raw = apply_head_norm(&k_raw, seq, n_kv_heads, head_dim, &layer.k_norm, eps)?;
-
-    // 4. Reshape to [1, seq, n_heads, head_dim] for RoPE
+    // 3+4+5+6. Reshape → per-head norm → transpose → RoPE.
+    //
+    // fast::rope expects (B, *, T, D) where T is the second-to-last dim (sequence axis).
+    // Transpose to [1, n_heads, seq, d] BEFORE rope so T = seq (correct positions).
+    // Previous order (rope on [1, seq, n_heads, d]) used T = n_heads — wrong semantics.
+    // This also removes 2 extra reshapes per q/k vs the old apply_head_norm path.
     let q = reshape(&q_raw, &[1, seq, n_heads, head_dim]).context("reshape q")?;
-    let k = reshape(&k_raw, &[1, seq, n_kv_heads, head_dim]).context("reshape k")?;
-    let v = reshape(&v_raw, &[1, seq, n_kv_heads, head_dim]).context("reshape v")?;
-
-    // 5. RoPE
+    let q = fast::rms_norm(&q, &layer.q_norm, eps).context("q_norm")?;
+    let q = transpose_axes(&q, &[0, 2, 1, 3]).context("transpose q")?; // [1, n_heads, seq, d]
     let q =
         fast::rope(&q, head_dim, false, rope_base, 1.0f32, cache_len, None).context("rope q")?;
+
+    let k = reshape(&k_raw, &[1, seq, n_kv_heads, head_dim]).context("reshape k")?;
+    let k = fast::rms_norm(&k, &layer.k_norm, eps).context("k_norm")?;
+    let k = transpose_axes(&k, &[0, 2, 1, 3]).context("transpose k")?; // [1, n_kv, seq, d]
     let k =
         fast::rope(&k, head_dim, false, rope_base, 1.0f32, cache_len, None).context("rope k")?;
 
-    // 6. Transpose to [1, n_heads, seq, head_dim]
-    let q = transpose_axes(&q, &[0, 2, 1, 3]).context("transpose q")?;
-    let k = transpose_axes(&k, &[0, 2, 1, 3]).context("transpose k")?;
-    let v = transpose_axes(&v, &[0, 2, 1, 3]).context("transpose v")?;
+    let v = reshape(&v_raw, &[1, seq, n_kv_heads, head_dim]).context("reshape v")?;
+    let v = transpose_axes(&v, &[0, 2, 1, 3]).context("transpose v")?; // [1, n_kv, seq, d]
 
     // 7. KV cache update
     let end_pos = cache_len + seq;
@@ -1119,26 +1241,12 @@ fn gpu_sample_token(logits: &Array, params: &SamplingParams) -> Result<Array> {
     categorical_sample_token(&scaled)
 }
 
-#[cfg(all(feature = "metal", metal_fused_ops))]
-#[allow(clippy::unnecessary_wraps)]
-fn greedy_sample_token(logits: &Array) -> Result<Array> {
-    // SAFETY: metal_argmax returns a newly allocated array we own.
-    Ok(unsafe { Array::from_ptr(metal_ffi::metal_argmax(logits.as_ptr())) })
-}
-
-#[cfg(all(feature = "metal", not(metal_fused_ops)))]
+#[cfg(feature = "metal")]
 fn greedy_sample_token(logits: &Array) -> Result<Array> {
     mlx_rs::ops::indexing::argmax(logits, None).context("mlx argmax")
 }
 
-#[cfg(all(feature = "metal", metal_fused_ops))]
-#[allow(clippy::unnecessary_wraps)]
-fn categorical_sample_token(logits: &Array) -> Result<Array> {
-    // SAFETY: metal_categorical_sample returns a newly allocated array we own.
-    Ok(unsafe { Array::from_ptr(metal_ffi::metal_categorical_sample(logits.as_ptr())) })
-}
-
-#[cfg(all(feature = "metal", not(metal_fused_ops)))]
+#[cfg(feature = "metal")]
 fn categorical_sample_token(logits: &Array) -> Result<Array> {
     mlx_rs::random::categorical(logits, None, None, None::<&Array>).context("mlx categorical")
 }
@@ -1175,22 +1283,6 @@ fn linear(x: &Array, weight: &WeightTensor) -> Result<Array> {
             .context("quantized_matmul")
         }
     }
-}
-
-/// Reshape `x` to [seq, n_heads, head_dim], apply RMS-norm, reshape back.
-#[cfg(feature = "metal")]
-fn apply_head_norm(
-    x: &Array,
-    seq: i32,
-    n_heads: i32,
-    head_dim: i32,
-    norm_weight: &Array,
-    eps: f32,
-) -> Result<Array> {
-    use mlx_rs::{fast, ops::reshape};
-    let x3 = reshape(x, &[seq, n_heads, head_dim]).context("reshape for head_norm")?;
-    let x3 = fast::rms_norm(&x3, norm_weight, eps).context("head rms_norm")?;
-    reshape(&x3, &[seq, n_heads * head_dim]).context("reshape after head_norm")
 }
 
 #[cfg(feature = "metal")]
