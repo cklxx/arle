@@ -52,6 +52,14 @@ SWEEP_CONFIGS = [
     # Concurrency sweep (short context)
     (128,  128,  2),
     (128,  128,  4),
+    # High concurrency sweep
+    (128,  256,  8),
+    (512,  256,  8),
+    (128,  256, 16),
+    (512,  256, 16),
+    (128,  256, 32),
+    (512,  256, 32),
+    (128,  256, 64),
 ]
 
 QUICK_CONFIGS = [
@@ -241,7 +249,8 @@ async def main():
 
         results = []
         for input_len, output_len, conc in configs:
-            r = await run_config(client, args.url, input_len, output_len, conc, args.requests)
+            num_req = max(args.requests, conc * 2)
+            r = await run_config(client, args.url, input_len, output_len, conc, num_req)
             results.append(r)
 
             print(

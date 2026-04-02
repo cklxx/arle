@@ -54,7 +54,7 @@ impl Default for SchedulerConfig {
             decode_active_prefill_cap: 512,
             gpu_reserved_bytes: 512 * 1024 * 1024,
             min_seq_len: 256,
-            kv_pool_headroom_bytes: 2 * 1024 * 1024 * 1024,
+            kv_pool_headroom_bytes: 4 * 1024 * 1024 * 1024,
             kv_pool_fallback_bytes: 4 * 1024 * 1024 * 1024,
         }
     }
@@ -163,6 +163,21 @@ impl SchedulerHandle {
             tx,
             model_id: Arc::from(model_id),
             waiting_count: Arc::new(AtomicUsize::new(0)),
+            max_waiting,
+        }
+    }
+
+    /// Create a handle that shares its waiting count with the scheduler.
+    pub fn with_shared_waiting_count(
+        tx: mpsc::UnboundedSender<IncomingRequest>,
+        model_id: &str,
+        max_waiting: usize,
+        waiting_count: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            tx,
+            model_id: Arc::from(model_id),
+            waiting_count,
             max_waiting,
         }
     }

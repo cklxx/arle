@@ -155,7 +155,12 @@ impl<M: ModelForward> Scheduler<M> {
             total_generated_tokens: 0,
         };
 
-        let handle = SchedulerHandle::with_max_waiting(tx, model_id, config.max_waiting_requests);
+        let handle = SchedulerHandle::with_shared_waiting_count(
+            tx,
+            model_id,
+            config.max_waiting_requests,
+            Arc::clone(&waiting_count),
+        );
         debug_assert_eq!(handle.waiting_count(), 0);
 
         Ok((scheduler, handle))
@@ -310,8 +315,8 @@ impl<M: ModelForward> Scheduler<M> {
         );
     }
 
-    /// Generate SGLang-style batch size schedule for CUDA Graph warmup.
-    /// Pattern: 1, 2, 4, 8, 12, 16, 24, 32, 40, 48, ..., max_bs
+    /// Generate batch size schedule for CUDA Graph warmup.
+    /// Pattern: 1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 96, 128, ..., max_bs
     fn cuda_graph_batch_sizes(max_bs: usize) -> Vec<usize> {
         let mut sizes = Vec::new();
         // Small sizes: 1, 2, 4, 8
@@ -320,11 +325,17 @@ impl<M: ModelForward> Scheduler<M> {
                 sizes.push(bs);
             }
         }
-        // From 12 onward, step by 8
+        // From 12 to 32, step by 4 (covers common concurrency levels)
         let mut bs = 12;
+        while bs <= 32.min(max_bs) {
+            sizes.push(bs);
+            bs += 4;
+        }
+        // From 48 onward, step by 16
+        bs = 48;
         while bs <= max_bs {
             sizes.push(bs);
-            bs += 8;
+            bs += 16;
         }
         // Ensure max_bs itself is included
         if sizes.last() != Some(&max_bs) && max_bs > 8 {
