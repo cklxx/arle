@@ -165,9 +165,11 @@ fn auto_num_slots(model_path: &str, max_seq_len: Option<usize>) -> usize {
     use std::path::Path;
 
     const DEFAULT_SEQ_LEN: usize = 4096;
-    const RESERVED_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4 GB headroom (paged pool + overhead)
+    // Reserve memory for: BatchDecodeBuffers (~500MB), FlashInfer workspace (256MB),
+    // CUDA Graph captures (~200MB), paged KV pool overhead, and safety margin.
+    const RESERVED_BYTES: usize = 6 * 1024 * 1024 * 1024; // 6 GB headroom
     const MIN_SLOTS: usize = 4;
-    const MAX_SLOTS: usize = 64;
+    const MAX_SLOTS: usize = 32;
 
     let seq_len = max_seq_len.unwrap_or(DEFAULT_SEQ_LEN);
 

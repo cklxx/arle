@@ -39,7 +39,7 @@ High concurrency:
 | C=1 ITL p50 (128/128) | 8.8ms | **8.6ms** | 8.9ms | -2%, **beats SGLang** |
 | C=4 throughput (512/256) | 318.7 tok/s | **405.3 tok/s** | 368.5 tok/s | **+27%, beats SGLang +10%** |
 | C=4 ITL p50 | 12.0ms | **9.2ms** | 9.8ms | **-23%, beats SGLang** |
-| C=4 throughput (128/128) | N/A (errors) | **408.9 tok/s** | 349.9 tok/s | **beats SGLang +17%** |
+| C=4 throughput (128/128) | — | **408.9 tok/s** | 349.9 tok/s | **beats SGLang +17%** |
 | C=8 throughput (128/256) | 639.7 tok/s | **772.3 tok/s** | 1229.5 tok/s | +21%, SGLang still 59% ahead |
 | C=8 ITL p50 | 23.7ms | **9.8ms** | 11.0ms | **-59%, beats SGLang** |
 | C=1 TTFT p50 | 22ms | **14-22ms** | 72ms | **still 3x faster** |

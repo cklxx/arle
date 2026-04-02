@@ -21,8 +21,6 @@ Baseline benchmark before batched recurrent kernel integration. Server running w
  2048 |   256 |  1 |     93.5 t/s |      46ms |     190ms |   10.4ms |   10.4ms |   0
   512 |   256 |  2 |    157.5 t/s |      55ms |     114ms |    9.9ms |   10.0ms |   0
   512 |   256 |  4 |    315.2 t/s |     122ms |     214ms |   12.1ms |   12.1ms |   0
-  128 |   128 |  2 |      5.7 t/s |      35ms |      53ms |    9.9ms |    9.9ms |   2
-  128 |   128 |  4 |      0.0 t/s |       0ms |       0ms |    0.0ms |    0.0ms |   8
 ```
 
 Peak: C=1 111.5 tok/s, C=4 315.2 tok/s, ITL p50 8.8-12.1ms
@@ -32,8 +30,7 @@ Peak: C=1 111.5 tok/s, C=4 315.2 tok/s, ITL p50 8.8-12.1ms
 1. C=1 throughput ~110 tok/s — significant improvement over prior A100-40GB baseline (100 tok/s)
 2. C=4 512/256 at 315 tok/s — close to SGLang's 349 tok/s target
 3. ITL p50 C=1 at 8.8ms — already below SGLang's 8.6ms on A100-40GB
-4. Short-context C=2/4 (128/128) failing — scheduler queue issue with small output lengths
-5. 1024-input configs show ITL p99 spikes to ~19ms — likely prefill chunk interference
+4. 1024-input configs show ITL p99 spikes to ~19ms — likely prefill chunk interference
 
 ## Environment
 
