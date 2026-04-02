@@ -62,7 +62,7 @@ fn main() {
         // Generate using ModelForward
         state.reset().expect("reset failed");
         model
-            .forward(&prompt_tokens, &mut state)
+            .forward_prefill(&prompt_tokens, &mut state)
             .expect("prefill failed");
         let mut output_tokens = prompt_tokens.clone();
         let first = model
@@ -71,7 +71,7 @@ fn main() {
         output_tokens.push(first);
         for _ in 1..case.max_new_tokens {
             model
-                .forward(&[*output_tokens.last().unwrap()], &mut state)
+                .forward_decode(*output_tokens.last().unwrap(), &mut state)
                 .expect("decode failed");
             let tok = model
                 .select_token(&mut state, &greedy, &mut rng)

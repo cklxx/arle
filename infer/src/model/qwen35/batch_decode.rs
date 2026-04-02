@@ -186,7 +186,7 @@ impl BatchDecodeBuffers35 {
 
 impl Qwen35Model {
     /// Batched decode: process B tokens from B different requests in one pass.
-    /// Falls back to sequential forward() for non-paged path.
+    /// Falls back to sequential forward_decode() for non-paged path.
     pub fn decode_batch_contiguous(
         &self,
         tokens: &[u32],
@@ -194,7 +194,7 @@ impl Qwen35Model {
         slot_indices: &[usize],
     ) -> Result<()> {
         for (i, &token) in tokens.iter().enumerate() {
-            self.forward(&[token], &mut states[slot_indices[i]])?;
+            self.forward_decode(token, &mut states[slot_indices[i]])?;
         }
         Ok(())
     }
@@ -495,11 +495,17 @@ impl Qwen35Model {
             // H2D upload pointer arrays
             self.ctx
                 .stream
-                .memcpy_htod(&bufs.conv_state_ptrs_host[..batch_size], &mut bufs.conv_state_ptrs_gpu)
+                .memcpy_htod(
+                    &bufs.conv_state_ptrs_host[..batch_size],
+                    &mut bufs.conv_state_ptrs_gpu,
+                )
                 .map_err(|e| anyhow::anyhow!("H2D conv_state_ptrs: {e}"))?;
             self.ctx
                 .stream
-                .memcpy_htod(&bufs.gdr_state_ptrs_host[..batch_size], &mut bufs.gdr_state_ptrs_gpu)
+                .memcpy_htod(
+                    &bufs.gdr_state_ptrs_host[..batch_size],
+                    &mut bufs.gdr_state_ptrs_gpu,
+                )
                 .map_err(|e| anyhow::anyhow!("H2D gdr_state_ptrs: {e}"))?;
 
             // Batched conv1d decode: one kernel launch for all B requests

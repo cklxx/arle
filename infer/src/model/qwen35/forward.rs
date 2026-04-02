@@ -76,6 +76,7 @@ impl GenerationState for Qwen35State {
 
 impl ModelForward for Qwen35Model {
     type State = Qwen35State;
+    type DecodeContext = super::batch_decode::BatchDecodeBuffers35;
 
     fn create_state(&self) -> Result<Self::State> {
         let single_token_bufs = SingleTokenBuffers::new(&self.ctx, &self.config)?;
@@ -90,6 +91,37 @@ impl ModelForward for Qwen35Model {
             ),
             recurrent_state: RecurrentState::new(&self.ctx, &self.config)?,
         })
+    }
+
+    fn create_decode_context(
+        &self,
+        max_batch_size: usize,
+        pool: &crate::paged_kv::PagedKVPool,
+    ) -> Result<Self::DecodeContext> {
+        use super::batch_decode::BatchDecodeBuffers35;
+        let c = &self.config;
+        let q_proj_dim = c.full_attn_q_proj_dim();
+        let q_dim = c.full_attn_q_dim();
+        let kv_dim = c.full_attn_kv_dim();
+        let inter_dim = c.intermediate_size;
+        let qkv_dim = c.linear_attn_qkv_dim();
+        let z_dim = c.linear_attn_z_dim();
+        let b_dim = c.linear_num_value_heads;
+        let max_pages = pool.max_total_tokens;
+        BatchDecodeBuffers35::new(
+            &self.ctx,
+            c.hidden_size,
+            q_proj_dim,
+            q_dim,
+            kv_dim,
+            inter_dim,
+            qkv_dim,
+            z_dim,
+            b_dim,
+            max_batch_size,
+            c.num_attention_heads,
+            max_pages,
+        )
     }
 
     fn kv_cache_bytes_per_token(&self) -> usize {
@@ -113,27 +145,27 @@ impl ModelForward for Qwen35Model {
         self.config.head_dim
     }
 
-    fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
-        // Prefetch offloaded KV before PREFILL only.
-        if tokens.len() > 1 && state.base.kv_cache.has_offloaded() {
+    fn forward_prefill(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
+        // Prefetch offloaded KV before prefill.
+        if state.base.kv_cache.has_offloaded() {
             state.base.kv_cache.prefetch_to_gpu(&self.ctx)?;
         }
 
-        if tokens.len() == 1 {
-            self.prefill_forward_single_token(
-                tokens[0],
-                &mut state.base.kv_cache,
-                &mut state.recurrent_state,
-                &mut state.single_token_bufs,
-                &mut state.base.graph_state,
-            )?;
-            state.base.prefill_logits = None;
-        } else {
-            let logits =
-                self.prefill_forward(tokens, &mut state.base.kv_cache, &mut state.recurrent_state)?;
-            state.base.prefill_logits = Some(logits);
-        }
+        let logits =
+            self.prefill_forward(tokens, &mut state.base.kv_cache, &mut state.recurrent_state)?;
+        state.base.prefill_logits = Some(logits);
+        Ok(())
+    }
 
+    fn forward_decode(&self, token: u32, state: &mut Self::State) -> Result<()> {
+        self.prefill_forward_single_token(
+            token,
+            &mut state.base.kv_cache,
+            &mut state.recurrent_state,
+            &mut state.single_token_bufs,
+            &mut state.base.graph_state,
+        )?;
+        state.base.prefill_logits = None;
         Ok(())
     }
 
@@ -169,55 +201,21 @@ impl ModelForward for Qwen35Model {
         states: &mut [Self::State],
         slot_indices: &[usize],
         paged_kv_pool: Option<&mut crate::paged_kv::PagedKVPool>,
-        decode_bufs_cache: &mut Option<Box<dyn std::any::Any + Send>>,
+        decode_ctx: &mut Self::DecodeContext,
         skip_logit_scatter: bool,
     ) -> Result<()> {
         if tokens.is_empty() {
             return Ok(());
         }
         match paged_kv_pool {
-            Some(pool) if !pool.k_buffers.is_empty() => {
-                use super::batch_decode::BatchDecodeBuffers35;
-
-                let bufs = match decode_bufs_cache {
-                    Some(cache) => cache
-                        .downcast_mut::<BatchDecodeBuffers35>()
-                        .expect("decode_bufs_cache type mismatch"),
-                    None => {
-                        let c = &self.config;
-                        let q_proj_dim = c.full_attn_q_proj_dim();
-                        let q_dim = c.full_attn_q_dim();
-                        let kv_dim = c.full_attn_kv_dim();
-                        let inter_dim = c.intermediate_size;
-                        let qkv_dim = c.linear_attn_qkv_dim();
-                        let z_dim = c.linear_attn_z_dim();
-                        let b_dim = c.linear_num_value_heads;
-                        let max_bs = states.len();
-                        let max_pages = pool.max_total_tokens;
-                        let b: Box<dyn std::any::Any + Send> = Box::new(BatchDecodeBuffers35::new(
-                            &self.ctx,
-                            c.hidden_size,
-                            q_proj_dim,
-                            q_dim,
-                            kv_dim,
-                            inter_dim,
-                            qkv_dim,
-                            z_dim,
-                            b_dim,
-                            max_bs,
-                            c.num_attention_heads,
-                            max_pages,
-                        )?);
-                        *decode_bufs_cache = Some(b);
-                        decode_bufs_cache
-                            .as_mut()
-                            .unwrap()
-                            .downcast_mut::<BatchDecodeBuffers35>()
-                            .unwrap()
-                    }
-                };
-                self.decode_batch(tokens, states, slot_indices, skip_logit_scatter, pool, bufs)
-            }
+            Some(pool) if !pool.k_buffers.is_empty() => self.decode_batch(
+                tokens,
+                states,
+                slot_indices,
+                skip_logit_scatter,
+                pool,
+                decode_ctx,
+            ),
             _ => self.decode_batch_contiguous(tokens, states, slot_indices),
         }
     }
@@ -225,31 +223,23 @@ impl ModelForward for Qwen35Model {
     fn sample_batch_greedy(
         &self,
         slot_indices: &[usize],
-        decode_bufs_cache: &mut Option<Box<dyn std::any::Any + Send>>,
+        decode_ctx: &mut Self::DecodeContext,
     ) -> Result<Option<Vec<u32>>> {
-        use super::batch_decode::BatchDecodeBuffers35;
-        let bufs = match decode_bufs_cache {
-            Some(cache) => match cache.downcast_mut::<BatchDecodeBuffers35>() {
-                Some(b) => b,
-                None => return Ok(None),
-            },
-            None => return Ok(None),
-        };
-        let logits = match bufs.logits_batch.as_ref() {
+        let logits = match decode_ctx.logits_batch.as_ref() {
             Some(l) if l.seq_len > 0 => l,
             _ => return Ok(None),
         };
         let batch_size = slot_indices.len();
-        crate::ops::argmax_batch_launch(&self.ctx, logits, &mut bufs.argmax_out, batch_size)?;
+        crate::ops::argmax_batch_launch(&self.ctx, logits, &mut decode_ctx.argmax_out, batch_size)?;
         self.ctx.sync()?;
         crate::ops::argmax_batch_readback_into(
             &self.ctx,
-            &bufs.argmax_out,
-            &mut bufs.argmax_host,
+            &decode_ctx.argmax_out,
+            &mut decode_ctx.argmax_host,
             batch_size,
         )?;
         Ok(Some(
-            bufs.argmax_host[..batch_size]
+            decode_ctx.argmax_host[..batch_size]
                 .iter()
                 .map(|&x| x as u32)
                 .collect(),

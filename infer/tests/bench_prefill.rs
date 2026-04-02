@@ -33,7 +33,9 @@ fn bench_prefill(seq_len: usize, warmup: usize, iters: usize) {
     eprintln!("[warmup] {} runs, seq_len={}", warmup, seq_len);
     for _ in 0..warmup {
         state.reset().expect("reset failed");
-        model.forward(&prompt, &mut state).expect("warmup failed");
+        model
+            .forward_prefill(&prompt, &mut state)
+            .expect("warmup failed");
         model
             .select_token(&mut state, &greedy, &mut rng)
             .expect("warmup select failed");
@@ -45,7 +47,9 @@ fn bench_prefill(seq_len: usize, warmup: usize, iters: usize) {
     for _ in 0..iters {
         state.reset().expect("reset failed");
         let start = Instant::now();
-        model.forward(&prompt, &mut state).expect("bench failed");
+        model
+            .forward_prefill(&prompt, &mut state)
+            .expect("bench failed");
         model
             .select_token(&mut state, &greedy, &mut rng)
             .expect("bench select failed");

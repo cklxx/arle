@@ -46,17 +46,29 @@ pub trait GenerationState {
     ) -> Result<()>;
 }
 
-/// Deep module interface: one `forward` method hides prefill/decode strategy,
-/// layer types, CUDA Graph, buffer management, KV cache, and recurrent state.
+/// Deep module interface: explicit prefill/decode phases with typed decode context.
+///
+/// Phase semantics:
+/// - `forward_prefill`: process multiple tokens, populate KV cache
+/// - `forward_decode`: process exactly one token, use existing KV cache
+/// - `forward_decode_batch`: process B tokens from B requests in one pass
 pub trait ModelForward: Send {
     type State: GenerationState + Send;
 
+    /// Pre-allocated buffers for batched decode, owned by the scheduler.
+    /// Replaces `Box<dyn Any + Send>` with compile-time type safety.
+    type DecodeContext: Send;
+
     fn create_state(&self) -> Result<Self::State>;
 
+    /// Create decode context for batched decode (lazy-init by scheduler).
+    fn create_decode_context(
+        &self,
+        max_batch_size: usize,
+        pool: &PagedKVPool,
+    ) -> Result<Self::DecodeContext>;
+
     /// KV cache memory cost per token in bytes (across all layers, K+V, bf16).
-    /// Used by the scheduler to compute the dynamic max_seq_len based on
-    /// available GPU memory.
-    /// Formula: 2 (K+V) * num_kv_layers * num_kv_heads * head_dim * 2 (bf16 bytes)
     fn kv_cache_bytes_per_token(&self) -> usize;
 
     /// Number of KV cache layers (for paged KV pool sizing).
@@ -69,7 +81,22 @@ pub trait ModelForward: Send {
     /// Head dimension (for paged KV pool sizing).
     fn head_dim(&self) -> usize;
 
-    fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()>;
+    /// Prefill: process multiple tokens, populate KV cache and produce logits.
+    fn forward_prefill(&self, tokens: &[u32], state: &mut Self::State) -> Result<()>;
+
+    /// Decode: process exactly one token using existing KV cache.
+    fn forward_decode(&self, token: u32, state: &mut Self::State) -> Result<()>;
+
+    /// Convenience: dispatch to prefill or decode based on token count.
+    /// Callers that know the phase should use `forward_prefill`/`forward_decode` directly.
+    fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
+        if tokens.len() == 1 {
+            self.forward_decode(tokens[0], state)
+        } else {
+            self.forward_prefill(tokens, state)
+        }
+    }
+
     fn select_token(
         &self,
         state: &mut Self::State,
@@ -97,8 +124,8 @@ pub trait ModelForward: Send {
 
     /// Prefill forward pass that also scatter-writes K/V to the token pool.
     ///
-    /// Called by the scheduler instead of `forward()` when a paged KV pool is
-    /// active. The default implementation just calls `forward()` (no pool write).
+    /// Called by the scheduler instead of `forward_prefill()` when a paged KV pool is
+    /// active. The default implementation just calls `forward_prefill()` (no pool write).
     /// Override in model implementations that support scatter-writing K/V to the
     /// pool during prefill (e.g., Qwen3).
     ///
@@ -112,8 +139,8 @@ pub trait ModelForward: Send {
         _slot: usize,
         _new_token_indices: &cudarc::driver::CudaSlice<i32>,
     ) -> Result<()> {
-        // Default: just call forward() (no pool write)
-        self.forward(tokens, state)
+        // Default: just call forward_prefill() (no pool write)
+        self.forward_prefill(tokens, state)
     }
 
     /// Fast-path batched greedy sampling on internal contiguous logits.
@@ -121,7 +148,7 @@ pub trait ModelForward: Send {
     fn sample_batch_greedy(
         &self,
         _slot_indices: &[usize],
-        _decode_bufs_cache: &mut Option<Box<dyn std::any::Any + Send>>,
+        _decode_ctx: &mut Self::DecodeContext,
     ) -> Result<Option<Vec<u32>>> {
         Ok(None)
     }
@@ -134,18 +161,18 @@ pub trait ModelForward: Send {
     /// `paged_kv_pool` is provided when the scheduler owns a paged KV pool.
     /// Implementations may use it for paged attention in batched decode.
     ///
-    /// Default implementation falls back to sequential `forward()` calls.
+    /// Default implementation falls back to sequential `forward_decode()` calls.
     fn forward_decode_batch(
         &self,
         tokens: &[u32],
         states: &mut [Self::State],
         slot_indices: &[usize],
         _paged_kv_pool: Option<&mut PagedKVPool>,
-        _decode_bufs_cache: &mut Option<Box<dyn std::any::Any + Send>>,
+        _decode_ctx: &mut Self::DecodeContext,
         _skip_logit_scatter: bool,
     ) -> Result<()> {
         for (i, &token) in tokens.iter().enumerate() {
-            self.forward(&[token], &mut states[slot_indices[i]])?;
+            self.forward_decode(token, &mut states[slot_indices[i]])?;
         }
         Ok(())
     }

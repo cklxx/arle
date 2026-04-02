@@ -796,13 +796,13 @@ impl<M: ModelForward> BenchModel for ModelWithState<M> {
     ) -> GenTimings {
         run_timed(prompt_tokens, max_new_tokens, |toks, n, cb| {
             self.state.reset()?;
-            self.model.forward(toks, &mut self.state)?;
+            self.model.forward_prefill(toks, &mut self.state)?;
             let mut last = self.model.select_token(&mut self.state, sampling, rng)?;
             if !cb(last) {
                 return Ok(());
             }
             for _ in 1..n {
-                self.model.forward(&[last], &mut self.state)?;
+                self.model.forward_decode(last, &mut self.state)?;
                 last = self.model.select_token(&mut self.state, sampling, rng)?;
                 if !cb(last) {
                     break;
