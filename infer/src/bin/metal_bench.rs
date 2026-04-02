@@ -168,7 +168,10 @@ fn compare_baseline(baseline: &Baseline, current: &BTreeMap<String, MetricStat>)
 
     // Print comparison table
     eprintln!();
-    eprintln!("  {:<20} {:>12} {:>12} {:>10}   {}", "Metric", "Baseline", "Current", "Delta", "Status");
+    eprintln!(
+        "  {:<20} {:>12} {:>12} {:>10}   {}",
+        "Metric", "Baseline", "Current", "Delta", "Status"
+    );
     eprintln!("  {}", "-".repeat(72));
     for (metric, base_val, cur_val, delta_pct, pass) in &rows {
         let status = if *pass { "PASS" } else { "FAIL" };
@@ -189,10 +192,38 @@ fn build_current_metrics(
     mean_total_time_ms: f64,
 ) -> BTreeMap<String, MetricStat> {
     let mut m = BTreeMap::new();
-    m.insert("prompt_tps".into(), MetricStat { mean: mean_prompt_tps, p50: None, p99: None });
-    m.insert("generation_tps".into(), MetricStat { mean: mean_generation_tps, p50: None, p99: None });
-    m.insert("ttft_ms".into(), MetricStat { mean: mean_ttft_ms, p50: None, p99: None });
-    m.insert("total_time_ms".into(), MetricStat { mean: mean_total_time_ms, p50: None, p99: None });
+    m.insert(
+        "prompt_tps".into(),
+        MetricStat {
+            mean: mean_prompt_tps,
+            p50: None,
+            p99: None,
+        },
+    );
+    m.insert(
+        "generation_tps".into(),
+        MetricStat {
+            mean: mean_generation_tps,
+            p50: None,
+            p99: None,
+        },
+    );
+    m.insert(
+        "ttft_ms".into(),
+        MetricStat {
+            mean: mean_ttft_ms,
+            p50: None,
+            p99: None,
+        },
+    );
+    m.insert(
+        "total_time_ms".into(),
+        MetricStat {
+            mean: mean_total_time_ms,
+            p50: None,
+            p99: None,
+        },
+    );
     m
 }
 
@@ -430,10 +461,12 @@ fn run_bench() -> Result<()> {
     if let Some(ref path) = cli.update_baseline {
         let should_write = if path.exists() {
             // Load existing baseline and compare
-            let data = std::fs::read_to_string(path)
-                .map_err(|e| anyhow::anyhow!("failed to read baseline {}: {}", path.display(), e))?;
-            let baseline: Baseline = serde_json::from_str(&data)
-                .map_err(|e| anyhow::anyhow!("failed to parse baseline {}: {}", path.display(), e))?;
+            let data = std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("failed to read baseline {}: {}", path.display(), e)
+            })?;
+            let baseline: Baseline = serde_json::from_str(&data).map_err(|e| {
+                anyhow::anyhow!("failed to parse baseline {}: {}", path.display(), e)
+            })?;
             eprintln!("Checking update eligibility against: {}", path.display());
             let passed = compare_baseline(&baseline, &current_metrics);
             if passed {

@@ -72,9 +72,7 @@ struct ErrorWrapper<'a> {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let wrapper = ErrorWrapper {
-            error: &self.body,
-        };
+        let wrapper = ErrorWrapper { error: &self.body };
         let body = serde_json::to_string(&wrapper).unwrap_or_else(|_| {
             r#"{"error":{"message":"Internal error","type":"server_error","code":"serialization_failed"}}"#.to_string()
         });
