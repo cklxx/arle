@@ -468,7 +468,7 @@ impl Qwen3Model {
         // 8. Batched MLP: merged gate+up GEMM → fused silu_mul from merged buffer → down
         ops::gemm_into(
             &self.ctx,
-            &layer.mlp.gate_up_proj,
+            layer.mlp.gate_up_proj.as_ref().expect("merged gate_up_proj required"),
             &bufs.normed,
             &mut bufs.gate_up_out,
         );

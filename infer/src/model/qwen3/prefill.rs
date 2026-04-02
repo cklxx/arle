@@ -55,21 +55,12 @@ impl PrefillBuffers {
 impl Qwen3Model {
     #[fastrace::trace(name = "get_embeddings_batch")]
     pub(super) fn get_embeddings_batch(&self, token_ids: &[u32]) -> Result<HiddenStates> {
-        let seq_len = token_ids.len();
-        let hidden_dim = self.config.hidden_size;
-
-        // Copy token IDs to GPU
-        let token_ids_i32: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
-        let token_ids_gpu = self
-            .ctx
-            .stream
-            .clone_htod(&token_ids_i32)
-            .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
-
-        let mut out = HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?;
-        ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut out)?;
-
-        Ok(out)
+        crate::model::common::get_embeddings_batch(
+            &self.ctx,
+            &self.embed_tokens,
+            token_ids,
+            self.config.hidden_size,
+        )
     }
 
     #[fastrace::trace(name = "process_all_layers_batch")]
@@ -298,14 +289,14 @@ impl Qwen3Model {
     }
 
     pub(super) fn compute_logits_batch(&self, hidden: &HiddenStates) -> Result<DeviceVec> {
-        let last_hidden = ops::extract_vec(&self.ctx, hidden, hidden.seq_len - 1)?;
-        let normed = ops::rms_norm(
+        crate::model::common::compute_logits_batch(
             &self.ctx,
-            &last_hidden,
+            hidden,
             &self.norm,
+            self.output_projection(),
             self.config.rms_norm_eps,
-        )?;
-        ops::linear(&self.ctx, &normed, self.output_projection())
+            false, // standard RMSNorm (not offset)
+        )
     }
 
     fn forward_layer_batch(

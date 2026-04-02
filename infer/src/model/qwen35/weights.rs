@@ -4,6 +4,7 @@ use log::{debug, info};
 use std::time::Instant;
 
 use super::config::{Config35, LayerType};
+use crate::model::common::{self, MLP};
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 use crate::weight_loader::{
     load_shard_info_fixed, load_tensor_1d, load_tensor_1d_f32, load_tensor_2d, mmap_shards,
@@ -53,20 +54,12 @@ pub(super) enum LayerKind {
     LinearAttention(LinearAttentionLayer),
 }
 
-/// MLP layer weights (shared between both layer types).
-#[allow(clippy::struct_field_names)]
-pub(super) struct MLP35 {
-    pub(super) gate_proj: DeviceMatrix,
-    pub(super) up_proj: DeviceMatrix,
-    pub(super) down_proj: DeviceMatrix,
-}
-
 /// Transformer block for Qwen3.5.
 pub(super) struct TransformerBlock35 {
     pub(super) input_layernorm: DeviceVec,
     pub(super) attn: LayerKind,
     pub(super) post_attention_layernorm: DeviceVec,
-    pub(super) mlp: MLP35,
+    pub(super) mlp: common::MLP,
 }
 
 /// Qwen3.5 model (text-only).
@@ -258,26 +251,13 @@ impl Qwen35Model {
                     &weight_map,
                     &format!("{}.post_attention_layernorm.weight", prefix),
                 )?,
-                mlp: MLP35 {
-                    gate_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.mlp.gate_proj.weight", prefix),
-                    )?,
-                    up_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.mlp.up_proj.weight", prefix),
-                    )?,
-                    down_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.mlp.down_proj.weight", prefix),
-                    )?,
-                },
+                mlp: MLP::load(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.mlp", prefix),
+                    false, // Qwen3.5 doesn't use merged gate+up
+                )?,
             };
 
             debug!(

@@ -3,6 +3,7 @@ use log::{debug, info};
 use std::time::Instant;
 
 use super::config::Config;
+use crate::model::common::{self, MLP};
 use crate::ops;
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 use crate::weight_loader::{
@@ -34,22 +35,12 @@ pub(super) struct Attention {
     pub(super) k_norm: DeviceVec,
 }
 
-/// MLP layer weights
-#[allow(clippy::upper_case_acronyms, clippy::struct_field_names)]
-pub(super) struct MLP {
-    pub(super) gate_proj: DeviceMatrix,
-    pub(super) up_proj: DeviceMatrix,
-    /// Merged gate+up projection: [2*inter_dim, hidden_dim]
-    pub(super) gate_up_proj: DeviceMatrix,
-    pub(super) down_proj: DeviceMatrix,
-}
-
 /// Transformer block
 pub(super) struct TransformerBlock {
     pub(super) input_layernorm: DeviceVec,
     pub(super) attention: Attention,
     pub(super) post_attention_layernorm: DeviceVec,
-    pub(super) mlp: MLP,
+    pub(super) mlp: common::MLP,
 }
 
 /// Qwen3 model — weights and config only. Mutable state lives in `Qwen3State`.
@@ -169,32 +160,13 @@ impl Qwen3Model {
                     &weight_map,
                     &format!("{}.post_attention_layernorm.weight", prefix),
                 )?,
-                mlp: {
-                    let gate_proj = load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.mlp.gate_proj.weight", prefix),
-                    )?;
-                    let up_proj = load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.mlp.up_proj.weight", prefix),
-                    )?;
-                    let gate_up_proj = DeviceMatrix::concat_rows(&ctx, &[&gate_proj, &up_proj])?;
-                    MLP {
-                        gate_proj,
-                        up_proj,
-                        gate_up_proj,
-                        down_proj: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.mlp.down_proj.weight", prefix),
-                        )?,
-                    }
-                },
+                mlp: MLP::load(
+                    &ctx,
+                    &shards,
+                    &weight_map,
+                    &format!("{}.mlp", prefix),
+                    true, // merge gate+up for batched decode
+                )?,
             };
             layers.push(block);
         }
@@ -304,6 +276,6 @@ impl Qwen3Model {
     }
 
     pub(super) fn output_projection(&self) -> &DeviceMatrix {
-        self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
+        common::output_projection(&self.lm_head, &self.embed_tokens)
     }
 }
