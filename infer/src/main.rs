@@ -91,8 +91,8 @@ async fn main() {
         },
         scheduler: SchedulerConfig {
             decode_active_prefill_cap: args.decode_prefill_cap,
-            gpu_reserved_bytes: args.gpu_reserved_mb * 1024 * 1024,
-            kv_pool_headroom_bytes: args.kv_pool_headroom_mb * 1024 * 1024,
+            gpu_reserved_bytes: args.gpu_reserved_mb.saturating_mul(1024 * 1024),
+            kv_pool_headroom_bytes: args.kv_pool_headroom_mb.saturating_mul(1024 * 1024),
             ..SchedulerConfig::runtime_defaults(args.num_slots)
         },
         seed: 42,

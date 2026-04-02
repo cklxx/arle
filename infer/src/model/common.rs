@@ -112,6 +112,7 @@ pub(crate) fn compute_logits_batch(
     eps: f32,
     use_offset_norm: bool,
 ) -> Result<DeviceVec> {
+    anyhow::ensure!(hidden.seq_len > 0, "compute_logits_batch: empty hidden states");
     let last_hidden = ops::extract_vec(ctx, hidden, hidden.seq_len - 1)?;
     let normed = if use_offset_norm {
         let mut out = DeviceVec::zeros(ctx, last_hidden.len)?;
