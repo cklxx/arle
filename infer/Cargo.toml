@@ -9,6 +9,7 @@ edition = "2024"
 tokenizers = "0.22"
 safetensors = "0.7"
 anyhow = "1.0"
+thiserror = "2"
 ndarray = "0.16"
 half = { version = "2.4", features = ["num-traits"] }
 serde = { version = "1.0", features = ["derive"] }
