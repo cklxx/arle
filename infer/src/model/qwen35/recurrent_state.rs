@@ -10,6 +10,18 @@ use cudarc::driver::CudaSlice;
 use super::config::Config35;
 use crate::tensor::{DeviceContext, DeviceVec};
 
+/// CPU-backed snapshot of all recurrent state layers, for prefix cache reuse.
+/// Saved after prefill completes, restored on prefix cache hit to avoid
+/// recomputing recurrent state from scratch.
+pub(crate) struct RecurrentSnapshot {
+    /// Per-layer GDR recurrent state (f32, on CPU).
+    pub(crate) gdr_states: Vec<Vec<f32>>,
+    /// Per-layer conv1d state (bf16, on CPU).
+    pub(crate) conv_states: Vec<Vec<half::bf16>>,
+    /// Number of tokens processed when snapshot was taken.
+    pub(crate) seq_len: usize,
+}
+
 /// Per-layer recurrent state for a single linear attention layer.
 pub(crate) struct LayerRecurrentState {
     /// Recurrent state matrix: [num_value_heads * key_head_dim * value_head_dim] f32
@@ -51,6 +63,49 @@ impl RecurrentState {
         }
 
         Ok(Self { layers, seq_len: 0 })
+    }
+
+    /// Save all recurrent state to CPU memory for prefix cache reuse.
+    /// Returns a snapshot that can be restored later via `restore_snapshot`.
+    pub(crate) fn save_snapshot(&self, ctx: &DeviceContext) -> Result<RecurrentSnapshot> {
+        let mut gdr_states = Vec::with_capacity(self.layers.len());
+        let mut conv_states = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let mut gdr_host = vec![0f32; layer.state.len()];
+            ctx.stream
+                .memcpy_dtoh(&layer.state, &mut gdr_host)
+                .map_err(|e| anyhow::anyhow!("D2H recurrent state failed: {}", e))?;
+            gdr_states.push(gdr_host);
+
+            let mut conv_host = vec![half::bf16::ZERO; layer.conv_state.data.len()];
+            ctx.stream
+                .memcpy_dtoh(&layer.conv_state.data, &mut conv_host)
+                .map_err(|e| anyhow::anyhow!("D2H conv state failed: {}", e))?;
+            conv_states.push(conv_host);
+        }
+        Ok(RecurrentSnapshot {
+            gdr_states,
+            conv_states,
+            seq_len: self.seq_len,
+        })
+    }
+
+    /// Restore recurrent state from a CPU snapshot.
+    pub(crate) fn restore_snapshot(
+        &mut self,
+        ctx: &DeviceContext,
+        snap: &RecurrentSnapshot,
+    ) -> Result<()> {
+        self.seq_len = snap.seq_len;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            ctx.stream
+                .memcpy_htod(&snap.gdr_states[i], &mut layer.state)
+                .map_err(|e| anyhow::anyhow!("H2D recurrent state failed: {}", e))?;
+            ctx.stream
+                .memcpy_htod(&snap.conv_states[i], &mut layer.conv_state.data)
+                .map_err(|e| anyhow::anyhow!("H2D conv state failed: {}", e))?;
+        }
+        Ok(())
     }
 
     /// Reset all state to zeros for a new generation.

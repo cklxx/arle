@@ -3,7 +3,7 @@ use rand::RngExt;
 use rand::rngs::StdRng;
 
 use super::decode_buffers::DecodeBuffers35;
-use super::recurrent_state::RecurrentState;
+use super::recurrent_state::{RecurrentSnapshot, RecurrentState};
 use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::Qwen35Model;
 use crate::model::generation_state::GenerationStateBase;
@@ -18,6 +18,8 @@ pub struct Qwen35State {
     pub(super) single_token_bufs: SingleTokenBuffers,
     pub(crate) base: GenerationStateBase,
     pub(super) recurrent_state: RecurrentState,
+    /// CPU snapshot of recurrent state, saved after prefill for prefix cache reuse.
+    pub(super) recurrent_snapshot: Option<RecurrentSnapshot>,
 }
 
 // SAFETY: `Qwen35State` contains CUDA resources (`DeviceContext`, `CudaSlice` inside
@@ -72,6 +74,25 @@ impl GenerationState for Qwen35State {
     ) -> Result<()> {
         self.base.migrate_kv_to_paged(ctx, pool, slot)
     }
+
+    fn save_recurrent_snapshot(&mut self) -> Result<()> {
+        let snap = self.recurrent_state.save_snapshot(&self.ctx)?;
+        self.recurrent_snapshot = Some(snap);
+        Ok(())
+    }
+
+    fn restore_recurrent_snapshot(&mut self) -> Result<bool> {
+        if let Some(snap) = self.recurrent_snapshot.as_ref() {
+            self.recurrent_state.restore_snapshot(&self.ctx, snap)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn has_recurrent_state(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -91,6 +112,7 @@ impl ModelForward for Qwen35Model {
                 self.config.num_key_value_heads,
             ),
             recurrent_state: RecurrentState::new(&self.ctx, &self.config)?,
+            recurrent_snapshot: None,
         })
     }
 

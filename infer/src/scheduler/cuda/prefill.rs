@@ -14,33 +14,69 @@ impl<M: ModelForward> Scheduler<M> {
         let cached = &mut self.cached_prompts[si];
         let state = &mut self.states[si];
 
-        // TODO: prefix cache disabled for Qwen3.5 — recurrent state contamination
-        // from previous request's decode tokens causes CUDA_ERROR_ILLEGAL_ADDRESS
-        // during batched decode. Need to properly reset recurrent state on prefix hit.
-        let prefix_len = 0;
+        let raw_prefix_len = cached
+            .iter()
+            .zip(req.prompt_tokens.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        // Track effective prefix length (may be zeroed on fallback to miss).
+        let mut prefix_len = raw_prefix_len;
 
-        let effective = if prefix_len > 0 && prefix_len == cached.len() {
-            info!(
-                "Request {}: prefix HIT {}/{} tokens",
-                req.id,
-                prefix_len,
-                req.prompt_tokens.len()
-            );
-            let suffix = &req.prompt_tokens[prefix_len..];
-            if suffix.is_empty() {
-                let Some(&last_tok) = req.prompt_tokens.last() else {
-                    error!(
-                        "Request {}: prompt_tokens empty on full prefix hit - dropping",
-                        req.id
+        let effective = if raw_prefix_len > 0 && raw_prefix_len == cached.len() {
+            // Full prefix hit: cached prompt is entirely contained in new prompt.
+            // Restore recurrent state snapshot if available (Qwen3.5 hybrid model).
+            let restore_ok = match state.restore_recurrent_snapshot() {
+                Ok(true) => {
+                    info!(
+                        "Request {}: prefix HIT {}/{} tokens (recurrent restored)",
+                        req.id, prefix_len, req.prompt_tokens.len()
                     );
+                    true
+                }
+                Ok(false) => {
+                    info!(
+                        "Request {}: prefix HIT {}/{} tokens",
+                        req.id, prefix_len, req.prompt_tokens.len()
+                    );
+                    true
+                }
+                Err(e) => {
+                    error!(
+                        "Request {}: recurrent restore failed ({}), falling back to miss",
+                        req.id, e
+                    );
+                    false
+                }
+            };
+
+            if !restore_ok {
+                // Restore failed, fall back to full miss.
+                prefix_len = 0;
+                if let Err(e) = state.reset() {
+                    error!("Request {}: reset failed: {}", req.id, e);
                     req.phase = Phase::Finished;
                     return;
-                };
-                vec![last_tok]
+                }
+                cached.clear();
+                req.prompt_tokens.clone()
             } else {
-                suffix.to_vec()
+                let suffix = &req.prompt_tokens[prefix_len..];
+                if suffix.is_empty() {
+                    let Some(&last_tok) = req.prompt_tokens.last() else {
+                        error!(
+                            "Request {}: prompt_tokens empty on full prefix hit - dropping",
+                            req.id
+                        );
+                        req.phase = Phase::Finished;
+                        return;
+                    };
+                    vec![last_tok]
+                } else {
+                    suffix.to_vec()
+                }
             }
-        } else if prefix_len > 0 {
+        } else if prefix_len > 0 && !state.has_recurrent_state() {
+            // Partial prefix hit — only safe for models without recurrent state.
             info!(
                 "Request {}: prefix PARTIAL {}/{} tokens",
                 req.id,
@@ -55,7 +91,16 @@ impl<M: ModelForward> Scheduler<M> {
             cached.truncate(prefix_len);
             req.prompt_tokens[prefix_len..].to_vec()
         } else {
-            info!("Request {}: prefix MISS", req.id);
+            // Miss (or partial hit on recurrent model — unsafe to reuse partial state).
+            if raw_prefix_len > 0 {
+                info!(
+                    "Request {}: prefix PARTIAL {}/{} tokens (recurrent model, treating as MISS)",
+                    req.id, raw_prefix_len, req.prompt_tokens.len()
+                );
+            } else {
+                info!("Request {}: prefix MISS", req.id);
+            }
+            prefix_len = 0;
             if let Err(e) = state.reset() {
                 error!("Request {}: reset failed: {}", req.id, e);
                 req.phase = Phase::Finished;
@@ -143,6 +188,16 @@ impl<M: ModelForward> Scheduler<M> {
                 req.id, new_progress, total
             );
             return;
+        }
+
+        // Save recurrent state snapshot for future prefix cache reuse.
+        // Must happen after all prefill chunks complete but before decode modifies state.
+        if let Err(e) = state.save_recurrent_snapshot() {
+            error!(
+                "Request {}: save recurrent snapshot failed: {}",
+                req.id, e
+            );
+            // Non-fatal: prefix cache just won't work for this slot's next request.
         }
 
         if !paged_kv_pool.k_buffers.is_empty() {

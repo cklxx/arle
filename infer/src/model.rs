@@ -44,6 +44,26 @@ pub trait GenerationState {
         pool: &crate::paged_kv::PagedKVPool,
         slot: usize,
     ) -> Result<()>;
+
+    /// Save a CPU snapshot of recurrent state for prefix cache reuse.
+    /// Called after prefill completes, before decode starts.
+    /// Default is no-op for models without recurrent state (e.g. Qwen3).
+    fn save_recurrent_snapshot(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Restore recurrent state from a previously saved snapshot.
+    /// Returns `true` if a snapshot existed and was restored.
+    /// Default returns `false` for models without recurrent state.
+    fn restore_recurrent_snapshot(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Whether this model has recurrent state that prevents partial prefix reuse.
+    /// When true, partial prefix hits are treated as misses (full re-prefill).
+    fn has_recurrent_state(&self) -> bool {
+        false
+    }
 }
 
 /// Deep module interface: explicit prefill/decode phases with typed decode context.
