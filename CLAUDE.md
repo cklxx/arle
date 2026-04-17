@@ -86,6 +86,11 @@ Claude = **direction**; Codex = **execution**. Reach via `codex:codex-rescue`
 - **2-strike rule:** two good-faith failed attempts → hand off. Brief must
   list what was tried, what was observed, why each attempt failed, so Codex
   picks a different angle.
+- **Effort estimates are in coding-agent wall-clock, not human-days.**
+  Codex parallelizes file edits, runs `cargo` in the background, and does not
+  take meetings. A "3-day human feature" is typically **2–6 agent-hours**.
+  Always phrase estimates as agent-hours/agent-days and note the unit
+  explicitly in planning docs.
 - **Claude always owns:** planning docs, experience entries, roadmap edits,
   user-facing explanations, final integration after Codex reports back.
 
