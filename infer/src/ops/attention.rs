@@ -467,6 +467,33 @@ impl<'a> PagedPrefillForward<'a> {
         let qo_indptr = [0i32, seq_len as i32];
         let kv_indptr = [0i32, num_pages as i32];
 
+        // Drain the compute stream BEFORE overwriting `page_locked_workspace`.
+        // FlashInfer's `plan_hd128` writes into the plan's host-pinned
+        // `page_locked_workspace` and enqueues a `cudaMemcpyAsync` into
+        // `int_workspace` on the compute stream. If a PRIOR forward's
+        // memcpy hasn't drained yet, the next plan call overwrites the
+        // source host bytes in-flight → corrupted `int_workspace` →
+        // `gemm_cuda CUDA_ERROR_UNKNOWN` at the next kernel launch.
+        //
+        // The 04-18 hoist (commit 5208530) removed per-layer re-plan
+        // (36 layers → 1 plan per forward). This sync closes the
+        // remaining per-forward race: between two different requests'
+        // prefill calls within the same scheduler step, the shared
+        // plan's workspace must NOT be re-written until the previous
+        // memcpy has drained. Observed as `gemm_cuda CUDA_ERROR_UNKNOWN`
+        // at c≥2 × `prefill_chunk_size=2048` (more forwards per step ⇒
+        // tighter race window), and as `scheduler deadlock after first
+        // chunk` at c=2 (stream gets permanently stuck). Empirically:
+        // c=1 runs clean without this sync because exactly one forward
+        // runs per scheduler step.
+        //
+        // Proper fix is per-wrapper plans (sglang pattern); until that
+        // lands, this synchronize is cheap — FlashInfer plan runs on
+        // the CPU anyway, so we only wait for prior GPU work to drain.
+        ctx.stream
+            .synchronize()
+            .map_err(|e| anyhow!("plan pre-sync failed: {e}"))?;
+
         // Single plan call for the whole forward. All layers share the same
         // (batch_size, qo_len, kv_len, page_size, num_heads) shape, so one
         // plan covers them all.
