@@ -54,8 +54,30 @@ pub struct FlashInferDecodeMetadata {
 /// FlashInfer's plan/run API needs:
 /// - `float_workspace`: ~128MB GPU buffer for split-KV temp storage
 /// - `int_workspace`: ~8MB GPU buffer for plan metadata
-/// - `page_locked_workspace`: ~8MB CPU pinned buffer for plan H2D copy
+/// - `page_locked_workspaces`: rotating pool of ~8MB CPU pinned buffers for
+///   plan H2D copy (see below)
 /// - `plan_info`: ~256 bytes opaque buffer for plan output
+///
+/// ### Rotating `page_locked_workspaces` pool
+///
+/// Each `plan_fn` call writes FlashInfer plan metadata into its assigned
+/// `page_locked_workspace` and enqueues a `cudaMemcpyAsync` from that host
+/// buffer into `int_workspace` on the compute stream. Reusing a single host
+/// buffer across two plan calls on the same thread is unsafe: if the prior
+/// memcpy has not drained yet, the CPU-side overwrite corrupts the in-flight
+/// source bytes → garbage lands in `int_workspace` → subsequent kernel
+/// launches see bad metadata (observed as `gemm_cuda CUDA_ERROR_UNKNOWN` at
+/// c≥2 × `prefill_chunk_size=2048`).
+///
+/// Instead of draining the entire compute stream before every plan call
+/// (the old `ctx.stream.synchronize()` hack — primary cause of TTFT p99
+/// +42% vs sglang at c=16), we keep a pool of `PAGE_LOCKED_POOL_SIZE`
+/// host-pinned buffers and rotate through them with `next_page_locked_workspace`.
+/// Each plan picks the next slot; by the time the pool wraps back to a
+/// reused buffer, the prior memcpy from that buffer has long since drained
+/// (every plan is followed by 36 per-layer `run_fn` launches on the same
+/// compute stream, which serialize after the memcpy). 8 is a 2× safety
+/// margin over the worst-case c=16 interleave of HD128+HD256 plans.
 pub struct FlashInferWorkspace {
     /// GPU scratch for split-KV temporaries (~128MB)
     pub float_workspace: CudaSlice<u8>,
@@ -63,18 +85,25 @@ pub struct FlashInferWorkspace {
     /// GPU scratch for plan metadata (~8MB)
     pub int_workspace: CudaSlice<u8>,
     pub int_workspace_bytes: usize,
-    /// CPU pinned buffer for plan H2D copy (~8MB)
-    page_locked_workspace: *mut u8,
+    /// Rotating pool of CPU pinned buffers for plan H2D copy (~8MB each).
+    /// `next_page_locked_workspace()` hands out the next pointer and advances
+    /// `page_locked_next_idx` mod `PAGE_LOCKED_POOL_SIZE`.
+    page_locked_workspaces: Vec<*mut u8>,
     #[allow(dead_code)]
     page_locked_workspace_bytes: usize,
+    /// Next slot to hand out from `page_locked_workspaces`. `Cell` is fine
+    /// because `BatchPrefillPagedPlan` is only entered through the
+    /// single-threaded `Mutex<Option<...>>` wrapper in `weights.rs`.
+    page_locked_next_idx: std::cell::Cell<usize>,
     /// Opaque plan info buffer (256 bytes, HOST pinned — used by CPU memcpy in FlashInfer)
     pub plan_info: *mut u8,
     /// LSE output buffer (log-sum-exp), nullable but we allocate for max batch
     pub lse: CudaSlice<f32>,
 }
 
-// SAFETY: The page_locked_workspace is a pinned CPU allocation that is only accessed
-// from the single inference thread (same thread that calls plan/run). No concurrent access.
+// SAFETY: The page-locked pool is a set of pinned CPU allocations accessed
+// only from the single inference thread (same thread that calls plan/run).
+// No concurrent access.
 unsafe impl Send for FlashInferWorkspace {}
 
 fn alloc_host_buffer(bytes: usize, label: &str) -> Result<*mut u8> {
@@ -225,6 +254,14 @@ impl BatchPrefillPagedPlan {
         ensure!(qo_indptr[0] == 0, "{plan_name}: qo_indptr must start at 0");
         ensure!(kv_indptr[0] == 0, "{plan_name}: kv_indptr must start at 0");
 
+        // Rotate through the page-locked pool so we never overwrite a buffer
+        // whose prior `cudaMemcpyAsync → int_workspace` might still be
+        // in-flight on the compute stream. See struct doc on
+        // `FlashInferWorkspace` for why this replaces the old
+        // `ctx.stream.synchronize()` drain in `attention.rs`. Taken before
+        // `device_ptr_mut` so the `&self` call doesn't overlap the mutable
+        // borrows below.
+        let page_locked = self.workspace.next_page_locked_workspace();
         let (fw_ptr, _gfw) = self.workspace.float_workspace.device_ptr_mut(&ctx.stream);
         let (iw_ptr, _giw) = self.workspace.int_workspace.device_ptr_mut(&ctx.stream);
         let ret = unsafe {
@@ -232,7 +269,7 @@ impl BatchPrefillPagedPlan {
                 fw_ptr as *mut u8,
                 self.workspace.float_workspace_bytes,
                 iw_ptr as *mut u8,
-                self.workspace.page_locked_workspace,
+                page_locked,
                 self.workspace.int_workspace_bytes,
                 qo_indptr.as_ptr(),
                 kv_indptr.as_ptr(),
@@ -470,7 +507,21 @@ impl FlashInferWorkspace {
     pub const HD256_FLOAT_WORKSPACE_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
     const INT_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
     const PAGE_LOCKED_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
+    /// Size of the rotating host-pinned plan-metadata pool. See the struct
+    /// doc-comment for why 8 is the safe choice at c=16.
+    pub const PAGE_LOCKED_POOL_SIZE: usize = 8;
     const PLAN_INFO_BYTES: usize = 256;
+
+    /// Hand out the next page-locked workspace pointer and advance the
+    /// rotating index. Single-threaded via the `Mutex` wrapper on
+    /// `BatchPrefillPagedPlan`; `Cell` is sufficient (no atomics needed).
+    fn next_page_locked_workspace(&self) -> *mut u8 {
+        let idx = self.page_locked_next_idx.get();
+        let ptr = self.page_locked_workspaces[idx];
+        self.page_locked_next_idx
+            .set((idx + 1) % Self::PAGE_LOCKED_POOL_SIZE);
+        ptr
+    }
 
     /// Allocate FlashInfer workspace buffers with the default 256 MiB float
     /// workspace. Use `new_with_float_bytes` for HD256 paths.
@@ -509,16 +560,32 @@ impl FlashInferWorkspace {
             .alloc_zeros(max_batch_size * num_qo_heads)
             .map_err(|e| anyhow::anyhow!("FlashInfer lse alloc failed: {e}"))?;
 
-        let page_locked_workspace =
-            alloc_host_buffer(Self::PAGE_LOCKED_WORKSPACE_BYTES, "page_locked_workspace")?;
+        let mut page_locked_workspaces: Vec<*mut u8> =
+            Vec::with_capacity(Self::PAGE_LOCKED_POOL_SIZE);
+        for i in 0..Self::PAGE_LOCKED_POOL_SIZE {
+            // Allocate each buffer independently; on failure, free what we
+            // already allocated to avoid leaking pinned host memory.
+            match alloc_host_buffer(Self::PAGE_LOCKED_WORKSPACE_BYTES, "page_locked_workspace") {
+                Ok(ptr) => page_locked_workspaces.push(ptr),
+                Err(e) => {
+                    for mut ptr in page_locked_workspaces.drain(..) {
+                        free_host_buffer(&mut ptr);
+                    }
+                    return Err(anyhow::anyhow!(
+                        "FlashInfer page_locked_workspaces alloc #{i} failed: {e}"
+                    ));
+                }
+            }
+        }
 
         Ok(Self {
             float_workspace,
             float_workspace_bytes,
             int_workspace,
             int_workspace_bytes: Self::INT_WORKSPACE_BYTES,
-            page_locked_workspace,
+            page_locked_workspaces,
             page_locked_workspace_bytes: Self::PAGE_LOCKED_WORKSPACE_BYTES,
+            page_locked_next_idx: std::cell::Cell::new(0),
             plan_info,
             lse,
         })
@@ -527,7 +594,9 @@ impl FlashInferWorkspace {
 
 impl Drop for FlashInferWorkspace {
     fn drop(&mut self) {
-        free_host_buffer(&mut self.page_locked_workspace);
+        for ptr in self.page_locked_workspaces.iter_mut() {
+            free_host_buffer(ptr);
+        }
         free_host_buffer(&mut self.plan_info);
     }
 }
@@ -545,6 +614,7 @@ pub fn flashinfer_plan(
     page_size: usize,
     head_dim: usize,
 ) -> Result<()> {
+    let page_locked = workspace.next_page_locked_workspace();
     let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
     let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
 
@@ -553,7 +623,7 @@ pub fn flashinfer_plan(
             fw_ptr as *mut u8,
             workspace.float_workspace_bytes,
             iw_ptr as *mut u8,
-            workspace.page_locked_workspace,
+            page_locked,
             workspace.int_workspace_bytes,
             indptr_h.as_ptr(),
             batch_size as i32,
@@ -590,6 +660,7 @@ pub fn flashinfer_tc_plan(
     page_size: usize,
     head_dim: usize,
 ) -> Result<()> {
+    let page_locked = workspace.next_page_locked_workspace();
     let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
     let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
 
@@ -598,7 +669,7 @@ pub fn flashinfer_tc_plan(
             fw_ptr as *mut u8,
             workspace.float_workspace_bytes,
             iw_ptr as *mut u8,
-            workspace.page_locked_workspace,
+            page_locked,
             workspace.int_workspace_bytes,
             qo_indptr_h.as_ptr(),
             kv_indptr_h.as_ptr(),
@@ -632,6 +703,7 @@ pub fn flashinfer_plan_hd256(
     page_size: usize,
     head_dim: usize,
 ) -> Result<()> {
+    let page_locked = workspace.next_page_locked_workspace();
     let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
     let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
 
@@ -640,7 +712,7 @@ pub fn flashinfer_plan_hd256(
             fw_ptr as *mut u8,
             workspace.float_workspace_bytes,
             iw_ptr as *mut u8,
-            workspace.page_locked_workspace,
+            page_locked,
             workspace.int_workspace_bytes,
             indptr_h.as_ptr(),
             batch_size as i32,

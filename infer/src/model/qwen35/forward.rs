@@ -208,6 +208,13 @@ impl ModelForward for Qwen35Model {
         Ok(())
     }
 
+    fn supports_cuda_graph_decode(&self) -> bool {
+        // Honour `--cuda-graph=false`; without this the scheduler captures
+        // graphs at warmup regardless of the CLI flag, wasting VRAM that
+        // the paged KV pool needs at c=16 × 4096.
+        self.enable_cuda_graph
+    }
+
     fn prefill_uses_paged_pool(&self) -> bool {
         // Phase 1A (commit 859c3d2) wired the paged HD256 prefill path but it
         // crashes the CUDA context on the second prefill chunk when the slot

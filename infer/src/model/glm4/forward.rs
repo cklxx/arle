@@ -90,6 +90,12 @@ impl ModelForward for GLM4Model {
         })
     }
 
+    fn supports_cuda_graph_decode(&self) -> bool {
+        // Honour `--cuda-graph=false`; without this the scheduler captures
+        // graphs at warmup regardless of the CLI flag.
+        self.enable_cuda_graph
+    }
+
     fn create_decode_context(
         &self,
         max_batch_size: usize,
