@@ -154,7 +154,10 @@ fn compute_budget_breakdown(
     };
     let total_bytes_per_token = storage_bytes_per_token + work_bytes_per_token;
     let max_total_tokens = if total_bytes_per_token > 0 {
-        (budget_bytes / total_bytes_per_token).max(num_slots)
+        budget_bytes
+            .checked_div(total_bytes_per_token)
+            .unwrap_or(0)
+            .max(num_slots)
     } else {
         0
     };

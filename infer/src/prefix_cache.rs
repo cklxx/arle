@@ -741,13 +741,22 @@ impl RadixCache {
     /// `ref_count == 0` whose descendants no longer hold any allocated
     /// `block_id`s.
     pub fn evictable_token_count(&self) -> usize {
+        let now = self.clock;
         let evictable_blocks = self
             .nodes
             .iter()
             .enumerate()
             .filter(|(idx, node)| {
+                // Mirror `evict_with_policy`'s candidate filter
+                // (`ref_count == 0 && !soft_pinned`) so the admission gate's
+                // budget matches what eviction is actually willing to release.
+                // Without the soft-pin check the gate admits, alloc fails on
+                // chunked prefill, and the request flips to `Finished` —
+                // exactly the failure mode the gate exists to prevent.
+                let soft_pinned = node.soft_pin_until.is_some_and(|deadline| deadline > now);
                 *idx != Self::root()
                     && node.ref_count == 0
+                    && !soft_pinned
                     && node.block_id.is_some()
                     && node
                         .children
