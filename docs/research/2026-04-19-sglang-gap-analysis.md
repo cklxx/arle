@@ -253,6 +253,43 @@ one victim picked per loop iter). No kernel change, no layout change.
 Gap #5 (HiRadixCache T1 demotion) is the next tier. Gap #7 (speculative) is
 a whole project, punt until 0.6.x.
 
+## Update (2026-04-19, commit `346355b`) — K=3 probe confirms the tradeoff
+
+ROI #3 landed (`346355b`, Pareto-neutral). Next tried a zero-code-change
+probe: flip `MIXED_PREFILL_MAX_REQS = 2 → 3` with `MIXED_PREFILL_CAP = 64`
+unchanged. At K=3 the per-req chunk rounds down to 16 tokens → 3 × 16 = 48
+total tokens per mixed tick (less than K=2's 64).
+
+| metric | K=2 cap=64 (baseline-fresh) | **K=3 cap=64** | Δ |
+|---|---|---|---|
+| TTFT p50 (ms) | 5511 | 6558 | **+19%** ❌ |
+| TTFT p99 (ms) | 16694 | 21497 | **+29%** ❌ |
+| ITL p50 (ms) | 87 | 82 | −6% ✓ |
+| ITL p99 (ms) | 199 | **105** | **−47% (INFER BEATS sglang 113)** ✓ |
+| out tok/s | 123 | 98 | −20% ❌ |
+
+**What this proves.** The K=2 cap=64 ITL p99 regression (199 vs
+sglang 113) isn't a kernel bug — it's the direct cost of the 64 tok
+mixed-prefill payload per tick. Shrinking the payload (K=3 cap=64 =
+48 tokens) closes the ITL gap immediately, but bleeds TTFT and
+throughput dollar-for-dollar. **The ITL–TTFT axis is a strict
+tradeoff at the current kernel shape.**
+
+Reverted K=3, staying at K=2 cap=64 which hits the better overall
+Pareto corner. The path to *simultaneously* winning ITL p99 AND TTFT
+p99 runs through **ROI #2 (mixed CUDA graph + cap raise)** — once
+replay eliminates the per-tick kernel-launch overhead, the fixed
+cost that makes 64-tok payloads expensive drops, and ITL p99 stops
+being a function of mixed-tick size. The research ranking stands.
+
+(Also documented: fresh `guidellm 0.6.0` + fresh `target/` rebuild
+showed a baseline drift vs the `673b9e9` numbers cited in the K=2
+wins entry — TTFT p50 regressed 3307 → 5511, ITL p99 113 → 199.
+Under-the-hood drift cause unknown; all the ROI #3 / K=3 numbers
+above were measured against this drifted baseline for apples-to-apples.
+If the drift is guidellm 0.6 metric changes, the historical wins still
+hold on the old tool; re-baselining or pinning guidellm is a follow-up.)
+
 ## Citations
 
 - sglang 0.5.10 source: https://github.com/sgl-project/sglang/tree/v0.5.10/python/sglang/srt
