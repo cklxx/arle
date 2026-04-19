@@ -133,6 +133,15 @@ impl<M: ModelForward> Scheduler<M> {
         let mut alloc_ok_indices: Vec<usize> = Vec::with_capacity(decode_indices.len());
         let mut alloc_ok_tokens: Vec<u32> = Vec::with_capacity(decode_indices.len());
         for (j, &i) in decode_indices.iter().enumerate() {
+            // L1 retract regression guard (codex review 2026-04-19): if
+            // `alloc_pool_tokens_with_retry` retracted this slot (or a
+            // sibling we were about to decode) to free pool pages, its
+            // phase has flipped to Finished. Skip it so the decode
+            // dispatch doesn't sample a token for a just-retracted slot;
+            // cleanup() will reap it next tick.
+            if matches!(self.active[i].phase, Phase::Finished) {
+                continue;
+            }
             let slot = self.active[i].slot_idx;
             if let Err(e) = self.alloc_pool_tokens_with_retry(slot, 1) {
                 error!(
@@ -140,10 +149,15 @@ impl<M: ModelForward> Scheduler<M> {
                     self.active[i].id, slot, e
                 );
                 self.active[i].finish(FinishReason::Length, &self.tokenizer);
-            } else {
-                alloc_ok_indices.push(i);
-                alloc_ok_tokens.push(token_ids[j]);
+                continue;
             }
+            if matches!(self.active[i].phase, Phase::Finished) {
+                // Retry succeeded but this index was retracted as the
+                // victim to satisfy its own request's shortfall.
+                continue;
+            }
+            alloc_ok_indices.push(i);
+            alloc_ok_tokens.push(token_ids[j]);
         }
         let decode_indices = alloc_ok_indices;
         let token_ids = alloc_ok_tokens;
@@ -367,6 +381,15 @@ impl<M: ModelForward> Scheduler<M> {
         let mut alloc_ok_indices: Vec<usize> = Vec::with_capacity(decode_indices.len());
         let mut alloc_ok_tokens: Vec<u32> = Vec::with_capacity(decode_indices.len());
         for (j, &i) in decode_indices.iter().enumerate() {
+            // L1 retract regression guard (codex review 2026-04-19): if
+            // `alloc_pool_tokens_with_retry` retracted this slot (or a
+            // sibling we were about to decode) to free pool pages, its
+            // phase has flipped to Finished. Skip it so the decode
+            // dispatch doesn't sample a token for a just-retracted slot;
+            // cleanup() will reap it next tick.
+            if matches!(self.active[i].phase, Phase::Finished) {
+                continue;
+            }
             let slot = self.active[i].slot_idx;
             if let Err(e) = self.alloc_pool_tokens_with_retry(slot, 1) {
                 error!(
@@ -374,10 +397,15 @@ impl<M: ModelForward> Scheduler<M> {
                     self.active[i].id, slot, e
                 );
                 self.active[i].finish(FinishReason::Length, &self.tokenizer);
-            } else {
-                alloc_ok_indices.push(i);
-                alloc_ok_tokens.push(token_ids[j]);
+                continue;
             }
+            if matches!(self.active[i].phase, Phase::Finished) {
+                // Retry succeeded but this index was retracted as the
+                // victim to satisfy its own request's shortfall.
+                continue;
+            }
+            alloc_ok_indices.push(i);
+            alloc_ok_tokens.push(token_ids[j]);
         }
         let decode_indices = alloc_ok_indices;
         let token_ids = alloc_ok_tokens;
