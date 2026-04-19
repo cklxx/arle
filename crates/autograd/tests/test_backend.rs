@@ -1,12 +1,38 @@
 //! Backend matmul parity tests. The CPU reference is authoritative; each
 //! gated backend must match it to within `1e-3` relative tolerance on the
-//! three shapes we actually hit in Lm training: small 2D, square 2D,
+//! three shapes we actually hit in Transformer training: small 2D, square 2D,
 //! and batched rank-3.
 
 use autograd::{
     CpuBackend,
-    backend::{Backend, cpu_matmul_forward},
+    backend::{
+        Backend, cpu_embedding_forward, cpu_exp_forward, cpu_gather_last_dim_forward,
+        cpu_gelu_forward, cpu_log_softmax_forward_last_axis, cpu_matmul_forward,
+        cpu_mean_last_axis_forward, cpu_mul_forward, cpu_mul_scalar_forward, cpu_neg_forward,
+        cpu_rms_norm_forward, cpu_rope_forward, cpu_silu_forward, cpu_softmax_forward_last_axis,
+        cpu_sum_last_axis_forward,
+    },
 };
+
+#[allow(dead_code)]
+fn _touch_refs() {
+    // Keep the reference imports live on builds where the CUDA test block is
+    // gated off (e.g. `--features cuda,no-cuda` — types check but tests skip).
+    let _ = cpu_softmax_forward_last_axis;
+    let _ = cpu_log_softmax_forward_last_axis;
+    let _ = cpu_mul_forward;
+    let _ = cpu_mul_scalar_forward;
+    let _ = cpu_exp_forward;
+    let _ = cpu_neg_forward;
+    let _ = cpu_gelu_forward;
+    let _ = cpu_silu_forward;
+    let _ = cpu_rms_norm_forward;
+    let _ = cpu_embedding_forward;
+    let _ = cpu_sum_last_axis_forward;
+    let _ = cpu_mean_last_axis_forward;
+    let _ = cpu_rope_forward;
+    let _ = cpu_gather_last_dim_forward;
+}
 
 fn make_rows(shape: &[usize], seed: u64) -> Vec<f32> {
     let size: usize = shape.iter().product();
@@ -200,6 +226,51 @@ fn cuda_backend_matches_cpu_batched_3d() {
     assert_close(&got, &want, 1e-3, "cuda 3d batched");
 }
 
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_softmax_matches_cpu_2d() {
+    use autograd::backend_metal::MetalBackend;
+
+    let backend = MetalBackend;
+    let x = make_rows(&[4, 32], 909);
+    let got = backend
+        .softmax_forward_last_axis(&x, &[4, 32])
+        .expect("metal softmax");
+    let want = cpu_softmax_forward_last_axis(&x, &[4, 32]).expect("ref");
+    assert_close(&got, &want, 1e-3, "metal softmax 2d");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_log_softmax_matches_cpu_2d() {
+    use autograd::backend_metal::MetalBackend;
+
+    let backend = MetalBackend;
+    let x = make_rows(&[4, 32], 808);
+    let got = backend
+        .log_softmax_forward_last_axis(&x, &[4, 32])
+        .expect("metal log_softmax");
+    let want = cpu_log_softmax_forward_last_axis(&x, &[4, 32]).expect("ref");
+    assert_close(&got, &want, 1e-3, "metal log_softmax 2d");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_log_softmax_matches_cpu_wide_vocab() {
+    use autograd::backend_metal::MetalBackend;
+
+    // Stresses the actual hot path: log_softmax over a realistic vocab
+    // dimension from pretrain (vocab≈150k). 4096 is a shrunken proxy that
+    // still exercises the full reduction + broadcast path.
+    let backend = MetalBackend;
+    let x = make_rows(&[8, 4096], 707);
+    let got = backend
+        .log_softmax_forward_last_axis(&x, &[8, 4096])
+        .expect("metal log_softmax wide");
+    let want = cpu_log_softmax_forward_last_axis(&x, &[8, 4096]).expect("ref");
+    assert_close(&got, &want, 1e-3, "metal log_softmax wide");
+}
+
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 #[test]
 fn cuda_backend_add_matches_cpu_2d() {
@@ -210,4 +281,356 @@ fn cuda_backend_add_matches_cpu_2d() {
     let b = make_rows(&[8, 32], 606);
     let got = run_lazy_add(&backend, &a, &b, &[8, 32]).expect("cuda add");
     assert_close(&got, &reference_add(&a, &b), 1e-3, "cuda add 2d");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_softmax_matches_cpu_2d() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let x = make_rows(&[4, 32], 919);
+    let got = backend
+        .softmax_forward_last_axis(&x, &[4, 32])
+        .expect("cuda softmax");
+    let want = cpu_softmax_forward_last_axis(&x, &[4, 32]).expect("ref");
+    assert_close(&got, &want, 1e-3, "cuda softmax 2d");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_log_softmax_matches_cpu_2d() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let x = make_rows(&[4, 32], 828);
+    let got = backend
+        .log_softmax_forward_last_axis(&x, &[4, 32])
+        .expect("cuda log_softmax");
+    let want = cpu_log_softmax_forward_last_axis(&x, &[4, 32]).expect("ref");
+    assert_close(&got, &want, 1e-3, "cuda log_softmax 2d");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_log_softmax_matches_cpu_wide_vocab() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let x = make_rows(&[8, 4096], 727);
+    let got = backend
+        .log_softmax_forward_last_axis(&x, &[8, 4096])
+        .expect("cuda log_softmax wide");
+    let want = cpu_log_softmax_forward_last_axis(&x, &[8, 4096]).expect("ref");
+    assert_close(&got, &want, 1e-3, "cuda log_softmax wide");
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// CPU reference self-parity tests (no backend feature required).
+// Ensures the newly-added CPU fns compile and stay consistent with the
+// autograd::ops::* CPU paths they mirror.
+// ──────────────────────────────────────────────────────────────────────
+
+#[test]
+fn cpu_mul_scalar_matches_elementwise() {
+    let x = make_rows(&[6, 5], 91);
+    let got = cpu_mul_scalar_forward(&x, 0.25).unwrap();
+    let want: Vec<f32> = x.iter().map(|v| v * 0.25).collect();
+    assert_close(&got, &want, 1e-6, "cpu mul_scalar");
+}
+
+#[test]
+fn cpu_silu_matches_ref() {
+    let x = make_rows(&[4, 8], 311);
+    let got = cpu_silu_forward(&x).unwrap();
+    for (i, &v) in x.iter().enumerate() {
+        let want = v * (1.0 / (1.0 + (-v).exp()));
+        assert!(
+            (got[i] - want).abs() < 1e-6,
+            "idx {i}: {} vs {}",
+            got[i],
+            want
+        );
+    }
+}
+
+#[test]
+fn cpu_rms_norm_matches_ref() {
+    let shape = &[3, 8];
+    let x = make_rows(shape, 19);
+    let weight: Vec<f32> = (0..8).map(|i| 0.5 + (i as f32) * 0.1).collect();
+    let got = cpu_rms_norm_forward(&x, &weight, shape, 1e-6).unwrap();
+    // Reference: per-row rsqrt(mean(x^2)+eps) * x * weight
+    let mut want = vec![0.0_f32; 24];
+    for row in 0..3 {
+        let base = row * 8;
+        let mean_sq = x[base..base + 8].iter().map(|v| v * v).sum::<f32>() / 8.0;
+        let inv_rms = (mean_sq + 1e-6).sqrt().recip();
+        for col in 0..8 {
+            want[base + col] = x[base + col] * inv_rms * weight[col];
+        }
+    }
+    assert_close(&got, &want, 1e-6, "cpu rms_norm");
+}
+
+#[test]
+fn cpu_embedding_gather_and_oob() {
+    let weight: Vec<f32> = (0..(5 * 4)).map(|i| i as f32).collect();
+    let ids = [0_i32, 2, 4, -1, 10];
+    let got = cpu_embedding_forward(&weight, 5, 4, &ids).unwrap();
+    assert_eq!(&got[0..4], &[0.0, 1.0, 2.0, 3.0]);
+    assert_eq!(&got[4..8], &[8.0, 9.0, 10.0, 11.0]);
+    assert_eq!(&got[8..12], &[16.0, 17.0, 18.0, 19.0]);
+    assert_eq!(&got[12..16], &[0.0, 0.0, 0.0, 0.0]); // id=-1 zero row
+    assert_eq!(&got[16..20], &[0.0, 0.0, 0.0, 0.0]); // id=10 oob zero row
+}
+
+#[test]
+fn cpu_sum_and_mean_last_axis() {
+    let shape = &[2, 5];
+    let x = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0];
+    let sum = cpu_sum_last_axis_forward(&x, shape).unwrap();
+    assert_eq!(sum, vec![15.0, 150.0]);
+    let mean = cpu_mean_last_axis_forward(&x, shape).unwrap();
+    assert_eq!(mean, vec![3.0, 30.0]);
+}
+
+#[test]
+fn cpu_gather_last_dim_basic() {
+    // src shape [3, 5], pick one element per row.
+    let src: Vec<f32> = (0..15).map(|i| i as f32).collect();
+    let ids = [0_i32, 2, 4];
+    let got = cpu_gather_last_dim_forward(&src, &[3, 5], &ids).unwrap();
+    assert_eq!(got, vec![0.0, 7.0, 14.0]);
+
+    // Out-of-range → error.
+    let bad = [0_i32, 2, 5];
+    assert!(cpu_gather_last_dim_forward(&src, &[3, 5], &bad).is_err());
+}
+
+#[test]
+fn cpu_rope_matches_ops() {
+    // Cross-check the Backend trait default (`cpu_rope_forward`) against the
+    // original `ops::rope::rope` implementation on a small Qwen3-shaped input.
+    use autograd::Tape;
+    use autograd::TensorStore;
+    use autograd::ops;
+    use autograd::tensor::Tensor;
+    let batch = 2_usize;
+    let heads = 3_usize;
+    let seq = 4_usize;
+    let head_dim = 8_usize;
+    let half_dim = head_dim / 2;
+    let shape = &[batch, heads, seq, head_dim];
+    let x = make_rows(shape, 91);
+    let mut cos = Vec::with_capacity(seq * half_dim);
+    let mut sin = Vec::with_capacity(seq * half_dim);
+    for t in 0..seq {
+        for i in 0..half_dim {
+            let theta = (t as f32) * (0.02_f32 + (i as f32) * 0.01_f32);
+            cos.push(theta.cos());
+            sin.push(theta.sin());
+        }
+    }
+    let want = cpu_rope_forward(&x, shape, &cos, &sin).unwrap();
+
+    // Route through ops::rope::rope so we catch any drift between the two.
+    let mut store = TensorStore::default();
+    let x_id = store.alloc(Tensor::new(x.clone(), shape.to_vec(), false).unwrap());
+    let cos_id = store.alloc(Tensor::new(cos.clone(), vec![seq, half_dim], false).unwrap());
+    let sin_id = store.alloc(Tensor::new(sin.clone(), vec![seq, half_dim], false).unwrap());
+    let mut tape = Tape::default();
+    let out_id = ops::rope::rope(x_id, cos_id, sin_id, &mut store, &mut tape).unwrap();
+    let ops_out = store.get(out_id).unwrap().data.clone();
+    assert_close(&want, &ops_out, 1e-6, "cpu_rope vs ops::rope");
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// CUDA parity tests — PENDING REMOTE CUDA VERIFICATION. Compile on Mac
+// under `--features cuda,no-cuda`; run on a real GPU box with
+// `cargo test -p autograd --features cuda --test test_backend`.
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_mul_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let a = make_rows(&[3, 17], 111);
+    let b = make_rows(&[3, 17], 222);
+    let got = backend.mul_forward(&a, &b).expect("cuda mul");
+    let want = cpu_mul_forward(&a, &b).unwrap();
+    assert_close(&got, &want, 1e-5, "cuda mul");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_mul_scalar_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let a = make_rows(&[4, 9], 77);
+    let got = backend
+        .mul_scalar_forward(&a, -0.5)
+        .expect("cuda mul_scalar");
+    let want = cpu_mul_scalar_forward(&a, -0.5).unwrap();
+    assert_close(&got, &want, 1e-6, "cuda mul_scalar");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_exp_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let a = make_rows(&[2, 128], 3);
+    let got = backend.exp_forward(&a).expect("cuda exp");
+    let want = cpu_exp_forward(&a).unwrap();
+    assert_close(&got, &want, 1e-4, "cuda exp");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_neg_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let a = make_rows(&[4, 16], 5);
+    let got = backend.neg_forward(&a).expect("cuda neg");
+    let want = cpu_neg_forward(&a).unwrap();
+    assert_close(&got, &want, 1e-6, "cuda neg");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_gelu_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let a = make_rows(&[4, 128], 9);
+    let got = backend.gelu_forward(&a).expect("cuda gelu");
+    let want = cpu_gelu_forward(&a).unwrap();
+    assert_close(&got, &want, 1e-4, "cuda gelu");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_silu_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let a = make_rows(&[4, 128], 13);
+    let got = backend.silu_forward(&a).expect("cuda silu");
+    let want = cpu_silu_forward(&a).unwrap();
+    assert_close(&got, &want, 1e-4, "cuda silu");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_rms_norm_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let shape = &[4, 64];
+    let x = make_rows(shape, 33);
+    let weight: Vec<f32> = (0..64).map(|i| 0.5 + (i as f32) * 0.01).collect();
+    let got = backend
+        .rms_norm_forward(&x, &weight, shape, 1e-6)
+        .expect("cuda rms_norm");
+    let want = cpu_rms_norm_forward(&x, &weight, shape, 1e-6).unwrap();
+    assert_close(&got, &want, 1e-4, "cuda rms_norm");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_embedding_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let vocab = 64_usize;
+    let dim = 32_usize;
+    let weight = make_rows(&[vocab, dim], 17);
+    let ids = [0_i32, 5, 10, 63, -1, 99, 7];
+    let got = backend
+        .embedding_forward(&weight, vocab, dim, &ids)
+        .expect("cuda embed");
+    let want = cpu_embedding_forward(&weight, vocab, dim, &ids).unwrap();
+    assert_close(&got, &want, 1e-6, "cuda embedding");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_sum_last_axis_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let shape = &[6, 257];
+    let x = make_rows(shape, 41);
+    let got = backend.sum_last_axis_forward(&x, shape).expect("cuda sum");
+    let want = cpu_sum_last_axis_forward(&x, shape).unwrap();
+    assert_close(&got, &want, 1e-3, "cuda sum");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_mean_last_axis_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let shape = &[6, 257];
+    let x = make_rows(shape, 43);
+    let got = backend
+        .mean_last_axis_forward(&x, shape)
+        .expect("cuda mean");
+    let want = cpu_mean_last_axis_forward(&x, shape).unwrap();
+    assert_close(&got, &want, 1e-5, "cuda mean");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_gather_last_dim_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let shape = &[4_usize, 128_usize];
+    let src = make_rows(shape, 71);
+    let ids = [5_i32, 0, 127, 42];
+    let got = backend
+        .gather_last_dim_forward(&src, shape, &ids)
+        .expect("cuda gather");
+    let want = cpu_gather_last_dim_forward(&src, shape, &ids).unwrap();
+    assert_close(&got, &want, 1e-6, "cuda gather");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_rope_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let batch = 2_usize;
+    let heads = 4_usize;
+    let seq = 16_usize;
+    let head_dim = 64_usize;
+    let half_dim = head_dim / 2;
+    let shape = &[batch, heads, seq, head_dim];
+    let x = make_rows(shape, 55);
+    let mut cos = Vec::with_capacity(seq * half_dim);
+    let mut sin = Vec::with_capacity(seq * half_dim);
+    for t in 0..seq {
+        for i in 0..half_dim {
+            let theta = (t as f32) * (0.02_f32 + (i as f32) * 0.01_f32);
+            cos.push(theta.cos());
+            sin.push(theta.sin());
+        }
+    }
+    let got = backend
+        .rope_forward(&x, shape, &cos, &sin)
+        .expect("cuda rope");
+    let want = cpu_rope_forward(&x, shape, &cos, &sin).unwrap();
+    assert_close(&got, &want, 1e-4, "cuda rope");
 }

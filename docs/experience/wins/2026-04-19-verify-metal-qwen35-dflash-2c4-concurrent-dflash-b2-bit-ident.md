@@ -221,33 +221,36 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 330 filtered out; fi
      `std::slice::from_ref(target_hidden)`; batched caller passes
      `&target_hidden_per_row`) so each row's fallback is its own
      pre-block hidden state.
-- **Two more [P1]/[P2] codex findings on the round-3 diff — deferred to
-  bench-enablement (#13), NOT fixed in this Phase 2B commit.** Both only
-  trigger when the `metal_dflash_concurrency_off` flag is flipped to
-  `false`; default-`true` production paths are unaffected. In-code
-  pointers added at the exact sites (`runtime.rs:1092-1116` partition
-  comment, `request_state.rs:1704-1713` eligibility gate).
-  1. [P1] **Plain-decode cache rollback on singleton fallback**
-     (`runtime.rs:1105-1116`). When the partition leaves one plain row,
-     `execute_qwen35_packed_decode_batch` returns `Ok(None)` for
-     `open.len() < 2` and the survivor advances via
-     `execute_decode_single`. The cached `Qwen35PackedDecodeBatch` still
-     holds the pre-singleton state; on the next membership change
-     `invalidate_qwen35_decode_batch_cache` syncs the stale cache back
-     into the live request, rolling it back by the singleton decode
-     step. **Fix:** invalidate the cache before the singleton fallback
-     (or bypass the cache for `open.len() == 1` entirely).
-  2. [P2] **All-or-nothing DFlash demotion on buffered-speculative
-     rows** (`request_state.rs:1704-1706`). The eligibility gate returns
-     `Ok(None)` as soon as any row has `!dflash.token_buffer.is_empty()`
-     or missing `target_hidden`, which demotes the whole bucket to
+- **Two [P1]/[P2] codex findings on the round-3 diff.** The [P1]
+  "plain-decode cache rollback on singleton fallback" was **retracted**
+  by a follow-up codex review (2026-04-19): the
+  `invalidate_qwen35_decode_batch_cache` sync on the `Ok(None)` arm is
+  the ONLY mechanism that propagates `packed_kv_flat`/`packed_gdr_flat`
+  updates from batched decode into each request's per-row KV state —
+  bypassing it (as an earlier attempted fix did) leaves the singleton
+  survivor decoding on stale caches. The original unconditional invalidate
+  is correct; no fix needed. The [P2] finding below was only reachable
+  when `metal_dflash_concurrency_off=false`; default-`true` production
+  paths were unaffected.
+  1. [P2] **All-or-nothing DFlash demotion on buffered-speculative
+     rows** (`request_state.rs:1704-1713`). The eligibility gate returned
+     `Ok(None)` as soon as any row had `!dflash.token_buffer.is_empty()`
+     or missing `target_hidden`, which demoted the whole bucket to
      scalar `execute_decode_single`. After a successful speculative
-     block (`accepted_inputs > 1` with tail kept), that row carries a
+     block (`accepted_inputs > 1` with tail kept), that row carried a
      non-empty buffer on the next tick, so in practice any mixed-
-     acceptance pattern collapses the bucket. **Fix:** per-row filter
-     that carves the ready subset (empty buffer + captured
-     target_hidden) and dispatches only that subset to the batched
-     path, sending the stale rows through `execute_decode_single`.
+     acceptance pattern collapsed the bucket. **Fixed in follow-up
+     commit f09b25a**: the function now partitions rows into a
+     ready subset (empty buffer + captured `target_hidden` + cross-row
+     shape/handle agreement via majority equivalence class) and a stale
+     subset; the batched kernel runs on the ready subset iff `len >= 2`,
+     and the caller in
+     `runtime.rs::execute_qwen35_dflash_packed_batch` routes stale rows
+     through `execute_decode_single`. The new return type is
+     `Option<DflashBatchOutcome { ready_indices, tokens }>`; see
+     `request_state.rs` for the helper predicates
+     `row_passes_dflash_batch_per_row_predicates` and
+     `rows_agree_on_dflash_batch_cross_row_predicates`.
 - **Single-row DFlash still serializes.** The dispatcher requires
   `dflash_rows.len() >= 2` to batch; one DFlash row falls through to
   `execute_decode_single` (per-row). The batched-stack overhead isn't
