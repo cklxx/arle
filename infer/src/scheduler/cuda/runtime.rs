@@ -337,7 +337,9 @@ impl<M: ModelForward> Scheduler<M> {
                 0
             };
             let extend_input_tokens = prompt_tokens.len().saturating_sub(radix_hit_len);
-            let clipped_max_new = incoming.max_tokens.min(super::core::CLIP_MAX_NEW_TOKENS);
+            let clipped_max_new = incoming
+                .max_tokens
+                .min(self.config.admission_clip_max_new_tokens);
             let total_tokens_needed = extend_input_tokens + clipped_max_new;
             if total_tokens_needed >= tick_budget_tokens {
                 self.prefix_cache.release(&radix_blocks);
@@ -349,7 +351,7 @@ impl<M: ModelForward> Scheduler<M> {
                 break;
             }
             tick_budget_tokens = tick_budget_tokens.saturating_sub(
-                extend_input_tokens + clipped_max_new + super::core::PREFILL_PAGE_OVERHEAD_TOKENS,
+                extend_input_tokens + clipped_max_new + self.paged_kv_pool.page_size,
             );
             let gpu_ready_prefix_blocks: Vec<_> = lookup
                 .blocks
@@ -538,6 +540,7 @@ mod tests {
     use crate::sampler::SamplingParams;
     use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerConfig};
     use crate::tokenizer::Tokenizer;
+    use crate::types::SessionId;
     use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec};
     use log::{Level, LevelFilter, Log, Metadata, Record};
     use std::collections::HashMap;
@@ -767,7 +770,12 @@ mod tests {
     }
 
     fn test_scheduler() -> Scheduler<FakeModel> {
-        let config = SchedulerConfig::runtime_defaults(16);
+        let config = SchedulerConfig {
+            max_slots: 16,
+            admission_clip_max_new_tokens: 4096,
+            admission_new_token_ratio: 0.7,
+            ..SchedulerConfig::runtime_defaults(16)
+        };
         let (mut scheduler, _handle) = Scheduler::with_config(
             FakeModel::new().expect("CUDA context should initialize"),
             test_tokenizer(),
@@ -846,12 +854,9 @@ mod tests {
         assert_eq!(scheduler.paged_kv_pool.free_count(), 1024);
         assert_eq!(scheduler.prefix_cache.evictable_token_count(), 0);
         assert_eq!(scheduler.admission_budget_tokens(), 1024);
-        assert_eq!(
-            128usize + 32 + super::super::core::PREFILL_PAGE_OVERHEAD_TOKENS,
-            176
-        );
+        assert_eq!(128usize + 32 + scheduler.paged_kv_pool.page_size, 176);
 
-        for _ in 0..16 {
+        for i in 0..16 {
             let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
             scheduler.waiting.push_back(IncomingRequest {
                 prompt: prompt.clone(),
@@ -859,7 +864,7 @@ mod tests {
                 sampling: SamplingParams::default(),
                 stop: None,
                 priority: RequestPriority::default(),
-                session_id: None,
+                session_id: Some(SessionId::from(format!("req-{i}"))),
                 delta_tx,
             });
         }
@@ -868,9 +873,24 @@ mod tests {
 
         assert_eq!(scheduler.active.len(), 5);
         assert_eq!(scheduler.waiting.len(), 11);
+        assert!(
+            scheduler
+                .waiting
+                .front()
+                .and_then(|req| req.session_id.as_ref())
+                .is_some_and(|session_id| session_id.as_str().ends_with("-5"))
+        );
 
         let logs = TEST_LOGGER.snapshot();
-        assert!(logs.contains("held for pool"), "missing hold log: {logs}");
+        assert_eq!(
+            logs.match_indices("held for pool").count(),
+            1,
+            "unexpected hold log count: {logs}"
+        );
+        assert!(
+            logs.contains("Request 5 held for pool (need=160 tok, budget=144 tok)"),
+            "missing expected hold log: {logs}"
+        );
         assert!(
             !logs.contains("pool alloc for paged prefill failed"),
             "unexpected alloc failure log: {logs}"
