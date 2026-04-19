@@ -19,6 +19,9 @@ pub(super) const PREFIX_CACHE_BLOCK_SIZE: usize = 16;
 /// decode writes directly to the paged pool via `decode_prep_paged`.
 /// Prefill chunk size is capped to this value to prevent buffer overflow.
 pub(super) const CONTIGUOUS_KV_TOKENS: usize = 512;
+pub(super) const CLIP_MAX_NEW_TOKENS: usize = 4096;
+pub(super) const INIT_NEW_TOKEN_RATIO: f64 = 0.7;
+pub(super) const PREFILL_PAGE_OVERHEAD_TOKENS: usize = 16;
 
 // Prefix-cache watermark / keepalive tunables moved to
 // `crate::scheduler::types::SchedulerConfig` in Tier C. See the doc
@@ -164,6 +167,21 @@ impl<M: ModelForward> Scheduler<M> {
                 .filter(|req| matches!(req.phase, Phase::Decoding))
                 .count(),
         )
+    }
+
+    pub(super) fn admission_budget_tokens(&self) -> usize {
+        let available = self.paged_kv_pool.free_count();
+        let evictable = self.prefix_cache.evictable_token_count();
+        let running_offset: f64 = self
+            .active
+            .iter()
+            .map(|r| {
+                let remaining = r.max_tokens.saturating_sub(r.generated_tokens.len());
+                let clipped = remaining.min(CLIP_MAX_NEW_TOKENS);
+                (clipped as f64) * INIT_NEW_TOKEN_RATIO
+            })
+            .sum();
+        (available + evictable).saturating_sub(running_offset.ceil() as usize)
     }
 
     fn prefix_cache_watermarks_pages(&self) -> (usize, usize) {

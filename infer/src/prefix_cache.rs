@@ -265,6 +265,15 @@ impl RadixCache {
         0
     }
 
+    fn subtree_has_allocated_block(&self, node_idx: usize) -> bool {
+        let node = &self.nodes[node_idx];
+        node.block_id.is_some()
+            || node
+                .children
+                .values()
+                .any(|&child_idx| self.subtree_has_allocated_block(child_idx))
+    }
+
     /// Allocate a node slot, reusing a reclaimed tombstone if possible.
     fn alloc_node(&mut self, node: Node) -> usize {
         if let Some(idx) = self.free_nodes.pop() {
@@ -673,6 +682,30 @@ impl RadixCache {
     /// matching those blocks.
     pub fn release(&mut self, blocks: &[BlockId]) {
         self.dec_refs_by_block_id(blocks);
+    }
+
+    /// Returns the token capacity currently reclaimable by a future eviction.
+    ///
+    /// This is a read-only peek for admission control. It matches the
+    /// scheduler-facing notion of "evictable now": a block-bearing node with
+    /// `ref_count == 0` whose descendants no longer hold any allocated
+    /// `block_id`s.
+    pub fn evictable_token_count(&self) -> usize {
+        let evictable_blocks = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(idx, node)| {
+                *idx != Self::root()
+                    && node.ref_count == 0
+                    && node.block_id.is_some()
+                    && node
+                        .children
+                        .values()
+                        .all(|&child_idx| !self.subtree_has_allocated_block(child_idx))
+            })
+            .count();
+        evictable_blocks * self.block_size
     }
 
     fn dec_refs_by_block_id(&mut self, blocks: &[BlockId]) {
