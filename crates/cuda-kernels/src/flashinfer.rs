@@ -139,13 +139,24 @@ pub struct BatchPrefillPagedPlan {
 }
 
 impl BatchPrefillPagedPlan {
-    /// HD128 paged prefill plan. Uses the default 256 MiB float workspace —
-    /// sufficient now that `enable_cuda_graph=false` keeps FlashInfer's
-    /// `padded_batch_size` at ~`total_num_tiles_q` (no graph-capture pad).
-    /// See `flashinfer_prefill_paged.cu` for the sizing rationale.
+    /// HD128 paged prefill plan. Uses the 512 MiB float workspace to match
+    /// sglang's Qwen2/Qwen3 workspace sizing
+    /// (`sglang/srt/layers/attention/flashinfer_backend.py:171-180`:
+    /// `SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)` for the
+    /// `Qwen3ForCausalLM` arch). The prior 256 MiB default exhausts under
+    /// `c=16 × 4096-prompt × chunk=2048` workloads on L4 — the FlashInfer
+    /// `int_workspace` gets overwritten by the next plan call before the
+    /// stream drains, corrupting the CUDA context and surfacing as a
+    /// `gemm_cuda CUDA_ERROR_UNKNOWN` on the subsequent kernel launch.
+    /// HD256 already uses 512 MiB via `new_hd256`; HD128 now matches.
     pub fn new(ctx: &DeviceContext, max_total_qo_rows: usize, num_qo_heads: usize) -> Result<Self> {
         Ok(Self {
-            workspace: FlashInferWorkspace::new(ctx, max_total_qo_rows, num_qo_heads)?,
+            workspace: FlashInferWorkspace::new_with_float_bytes(
+                ctx,
+                max_total_qo_rows,
+                num_qo_heads,
+                FlashInferWorkspace::HD256_FLOAT_WORKSPACE_BYTES,
+            )?,
             hd128: PlanBuf::new()?,
             hd256: PlanBuf::new()?,
         })
