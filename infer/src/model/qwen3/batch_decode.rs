@@ -104,7 +104,6 @@ pub(crate) struct MixedBatchBuffers {
     act_out: HiddenStates,
     logits: HiddenStates,
     token_ids_gpu: CudaSlice<i32>,
-    metadata: FlashInferDecodeMetadata,
     max_tokens: usize,
 }
 
@@ -114,7 +113,6 @@ impl MixedBatchBuffers {
         ctx: &DeviceContext,
         model_config: &Config,
         max_batch_size: usize,
-        max_total_pages: usize,
     ) -> Result<Self> {
         let max_tokens = max_batch_size + MIXED_PREFILL_CAP;
         let q_dim = model_config.num_attention_heads * model_config.head_dim;
@@ -139,12 +137,6 @@ impl MixedBatchBuffers {
                 .stream
                 .alloc_zeros(max_tokens)
                 .map_err(|e| anyhow::anyhow!("Alloc mixed token_ids_gpu failed: {e}"))?,
-            metadata: FlashInferDecodeMetadata::new(
-                ctx,
-                max_tokens,
-                max_total_pages + MIXED_PREFILL_CAP,
-                model_config.num_attention_heads,
-            )?,
             max_tokens,
         })
     }
@@ -216,10 +208,15 @@ impl BatchDecodeBuffers {
 
             token_ids_scratch: Vec::with_capacity(max_batch_size),
 
+            // Inflate metadata sizing by MIXED_PREFILL_CAP so the mixed
+            // decode+prefill path (`decode_batch_with_prefill`) can reuse this
+            // same metadata without overrunning positions/indptr/last_page_len
+            // buffers. Mixed path writes up to B + C positions where C ≤
+            // MIXED_PREFILL_CAP; sizing here has to match.
             metadata: FlashInferDecodeMetadata::new(
                 ctx,
-                max_batch_size,
-                max_total_pages,
+                max_batch_size + MIXED_PREFILL_CAP,
+                max_total_pages + MIXED_PREFILL_CAP,
                 num_qheads,
             )?,
             quantized_kv_meta: ctx
@@ -254,14 +251,13 @@ impl BatchDecodeBuffers {
     fn mixed_buffers_mut(
         &mut self,
         model: &Qwen3Model,
-        kv_pool: &PagedKVPool,
+        _kv_pool: &PagedKVPool,
     ) -> Result<&mut MixedBatchBuffers> {
         if self.mixed.is_none() {
             self.mixed = Some(MixedBatchBuffers::new(
                 &model.ctx,
                 &model.config,
                 self.max_batch_size,
-                kv_pool.max_total_pages,
             )?);
         }
         Ok(self.mixed.as_mut().unwrap())
@@ -376,9 +372,28 @@ impl Qwen3Model {
                 bufs.max_batch_size,
             )?);
         }
-        let logits_batch_ptr = bufs.logits_batch.as_mut().unwrap() as *mut HiddenStates;
-
-        let mixed = bufs.mixed_buffers_mut(self, paged_kv_pool)?;
+        if bufs.mixed.is_none() {
+            bufs.mixed = Some(MixedBatchBuffers::new(
+                &self.ctx,
+                &self.config,
+                bufs.max_batch_size,
+            )?);
+        }
+        // Disjoint-field borrow: the mixed path reuses `bufs.metadata` (the
+        // decode path's FlashInfer workspace) instead of owning its own —
+        // the two phases never overlap in a single scheduler tick, so we
+        // save the duplicate ~328 MiB of FlashInfer state. We split `bufs`
+        // here so that `metadata` and `mixed` can be mutated independently.
+        let BatchDecodeBuffers {
+            mixed,
+            metadata,
+            logits_batch,
+            ..
+        } = &mut *bufs;
+        let mixed = mixed.as_mut().expect("mixed buffers initialized above");
+        let logits_buf = logits_batch
+            .as_mut()
+            .expect("logits_batch initialized above");
         let total_tokens = b + c;
         if total_tokens > mixed.max_tokens {
             return Ok(false);
@@ -393,7 +408,14 @@ impl Qwen3Model {
             .memcpy_htod(&combined_tokens, &mut mixed.token_ids_gpu)
             .map_err(|e| anyhow::anyhow!("H2D mixed token_ids: {e}"))?;
 
-        let _ = mixed.metadata.update_mixed(
+        // `update_mixed` may reallocate `metadata.kv_indices` when the mixed
+        // page count exceeds what the decode path sized for; it already flips
+        // `plan_dirty = true` internally. We do NOT invalidate the decode
+        // graph cache here because no decode graph has been captured with
+        // this `metadata` yet in this tick — the next regular decode step
+        // will re-plan via `plan_attention()` (which observes `plan_dirty`)
+        // and, if needed, re-capture its graph.
+        let _ = metadata.update_mixed(
             &self.ctx,
             paged_kv_pool,
             decode_slot_indices,
@@ -401,7 +423,7 @@ impl Qwen3Model {
             prefill_start_pos,
             c,
         )?;
-        mixed.metadata.tc_plan(
+        metadata.tc_plan(
             &self.ctx,
             b + 1,
             self.config.num_attention_heads,
@@ -511,10 +533,10 @@ impl Qwen3Model {
             let (kn_ptr, _gkn) = nrp.k_norm.data.device_ptr(&self.ctx.stream);
             let (cos_ptr, _gcos) = nrp.cos_cache.data.device_ptr(&self.ctx.stream);
             let (sin_ptr, _gsin) = nrp.sin_cache.data.device_ptr(&self.ctx.stream);
-            let (pos_ptr, _gpos) = mixed.metadata.positions.device_ptr(&self.ctx.stream);
-            let (ind_ptr, _gind) = mixed.metadata.kv_indptr.device_ptr(&self.ctx.stream);
-            let (idx_ptr, _gidx) = mixed.metadata.kv_indices.device_ptr(&self.ctx.stream);
-            let (lp_ptr, _glp) = mixed.metadata.kv_last_page_len.device_ptr(&self.ctx.stream);
+            let (pos_ptr, _gpos) = metadata.positions.device_ptr(&self.ctx.stream);
+            let (ind_ptr, _gind) = metadata.kv_indptr.device_ptr(&self.ctx.stream);
+            let (idx_ptr, _gidx) = metadata.kv_indices.device_ptr(&self.ctx.stream);
+            let (lp_ptr, _glp) = metadata.kv_last_page_len.device_ptr(&self.ctx.stream);
             let k_pool_ptr = paged_kv_pool.k_ptr(layer_idx, &self.ctx.stream);
             let v_pool_ptr = paged_kv_pool.v_ptr(layer_idx, &self.ctx.stream);
 
@@ -579,29 +601,23 @@ impl Qwen3Model {
             }
 
             let ret = {
-                let (fw_ptr, _gfw) = mixed
-                    .metadata
+                let (fw_ptr, _gfw) = metadata
                     .flashinfer_ws
                     .float_workspace
                     .device_ptr_mut(&self.ctx.stream);
-                let (iw_ptr, _giw) = mixed
-                    .metadata
+                let (iw_ptr, _giw) = metadata
                     .flashinfer_ws
                     .int_workspace
                     .device_ptr_mut(&self.ctx.stream);
-                let (qoi_ptr, _gqoi) = mixed.metadata.qo_indptr.device_ptr(&self.ctx.stream);
+                let (qoi_ptr, _gqoi) = metadata.qo_indptr.device_ptr(&self.ctx.stream);
                 let (o_ptr, _go) = mixed.attn_output.data.device_ptr_mut(&self.ctx.stream);
-                let (lse_ptr, _glse) = mixed
-                    .metadata
-                    .flashinfer_ws
-                    .lse
-                    .device_ptr_mut(&self.ctx.stream);
+                let (lse_ptr, _glse) = metadata.flashinfer_ws.lse.device_ptr_mut(&self.ctx.stream);
 
                 unsafe {
                     ffi::flashinfer_tc_decode_run(
                         fw_ptr as *mut u8,
                         iw_ptr as *mut u8,
-                        mixed.metadata.flashinfer_ws.plan_info.cast_const(),
+                        metadata.flashinfer_ws.plan_info.cast_const(),
                         q_ptr as *const ffi::Half,
                         qoi_ptr as *const i32,
                         k_pool_ptr as *const ffi::Half,
@@ -710,10 +726,9 @@ impl Qwen3Model {
         );
 
         {
-            let logits = unsafe { &mut *logits_batch_ptr };
-            logits.seq_len = b;
-            let src = mixed.logits.data.slice(0..b * logits.hidden_dim);
-            let mut dst = logits.data.slice_mut(0..b * logits.hidden_dim);
+            logits_buf.seq_len = b;
+            let src = mixed.logits.data.slice(0..b * logits_buf.hidden_dim);
+            let mut dst = logits_buf.data.slice_mut(0..b * logits_buf.hidden_dim);
             self.ctx
                 .stream
                 .memcpy_dtod(&src, &mut dst)

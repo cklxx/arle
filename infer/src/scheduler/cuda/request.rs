@@ -55,6 +55,13 @@ pub(crate) struct ActiveRequest {
     /// prompt-prefix-of-cached / extendable-prefix distinctions without keeping
     /// a parallel `cached_prompts: Vec<Vec<u32>>` token store.
     pub(crate) reusable_cached_prompt_len: usize,
+    pub(crate) first_step_at: Option<std::time::Instant>,
+    pub(crate) finished_at: Option<std::time::Instant>,
+    pub(crate) t_prefill_us: u64,
+    pub(crate) t_decode_us: u64,
+    pub(crate) t_emit_us: u64,
+    pub(crate) t_new_us: u64,
+    pub(crate) step_count: u64,
 }
 
 impl ActiveRequest {
@@ -266,6 +273,13 @@ mod tests {
             latest_logprob: None,
             reusable_prefix_len: 0,
             reusable_cached_prompt_len: 0,
+            first_step_at: None,
+            finished_at: None,
+            t_prefill_us: 0,
+            t_decode_us: 0,
+            t_emit_us: 0,
+            t_new_us: 0,
+            step_count: 0,
         }
     }
 

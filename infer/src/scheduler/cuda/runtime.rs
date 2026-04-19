@@ -454,6 +454,13 @@ impl<M: ModelForward> Scheduler<M> {
                 latest_logprob: None,
                 reusable_prefix_len,
                 reusable_cached_prompt_len,
+                first_step_at: None,
+                finished_at: None,
+                t_prefill_us: 0,
+                t_decode_us: 0,
+                t_emit_us: 0,
+                t_new_us: 0,
+                step_count: 0,
             });
         }
     }
@@ -470,7 +477,7 @@ impl<M: ModelForward> Scheduler<M> {
         let mut i = 0;
         while i < self.active.len() {
             if matches!(self.active[i].phase, Phase::Finished) {
-                let req = self.active.remove(i);
+                let mut req = self.active.remove(i);
                 let gen_tokens = req.generated_tokens.len() as u64;
                 // L1: retracted victims are already re-queued onto
                 // `waiting` by `retract_longest_decode`; their pool pages
@@ -501,6 +508,7 @@ impl<M: ModelForward> Scheduler<M> {
 
                 self.total_completed += 1;
                 self.total_generated_tokens += gen_tokens;
+                req.finished_at = Some(std::time::Instant::now());
                 let e2e_s = req.admitted_at.elapsed().as_secs_f64();
                 let ttft_s = req
                     .first_token_at
@@ -517,6 +525,40 @@ impl<M: ModelForward> Scheduler<M> {
                     tpot_s,
                     e2e_s,
                 );
+
+                if std::env::var("INFER_TRACE").ok().as_deref() == Some("1") {
+                    let e2e_us = req.admitted_at.elapsed().as_micros() as u64;
+                    let ttft_us = req.first_token_at.map_or(e2e_us, |t| {
+                        t.duration_since(req.admitted_at).as_micros() as u64
+                    });
+                    let queue_us = req
+                        .first_step_at
+                        .map_or(0, |t| t.duration_since(req.admitted_at).as_micros() as u64);
+                    let sum_stages = queue_us
+                        + req.t_new_us
+                        + req.t_prefill_us
+                        + req.t_decode_us
+                        + req.t_emit_us;
+                    let residual_us = e2e_us.saturating_sub(sum_stages);
+                    let gen_count = req.generated_tokens.len().max(1) as u64;
+                    let tpot_us = e2e_us.saturating_sub(ttft_us) / gen_count;
+                    info!(
+                        "TRACE id={} e2e_us={} ttft_us={} tpot_us={} steps={} prompt={} gen={} queue_us={} new_us={} prefill_us={} decode_us={} emit_us={} residual_us={}",
+                        req.id,
+                        e2e_us,
+                        ttft_us,
+                        tpot_us,
+                        req.step_count,
+                        req.prompt_tokens.len(),
+                        req.generated_tokens.len(),
+                        queue_us,
+                        req.t_new_us,
+                        req.t_prefill_us,
+                        req.t_decode_us,
+                        req.t_emit_us,
+                        residual_us,
+                    );
+                }
 
                 info!(
                     "Request {} done: {} tokens (active={}, waiting={})",

@@ -7,6 +7,14 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
+        let step_t0 = std::time::Instant::now();
+        let trace_on = std::env::var("INFER_TRACE").ok().as_deref() == Some("1");
+        let decode_count_pre = self
+            .active
+            .iter()
+            .filter(|r| matches!(r.phase, Phase::Decoding))
+            .count();
+
         // Phase 1: Batched decode (GPU forward pass + sampling)
         //
         // Launched BEFORE emit_delta so that GPU compute overlaps with
@@ -61,7 +69,14 @@ impl<M: ModelForward> Scheduler<M> {
                 if matches!(req.phase, Phase::Decoding)
                     && req.decoded_token_count < req.generated_tokens.len()
                 {
-                    req.emit_delta(tokenizer);
+                    if trace_on {
+                        let t = std::time::Instant::now();
+                        req.emit_delta(tokenizer);
+                        req.t_emit_us =
+                            req.t_emit_us.saturating_add(t.elapsed().as_micros() as u64);
+                    } else {
+                        req.emit_delta(tokenizer);
+                    }
                 }
             }
         }
@@ -73,7 +88,18 @@ impl<M: ModelForward> Scheduler<M> {
             let new_idx =
                 (0..self.active.len()).find(|&i| matches!(self.active[i].phase, Phase::New));
             match new_idx {
-                Some(idx) => self.step_new(idx),
+                Some(idx) => {
+                    if trace_on {
+                        let t = std::time::Instant::now();
+                        self.step_new(idx);
+                        let elapsed_us = t.elapsed().as_micros() as u64;
+                        if let Some(req) = self.active.get_mut(idx) {
+                            req.t_new_us = req.t_new_us.saturating_add(elapsed_us);
+                        }
+                    } else {
+                        self.step_new(idx);
+                    }
+                }
                 None => break,
             }
         }
@@ -104,7 +130,16 @@ impl<M: ModelForward> Scheduler<M> {
             .collect();
         for idx in prefill_indices {
             if matches!(self.active[idx].phase, Phase::Prefilling { .. }) {
-                self.step_prefill_chunk(idx);
+                if trace_on {
+                    let t = std::time::Instant::now();
+                    self.step_prefill_chunk(idx);
+                    let elapsed_us = t.elapsed().as_micros() as u64;
+                    if let Some(req) = self.active.get_mut(idx) {
+                        req.t_prefill_us = req.t_prefill_us.saturating_add(elapsed_us);
+                    }
+                } else {
+                    self.step_prefill_chunk(idx);
+                }
             }
         }
         let prefill_us = prefill_t.elapsed().as_micros();
@@ -137,6 +172,23 @@ impl<M: ModelForward> Scheduler<M> {
         update_ema(&mut self.step_timing_emit_us, emit_us);
         update_ema(&mut self.step_timing_prefill_us, prefill_us);
         update_ema(&mut self.step_timing_total_us, total_us);
+
+        if trace_on {
+            let per_decode_us = if decode_count_pre > 0 {
+                (decode_us as u64) / (decode_count_pre as u64)
+            } else {
+                0
+            };
+            for req in &mut self.active {
+                if per_decode_us > 0 && matches!(req.phase, Phase::Decoding | Phase::Finished) {
+                    req.t_decode_us = req.t_decode_us.saturating_add(per_decode_us);
+                }
+                req.step_count = req.step_count.saturating_add(1);
+                if req.first_step_at.is_none() {
+                    req.first_step_at = Some(step_t0);
+                }
+            }
+        }
 
         if total_us > 100_000 {
             info!(
