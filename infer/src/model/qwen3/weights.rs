@@ -62,6 +62,14 @@ pub struct Qwen3Model {
     /// async-free pressure that caused foreign C++ exceptions under load.
     pub(super) paged_prefill_plan:
         std::sync::Mutex<Option<cuda_kernels::flashinfer::BatchPrefillPagedPlan>>,
+    /// Shared scratch-buffer pool for both paged and contiguous prefill paths.
+    /// Lazy-initialized on first call and grown monotonically via
+    /// `PrefillBuffers::ensure_capacity`, so the ~10 per-forward scratch
+    /// allocations (~150MB worth of bf16 buffers at chunk_size=2048) stop
+    /// churning the CUDA stream's async allocator. Same rationale as
+    /// `paged_prefill_plan` — unblocking `prefill_chunk_size=2048 × c=16`
+    /// where per-forward alloc/free backlog poisoned the context.
+    pub(super) prefill_buffers: std::sync::Mutex<Option<super::prefill::PrefillBuffers>>,
     /// Optional PEFT LoRA bundle. `None` = no adapter, forward uses base
     /// weights verbatim. When `Some`, every projection site in prefill /
     /// decode / batch_decode checks `lora.layers[layer_idx].<module>` and
@@ -245,6 +253,7 @@ impl Qwen3Model {
             sin_cache,
             enable_cuda_graph: runtime.enable_cuda_graph,
             paged_prefill_plan: std::sync::Mutex::new(None),
+            prefill_buffers: std::sync::Mutex::new(None),
             lora: None,
         };
 
@@ -484,6 +493,7 @@ impl Qwen3Model {
             sin_cache,
             enable_cuda_graph: runtime.enable_cuda_graph,
             paged_prefill_plan: std::sync::Mutex::new(None),
+            prefill_buffers: std::sync::Mutex::new(None),
             lora: None,
         };
 

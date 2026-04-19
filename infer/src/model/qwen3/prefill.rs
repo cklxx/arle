@@ -9,13 +9,32 @@ use cuda_kernels::flashinfer::BatchPrefillPagedPlan;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
-/// Created once per prefill in `process_all_layers_batch`, eliminating
-/// per-layer `cuMemAllocAsync` overhead (~11k calls / 88ms at seq=2048).
+///
+/// Model-owned, lazily-initialized, mutex-guarded shared buffer pool sized
+/// for the scheduler's `prefill_chunk_size`. Ports sglang's
+/// `global_workspace_buffer` pattern (`flashinfer_backend.py:202-219`): one
+/// allocation per model, reused across all subsequent prefills. Eliminates
+/// ~11k `cuMemAllocAsync` calls per forward AND eliminates the async
+/// alloc/free backlog that poisons the CUDA stream under c=16 concurrency
+/// at chunk_size=2048 (manifests as `gemm_cuda CUDA_ERROR_UNKNOWN`).
 ///
 /// Buffer reuse across steps (all kernels serialized on a single stream):
 ///   `normed`  reused for `normed2`  (steps 1-4 done before step 8)
 ///   `o_buf`   reused for `mlp_out`  (step 7 done before step 12)
-struct PrefillBuffers {
+///
+/// ## Capacity semantics
+/// - `capacity_tokens` records the guaranteed minimum token-count that all
+///   non-`hidden_out` buffers can hold without reallocation. Callers must
+///   invoke `ensure_capacity` before using the buffers for a chunk of
+///   length N; a larger N triggers monotonic regrowth of every buffer.
+/// - `hidden_out` is special: the forward-layer code `std::mem::swap`s it
+///   with the incoming `hidden` on every residual add, so by the time a
+///   subsequent forward starts, `hidden_out` may hold a smaller (embedding-
+///   sized) buffer than `capacity_tokens`. `ensure_capacity` therefore
+///   checks `hidden_out.data.len()` independently of `capacity_tokens`.
+pub(super) struct PrefillBuffers {
+    /// Last guaranteed capacity (tokens) for non-`hidden_out` buffers.
+    capacity_tokens: usize,
     /// Output ping-pong: layer writes result here; caller swaps with the incoming hidden.
     hidden_out: HiddenStates, // hidden_dim × seq_len
     /// fp32 shadow of the residual stream. Maintained across layers so that
@@ -36,36 +55,94 @@ struct PrefillBuffers {
 }
 
 impl PrefillBuffers {
-    fn new(
+    pub(super) fn new_with_capacity(
         ctx: &DeviceContext,
         hidden_dim: usize,
         q_dim: usize,
         kv_dim: usize,
         inter_dim: usize,
-        seq_len: usize,
+        capacity_tokens: usize,
     ) -> Result<Self> {
-        let residual_f32 = if std::env::var("INFER_QWEN3_FP32_RESIDUAL").is_ok() {
-            Some(
-                ctx.stream
-                    .alloc_zeros::<f32>(hidden_dim * seq_len)
-                    .map_err(|e| anyhow::anyhow!("alloc residual_f32: {e}"))?,
-            )
-        } else {
-            None
-        };
+        // `residual_f32` stays `None` here: `rms_norm_batch_f32_in_into` asserts
+        // strict equality between `x_f32.len()` and `hidden_dim * seq_len`, so
+        // the f32 shadow must be sized per-chunk rather than to the pool
+        // capacity. `ensure_capacity` sizes it to the active seq_len below.
         Ok(Self {
-            hidden_out: HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
-            residual_f32,
-            normed: HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
-            q_batch: HiddenStates::zeros(ctx, q_dim, seq_len)?,
-            k_batch: HiddenStates::zeros(ctx, kv_dim, seq_len)?,
-            v_batch: HiddenStates::zeros(ctx, kv_dim, seq_len)?,
-            o_buf: HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
-            gate_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
-            up_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
-            act_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
-            attn_output: HiddenStates::zeros(ctx, q_dim, seq_len)?,
+            capacity_tokens,
+            hidden_out: HiddenStates::zeros(ctx, hidden_dim, capacity_tokens)?,
+            residual_f32: None,
+            normed: HiddenStates::zeros(ctx, hidden_dim, capacity_tokens)?,
+            q_batch: HiddenStates::zeros(ctx, q_dim, capacity_tokens)?,
+            k_batch: HiddenStates::zeros(ctx, kv_dim, capacity_tokens)?,
+            v_batch: HiddenStates::zeros(ctx, kv_dim, capacity_tokens)?,
+            o_buf: HiddenStates::zeros(ctx, hidden_dim, capacity_tokens)?,
+            gate_out: HiddenStates::zeros(ctx, inter_dim, capacity_tokens)?,
+            up_out: HiddenStates::zeros(ctx, inter_dim, capacity_tokens)?,
+            act_out: HiddenStates::zeros(ctx, inter_dim, capacity_tokens)?,
+            attn_output: HiddenStates::zeros(ctx, q_dim, capacity_tokens)?,
         })
+    }
+
+    /// Grow buffers if `required` exceeds the last guaranteed capacity.
+    /// Also repairs `hidden_out` if a prior forward's `std::mem::swap` left
+    /// it holding a smaller (embedding-sized) buffer, and (re)allocates
+    /// `residual_f32` to match the active chunk length when the fp32
+    /// residual shadow is enabled (opt-in diagnostic, not on the hot path).
+    pub(super) fn ensure_capacity(
+        &mut self,
+        ctx: &DeviceContext,
+        hidden_dim: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        inter_dim: usize,
+        required: usize,
+    ) -> Result<()> {
+        if required > self.capacity_tokens {
+            // Monotonic regrowth: reallocate every bf16 buffer at the new max.
+            *self = Self::new_with_capacity(ctx, hidden_dim, q_dim, kv_dim, inter_dim, required)?;
+        } else if self.hidden_out.data.len() < hidden_dim * required {
+            // Even when `capacity_tokens` is sufficient, `hidden_out` may have
+            // been swapped with a smaller incoming `hidden` on the previous
+            // forward — check its actual storage independently.
+            self.hidden_out = HiddenStates::zeros(ctx, hidden_dim, self.capacity_tokens)?;
+        }
+        // `residual_f32` must match `hidden_dim * seq_len` exactly
+        // (`rms_norm_batch_f32_in_into` strict-equality assert). Allocate
+        // only when the env flag is set; size to the active chunk.
+        if std::env::var("INFER_QWEN3_FP32_RESIDUAL").is_ok() {
+            let needed = hidden_dim * required;
+            let realloc = match &self.residual_f32 {
+                Some(r) => r.len() != needed,
+                None => true,
+            };
+            if realloc {
+                self.residual_f32 = Some(
+                    ctx.stream
+                        .alloc_zeros::<f32>(needed)
+                        .map_err(|e| anyhow::anyhow!("alloc residual_f32: {e}"))?,
+                );
+            }
+        } else {
+            self.residual_f32 = None;
+        }
+        Ok(())
+    }
+
+    /// Set the `seq_len` field on every scratch buffer to the active chunk
+    /// length. The underlying `data` capacity is already >= `seq_len` thanks
+    /// to `ensure_capacity`; updating `seq_len` makes the `_into` ops'
+    /// `assert_eq!(out.seq_len, x.seq_len)` shape checks pass.
+    fn set_active_seq_len(&mut self, seq_len: usize) {
+        self.hidden_out.seq_len = seq_len;
+        self.normed.seq_len = seq_len;
+        self.q_batch.seq_len = seq_len;
+        self.k_batch.seq_len = seq_len;
+        self.v_batch.seq_len = seq_len;
+        self.o_buf.seq_len = seq_len;
+        self.gate_out.seq_len = seq_len;
+        self.up_out.seq_len = seq_len;
+        self.act_out.seq_len = seq_len;
+        self.attn_output.seq_len = seq_len;
     }
 }
 
@@ -95,15 +172,38 @@ impl Qwen3Model {
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
 
-        // Allocate all intermediates once — eliminates ~11k cuMemAllocAsync calls.
-        let mut bufs = PrefillBuffers::new(
-            &self.ctx,
-            self.config.hidden_size,
-            q_dim,
-            kv_dim,
-            inter_dim,
-            seq_len,
-        )?;
+        // Model-owned scratch pool: eliminates ~11k cuMemAllocAsync calls per
+        // forward and keeps the CUDA stream's async alloc/free backlog
+        // bounded. See `PrefillBuffers` doc comment.
+        let mut bufs_guard = self
+            .prefill_buffers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("prefill_buffers mutex poisoned"))?;
+        let bufs = match &mut *bufs_guard {
+            Some(existing) => {
+                existing.ensure_capacity(
+                    &self.ctx,
+                    self.config.hidden_size,
+                    q_dim,
+                    kv_dim,
+                    inter_dim,
+                    seq_len,
+                )?;
+                existing
+            }
+            slot @ None => {
+                *slot = Some(PrefillBuffers::new_with_capacity(
+                    &self.ctx,
+                    self.config.hidden_size,
+                    q_dim,
+                    kv_dim,
+                    inter_dim,
+                    seq_len,
+                )?);
+                slot.as_mut().expect("just populated")
+            }
+        };
+        bufs.set_active_seq_len(seq_len);
 
         // If fp32 residual shadow is enabled, seed it from the bf16 embedding.
         if let Some(ref mut r) = bufs.residual_f32 {
@@ -111,14 +211,7 @@ impl Qwen3Model {
         }
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            self.forward_layer_batch(
-                layer_idx,
-                layer,
-                &mut hidden,
-                start_pos,
-                kv_cache,
-                &mut bufs,
-            )?;
+            self.forward_layer_batch(layer_idx, layer, &mut hidden, start_pos, kv_cache, bufs)?;
         }
 
         // If fp32 residual shadow was active, convert back to bf16 for the
@@ -158,14 +251,38 @@ impl Qwen3Model {
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
 
-        let mut bufs = PrefillBuffers::new(
-            &self.ctx,
-            self.config.hidden_size,
-            q_dim,
-            kv_dim,
-            inter_dim,
-            seq_len,
-        )?;
+        // Model-owned scratch pool (see `PrefillBuffers` doc). Guard is held
+        // for the full forward; `paged_prefill_plan` is acquired afterwards
+        // so the lock-acquisition order is stable across all prefill paths.
+        let mut bufs_guard = self
+            .prefill_buffers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("prefill_buffers mutex poisoned"))?;
+        let bufs = match &mut *bufs_guard {
+            Some(existing) => {
+                existing.ensure_capacity(
+                    &self.ctx,
+                    self.config.hidden_size,
+                    q_dim,
+                    kv_dim,
+                    inter_dim,
+                    seq_len,
+                )?;
+                existing
+            }
+            slot @ None => {
+                *slot = Some(PrefillBuffers::new_with_capacity(
+                    &self.ctx,
+                    self.config.hidden_size,
+                    q_dim,
+                    kv_dim,
+                    inter_dim,
+                    seq_len,
+                )?);
+                slot.as_mut().expect("just populated")
+            }
+        };
+        bufs.set_active_seq_len(seq_len);
 
         // Per-forward GPU-resident page table (1 i32 per logical page in the
         // slot). Uploaded once and reused across all 36 layers.
@@ -228,7 +345,7 @@ impl Qwen3Model {
                 layer,
                 &mut hidden,
                 start_pos,
-                &mut bufs,
+                bufs,
                 pool,
                 &slot_page_indices,
                 &mut fwd,
