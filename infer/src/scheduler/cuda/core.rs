@@ -19,6 +19,7 @@ pub(super) const PREFIX_CACHE_BLOCK_SIZE: usize = 16;
 /// decode writes directly to the paged pool via `decode_prep_paged`.
 /// Prefill chunk size is capped to this value to prevent buffer overflow.
 pub(super) const CONTIGUOUS_KV_TOKENS: usize = 512;
+pub(super) const DECODE_HEADROOM_PAGES: usize = 32;
 
 // Prefix-cache watermark / keepalive tunables moved to
 // `crate::scheduler::types::SchedulerConfig` in Tier C. See the doc
@@ -171,6 +172,30 @@ impl<M: ModelForward> Scheduler<M> {
         let high = (total as f64 * self.config.prefix_cache_high_water) as usize;
         let low = (total as f64 * self.config.prefix_cache_low_water) as usize;
         (high, low)
+    }
+
+    pub(super) fn admission_budget_pages(&self) -> usize {
+        // Admission must not overcommit the pool across two time horizons at
+        // once: (a) pages that are already physically held (live slot KV +
+        // prefix-cache-retained pages), already reflected by `free_count()`;
+        // and (b) the *remaining* worst-case growth of in-flight requests
+        // that haven't yet allocated their full prompt+decode budget. We
+        // therefore take current free pages and subtract the *future*
+        // growth owed to each active request, plus a small decode-headroom
+        // reserve for the retry-with-reclaim path.
+        let page_size = self.paged_kv_pool.page_size;
+        let future_growth: usize = self
+            .active
+            .iter()
+            .map(|r| {
+                let held = self.paged_kv_pool.seq_len(r.slot_idx).div_ceil(page_size);
+                r.reserved_pool_pages.saturating_sub(held)
+            })
+            .sum();
+        let free_pages = self.paged_kv_pool.free_count() / page_size;
+        free_pages
+            .saturating_sub(future_growth)
+            .saturating_sub(DECODE_HEADROOM_PAGES)
     }
 
     pub fn session_fingerprints(&self, session_id: &str) -> Vec<BlockFingerprint> {

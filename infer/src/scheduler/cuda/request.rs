@@ -55,6 +55,12 @@ pub(crate) struct ActiveRequest {
     /// prompt-prefix-of-cached / extendable-prefix distinctions without keeping
     /// a parallel `cached_prompts: Vec<Vec<u32>>` token store.
     pub(crate) reusable_cached_prompt_len: usize,
+    /// Worst-case pool-page reservation committed at admission time:
+    /// ceil((uncached_prompt_tokens + max_tokens) / page_size). Used by
+    /// `Scheduler::admission_budget_pages()` to avoid over-admission when
+    /// a tick's in-flight requests haven't yet physically allocated their
+    /// full future working set.
+    pub(crate) reserved_pool_pages: usize,
 }
 
 impl ActiveRequest {
@@ -264,6 +270,7 @@ mod tests {
             latest_logprob: None,
             reusable_prefix_len: 0,
             reusable_cached_prompt_len: 0,
+            reserved_pool_pages: 0,
         }
     }
 
