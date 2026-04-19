@@ -14,7 +14,7 @@
 #[cfg(not(feature = "no-cuda"))]
 use crate::{
     AutogradError,
-    backend::{CudaStorage, matmul_output_shape},
+    backend::{CudaStorage, matmul_output_shape, validate_broadcast},
 };
 use crate::{
     Result,
@@ -439,6 +439,24 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn add_broadcast_forward(
+        &self,
+        a: &[f32],
+        a_shape: &[usize],
+        b: &[f32],
+        b_shape: &[usize],
+    ) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (a, a_shape, b, b_shape);
+            todo!("GPU required: cuda add_broadcast is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_add_broadcast(self, a, a_shape, b, b_shape)
+        }
+    }
+
     fn exp_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
         #[cfg(feature = "no-cuda")]
         {
@@ -579,6 +597,25 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_gather_last_dim(self, src, src_shape, ids)
+        }
+    }
+
+    fn scatter_add_rows_forward(
+        &self,
+        upstream: &[f32],
+        prefix_rows: usize,
+        feature_dim: usize,
+        indices: &[i32],
+        vocab: usize,
+    ) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream, prefix_rows, feature_dim, indices, vocab);
+            todo!("GPU required: cuda scatter_add_rows is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_scatter_add_rows(self, upstream, prefix_rows, feature_dim, indices, vocab)
         }
     }
 }
@@ -1058,6 +1095,169 @@ fn cuda_gather_last_dim(
         },
     )?;
     cuda_download(backend, &d_out, prefix)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_scatter_add_rows(
+    backend: &CudaBackend,
+    upstream: &[f32],
+    prefix_rows: usize,
+    feature_dim: usize,
+    indices: &[i32],
+    vocab: usize,
+) -> Result<Vec<f32>> {
+    let expected_upstream = prefix_rows * feature_dim;
+    if upstream.len() != expected_upstream {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![expected_upstream],
+            got: vec![upstream.len()],
+        });
+    }
+    if indices.len() != prefix_rows {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: prefix_rows,
+            got: indices.len(),
+        });
+    }
+    let out_len = vocab * feature_dim;
+    // Zero-initialize the accumulator on-device — the kernel only adds.
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(out_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+    if prefix_rows == 0 || feature_dim == 0 {
+        return cuda_download(backend, &d_out, out_len);
+    }
+    let d_upstream = backend
+        .stream
+        .clone_htod(upstream)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let d_idx = backend
+        .stream
+        .clone_htod(indices)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+
+    let prefix_i32 = i32::try_from(prefix_rows)
+        .map_err(|_| AutogradError::TapeInvariant("cuda scatter_add prefix_rows exceeds i32"))?;
+    let feature_i32 = i32::try_from(feature_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda scatter_add feature_dim exceeds i32"))?;
+    let vocab_i32 = i32::try_from(vocab)
+        .map_err(|_| AutogradError::TapeInvariant("cuda scatter_add vocab exceeds i32"))?;
+
+    let block = std::cmp::min(feature_dim, 256) as u32;
+    let block = block.max(1);
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function("scatter_add_rows_f32")?,
+        prefix_rows,
+        block,
+        0,
+        |builder| {
+            builder
+                .arg(&mut d_out)
+                .arg(&d_upstream)
+                .arg(&d_idx)
+                .arg(&prefix_i32)
+                .arg(&feature_i32)
+                .arg(&vocab_i32);
+        },
+    )?;
+    cuda_download(backend, &d_out, out_len)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_add_broadcast(
+    backend: &CudaBackend,
+    a: &[f32],
+    a_shape: &[usize],
+    b: &[f32],
+    b_shape: &[usize],
+) -> Result<Vec<f32>> {
+    validate_broadcast(a_shape, b_shape)?;
+    let total: usize = if a_shape.is_empty() {
+        1
+    } else {
+        a_shape.iter().product()
+    };
+    let b_size: usize = if b_shape.is_empty() {
+        1
+    } else {
+        b_shape.iter().product()
+    };
+    if a.len() != total {
+        return Err(AutogradError::DataLengthMismatch {
+            len: a.len(),
+            shape: a_shape.to_vec(),
+            size: total,
+        });
+    }
+    if b.len() != b_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: b.len(),
+            shape: b_shape.to_vec(),
+            size: b_size,
+        });
+    }
+
+    // Build right-aligned b-strides of length `out_rank`: 0 on broadcast axes
+    // (axis missing from b_shape or b_shape dim == 1), contiguous otherwise.
+    let out_rank = a_shape.len();
+    let rank_offset = out_rank - b_shape.len();
+    let mut b_strides = vec![0_i32; out_rank];
+    let mut stride: i32 = 1;
+    for i in (0..b_shape.len()).rev() {
+        let dim = b_shape[i];
+        if dim == 1 {
+            b_strides[rank_offset + i] = 0;
+        } else {
+            b_strides[rank_offset + i] = stride;
+        }
+        // Advance stride regardless so the row-major layout over the b buffer
+        // is consistent — broadcast axes still occupy 1 slot in b.
+        stride = stride.saturating_mul(dim as i32);
+    }
+
+    let out_shape_i32: Vec<i32> = a_shape.iter().map(|&d| d as i32).collect();
+
+    let d_a = backend.upload_slice(a, a_shape)?;
+    let d_b = backend
+        .stream
+        .clone_htod(b)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let d_out_shape = backend
+        .stream
+        .clone_htod(&out_shape_i32)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let d_b_strides = backend
+        .stream
+        .clone_htod(&b_strides)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+
+    let out_rank_i32 = i32::try_from(out_rank)
+        .map_err(|_| AutogradError::TapeInvariant("cuda add_broadcast rank exceeds i32"))?;
+    let total_i32 = i32::try_from(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda add_broadcast total exceeds i32"))?;
+
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("add_broadcast_f32")?,
+        total,
+        |builder| {
+            builder
+                .arg(&d_a)
+                .arg(&d_b)
+                .arg(&mut d_out)
+                .arg(&d_out_shape)
+                .arg(&d_b_strides)
+                .arg(&out_rank_i32)
+                .arg(&total_i32);
+        },
+    )?;
+    cuda_download(backend, &d_out, total)
 }
 
 #[cfg(not(feature = "no-cuda"))]
