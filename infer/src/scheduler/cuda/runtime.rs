@@ -336,23 +336,6 @@ impl<M: ModelForward> Scheduler<M> {
             } else {
                 0
             };
-            let extend_input_tokens = prompt_tokens.len().saturating_sub(radix_hit_len);
-            let clipped_max_new = incoming
-                .max_tokens
-                .min(self.config.admission_clip_max_new_tokens);
-            let total_tokens_needed = extend_input_tokens + clipped_max_new;
-            if total_tokens_needed >= tick_budget_tokens {
-                self.prefix_cache.release(&radix_blocks);
-                info!(
-                    "Request {} held for pool (need={} tok, budget={} tok)",
-                    self.next_id, total_tokens_needed, tick_budget_tokens
-                );
-                self.waiting.push_front(incoming);
-                break;
-            }
-            tick_budget_tokens = tick_budget_tokens.saturating_sub(
-                extend_input_tokens + clipped_max_new + self.paged_kv_pool.page_size,
-            );
             let gpu_ready_prefix_blocks: Vec<_> = lookup
                 .blocks
                 .iter()
@@ -373,6 +356,33 @@ impl<M: ModelForward> Scheduler<M> {
             };
             let (slot_idx, reusable_prefix_len, reusable_cached_prompt_len) =
                 reusable.unwrap_or((free_slots[0], 0, 0));
+            // Admission gate (P1#1): subtract what the scheduler will
+            // *actually* reuse. When `best_reusable_slot_for_radix_hit`
+            // returns None, reuse is 0 even if `radix_hit_len` matched —
+            // step_new re-prefills the whole prompt onto a cold slot.
+            // Gating on `radix_hit_len` (the looser global match) under-
+            // reserves pool tokens and OOMs on chunked prefill.
+            let extend_input_tokens = prompt_tokens.len().saturating_sub(reusable_prefix_len);
+            let clipped_max_new = incoming
+                .max_tokens
+                .min(self.config.admission_clip_max_new_tokens);
+            let total_tokens_needed = extend_input_tokens + clipped_max_new;
+            if total_tokens_needed >= tick_budget_tokens {
+                self.prefix_cache.release(&radix_blocks);
+                info!(
+                    "Request {} held for pool (need={} tok, budget={} tok, radix_hit={}, reusable_prefix={})",
+                    self.next_id,
+                    total_tokens_needed,
+                    tick_budget_tokens,
+                    radix_hit_len,
+                    reusable_prefix_len
+                );
+                self.waiting.push_front(incoming);
+                break;
+            }
+            tick_budget_tokens = tick_budget_tokens.saturating_sub(
+                extend_input_tokens + clipped_max_new + self.paged_kv_pool.page_size,
+            );
             self.prefix_cache.release(&radix_blocks);
 
             let id = self.next_id;
@@ -462,16 +472,32 @@ impl<M: ModelForward> Scheduler<M> {
             if matches!(self.active[i].phase, Phase::Finished) {
                 let req = self.active.remove(i);
                 let gen_tokens = req.generated_tokens.len() as u64;
+                // L1: retracted victims are already re-queued onto
+                // `waiting` by `retract_longest_decode`; their pool pages
+                // are already released; their cached prompt is incomplete
+                // (partial prefill) so we must NOT publish it to the
+                // prefix cache, and this is NOT a completion for metrics.
+                let was_retracted = self.retracted_request_ids.remove(&req.id);
                 self.clear_slot_prefix_ownership(req.slot_idx);
 
-                if let Some(prompt_tokens) = req.cached_prompt_to_publish() {
+                if !was_retracted && let Some(prompt_tokens) = req.cached_prompt_to_publish() {
                     let prompt_vec = prompt_tokens.to_vec();
                     self.slot_materialized_prompt_lens[req.slot_idx] = prompt_vec.len();
                     self.publish_to_prefix_cache(req.slot_idx, &prompt_vec, req.session_id.clone());
                 } else {
                     self.slot_materialized_prompt_lens[req.slot_idx] = 0;
                 }
+                // Pool pages already freed inside retract; `free_slot`
+                // here is idempotent but we keep it so the non-retract
+                // path (normal completion) still releases.
                 self.paged_kv_pool.free_slot(req.slot_idx);
+
+                if was_retracted {
+                    if self.last_served >= self.active.len() && !self.active.is_empty() {
+                        self.last_served = 0;
+                    }
+                    continue;
+                }
 
                 self.total_completed += 1;
                 self.total_generated_tokens += gen_tokens;
