@@ -165,10 +165,22 @@ impl<M: ModelForward> Scheduler<M> {
             && self.paged_kv_pool.free_count() < decode_indices.len() + prefill_token_total
             && decode_indices.len() > 1
         {
+            // sglang-parity victim ranking (`ScheduleBatch.retract_decode`):
+            // prefer the request with the most OUTPUT tokens AND the shortest
+            // INPUT tokens — i.e. the cheapest to re-prefill. Previous
+            // single-key ranking only considered output length, so we kept
+            // preempting the 4 k-prompt reqs that cost 4 k tokens of re-prefill
+            // each cycle under memory pressure.
             let victim_pos = decode_indices
                 .iter()
                 .enumerate()
-                .max_by_key(|(_, i)| self.active[**i].generated_tokens.len())
+                .max_by_key(|(_, i)| {
+                    let r = &self.active[**i];
+                    (
+                        r.generated_tokens.len() as i64,
+                        -(r.prompt_tokens.len() as i64),
+                    )
+                })
                 .map(|(pos, _)| pos)
                 .unwrap();
             let victim_idx = decode_indices[victim_pos];
@@ -499,11 +511,22 @@ impl<M: ModelForward> Scheduler<M> {
             && self.paged_kv_pool.free_count() < decode_indices.len()
             && decode_indices.len() > 1
         {
-            // Pick victim: most generated tokens = highest KV cost
+            // Pick victim: sglang-parity `retract_decode` ranking. Prefer the
+            // request with the most output tokens AND the shortest input
+            // tokens — cheapest to re-prefill when it resumes. Previous
+            // single-key ranking only considered output length, repeatedly
+            // preempting the 4 k-prompt reqs and paying 4 k of re-prefill on
+            // each cycle under pool pressure.
             let victim_pos = decode_indices
                 .iter()
                 .enumerate()
-                .max_by_key(|(_, i)| self.active[**i].generated_tokens.len())
+                .max_by_key(|(_, i)| {
+                    let r = &self.active[**i];
+                    (
+                        r.generated_tokens.len() as i64,
+                        -(r.prompt_tokens.len() as i64),
+                    )
+                })
                 .map(|(pos, _)| pos)
                 .unwrap();
             let victim_idx = decode_indices[victim_pos];
