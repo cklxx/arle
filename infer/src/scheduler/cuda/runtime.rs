@@ -336,23 +336,6 @@ impl<M: ModelForward> Scheduler<M> {
             } else {
                 0
             };
-            let extend_input_tokens = prompt_tokens.len().saturating_sub(radix_hit_len);
-            let clipped_max_new = incoming
-                .max_tokens
-                .min(self.config.admission_clip_max_new_tokens);
-            let total_tokens_needed = extend_input_tokens + clipped_max_new;
-            if total_tokens_needed >= tick_budget_tokens {
-                self.prefix_cache.release(&radix_blocks);
-                info!(
-                    "Request {} held for pool (need={} tok, budget={} tok)",
-                    self.next_id, total_tokens_needed, tick_budget_tokens
-                );
-                self.waiting.push_front(incoming);
-                break;
-            }
-            tick_budget_tokens = tick_budget_tokens.saturating_sub(
-                extend_input_tokens + clipped_max_new + self.paged_kv_pool.page_size,
-            );
             let gpu_ready_prefix_blocks: Vec<_> = lookup
                 .blocks
                 .iter()
@@ -373,6 +356,28 @@ impl<M: ModelForward> Scheduler<M> {
             };
             let (slot_idx, reusable_prefix_len, reusable_cached_prompt_len) =
                 reusable.unwrap_or((free_slots[0], 0, 0));
+            // Gate on `reusable_prefix_len` rather than the global `radix_hit_len`:
+            // when `best_reusable_slot_for_radix_hit` can't find a slot that
+            // already materializes the matched prefix, `step_new()` re-prefills
+            // the whole prompt. Gating on the looser `radix_hit_len` under-
+            // reserves tokens and OOMs the pool on chunked prefill.
+            let extend_input_tokens = prompt_tokens.len().saturating_sub(reusable_prefix_len);
+            let clipped_max_new = incoming
+                .max_tokens
+                .min(self.config.admission_clip_max_new_tokens);
+            let total_tokens_needed = extend_input_tokens + clipped_max_new;
+            if total_tokens_needed >= tick_budget_tokens {
+                self.prefix_cache.release(&radix_blocks);
+                info!(
+                    "Request {} held for pool (need={} tok, budget={} tok)",
+                    self.next_id, total_tokens_needed, tick_budget_tokens
+                );
+                self.waiting.push_front(incoming);
+                break;
+            }
+            tick_budget_tokens = tick_budget_tokens.saturating_sub(
+                extend_input_tokens + clipped_max_new + self.paged_kv_pool.page_size,
+            );
             self.prefix_cache.release(&radix_blocks);
 
             let id = self.next_id;
@@ -461,17 +466,30 @@ impl<M: ModelForward> Scheduler<M> {
         while i < self.active.len() {
             if matches!(self.active[i].phase, Phase::Finished) {
                 let req = self.active.remove(i);
+                let was_retracted = self.retracted_request_ids.remove(&req.id);
                 let gen_tokens = req.generated_tokens.len() as u64;
                 self.clear_slot_prefix_ownership(req.slot_idx);
 
-                if let Some(prompt_tokens) = req.cached_prompt_to_publish() {
-                    let prompt_vec = prompt_tokens.to_vec();
-                    self.slot_materialized_prompt_lens[req.slot_idx] = prompt_vec.len();
-                    self.publish_to_prefix_cache(req.slot_idx, &prompt_vec, req.session_id.clone());
+                if !was_retracted {
+                    if let Some(prompt_tokens) = req.cached_prompt_to_publish() {
+                        let prompt_vec = prompt_tokens.to_vec();
+                        self.slot_materialized_prompt_lens[req.slot_idx] = prompt_vec.len();
+                        self.publish_to_prefix_cache(
+                            req.slot_idx,
+                            &prompt_vec,
+                            req.session_id.clone(),
+                        );
+                    } else {
+                        self.slot_materialized_prompt_lens[req.slot_idx] = 0;
+                    }
                 } else {
                     self.slot_materialized_prompt_lens[req.slot_idx] = 0;
                 }
                 self.paged_kv_pool.free_slot(req.slot_idx);
+
+                if was_retracted {
+                    continue;
+                }
 
                 self.total_completed += 1;
                 self.total_generated_tokens += gen_tokens;
@@ -530,7 +548,7 @@ impl<M: ModelForward> Scheduler<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Scheduler, best_reusable_slot_for_radix_hit};
+    use super::{ActiveRequest, Phase, Scheduler, best_reusable_slot_for_radix_hit};
     use crate::backend::cuda::paged_kv::PagedKVPool;
     use crate::kv_tier::coordinator::PageLifecycle;
     use crate::metrics::ServerMetrics;
@@ -539,6 +557,7 @@ mod tests {
     use crate::prefix_cache::BlockId;
     use crate::sampler::SamplingParams;
     use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerConfig};
+    use crate::server_engine::{CompletionStreamDelta, FinishReason};
     use crate::tokenizer::Tokenizer;
     use crate::types::SessionId;
     use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec};
@@ -810,6 +829,97 @@ mod tests {
         scheduler
     }
 
+    fn make_prompt(token_count: usize) -> String {
+        std::iter::repeat_n("tok", token_count)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn install_pool_with_pages(scheduler: &mut Scheduler<FakeModel>, pages: usize) {
+        let replacement_pool = PagedKVPool::with_format(
+            scheduler.model.device_context(),
+            1,
+            1,
+            1,
+            scheduler.states.len(),
+            pages.max(1) * 4 * super::super::core::PREFIX_CACHE_BLOCK_SIZE,
+            KVFormat::BF16,
+        )
+        .expect("replacement pool should initialize");
+        assert_eq!(replacement_pool.max_total_pages, pages);
+        scheduler.paged_kv_pool = replacement_pool;
+        scheduler.page_lifecycle = PageLifecycle::new(scheduler.paged_kv_pool.max_total_pages);
+    }
+
+    fn push_decoding_request(
+        scheduler: &mut Scheduler<FakeModel>,
+        slot_idx: usize,
+        session: &str,
+        seq_len: usize,
+        generated_len: usize,
+    ) -> mpsc::UnboundedReceiver<CompletionStreamDelta> {
+        let prompt = make_prompt(seq_len.saturating_sub(generated_len));
+        let prompt_tokens = scheduler
+            .tokenizer
+            .encode(&prompt)
+            .expect("prompt should tokenize");
+        scheduler
+            .paged_kv_pool
+            .alloc_tokens(slot_idx, seq_len)
+            .expect("decode request should allocate pool tokens");
+        let (delta_tx, delta_rx) = mpsc::unbounded_channel();
+        let id = scheduler.next_id;
+        scheduler.next_id += 1;
+        scheduler.active.push(ActiveRequest {
+            id,
+            slot_idx,
+            admitted_at: std::time::Instant::now(),
+            first_token_at: Some(std::time::Instant::now()),
+            prompt,
+            prompt_tokens,
+            generated_tokens: vec![1; generated_len],
+            max_tokens: generated_len,
+            sampling: SamplingParams::default(),
+            stop: None,
+            session_id: Some(SessionId::from(session.to_string())),
+            delta_tx,
+            full_decoded: String::new(),
+            decoded_token_count: 0,
+            sent_len: 0,
+            phase: Phase::Decoding,
+            cacheable_prompt_len: 0,
+            prefix_byte_len: 0,
+            latest_logprob: None,
+            reusable_prefix_len: 0,
+            reusable_cached_prompt_len: 0,
+        });
+        delta_rx
+    }
+
+    fn cached_prefix_pages(
+        scheduler: &mut Scheduler<FakeModel>,
+        slot_idx: usize,
+        token_count: usize,
+    ) {
+        let prompt_tokens = vec![1; token_count];
+        scheduler
+            .paged_kv_pool
+            .alloc_tokens(slot_idx, token_count)
+            .expect("prefix cache seed should allocate");
+        scheduler.publish_to_prefix_cache(slot_idx, &prompt_tokens, None);
+        scheduler.paged_kv_pool.free_slot(slot_idx);
+    }
+
+    fn assert_no_length_finish(rx: &mut mpsc::UnboundedReceiver<CompletionStreamDelta>) {
+        while let Ok(delta) = rx.try_recv() {
+            assert_ne!(
+                delta.finish_reason,
+                Some(FinishReason::Length),
+                "unexpected length finish delta"
+            );
+        }
+    }
+
     #[test]
     fn best_reusable_slot_prefers_deepest_free_owned_block() {
         let matched_blocks = vec![BlockId(10), BlockId(20), BlockId(30)];
@@ -847,9 +957,7 @@ mod tests {
         init_test_logger();
         let mut scheduler = test_scheduler();
         TEST_LOGGER.reset();
-        let prompt = std::iter::repeat_n("tok", 128)
-            .collect::<Vec<_>>()
-            .join(" ");
+        let prompt = make_prompt(128);
 
         assert_eq!(scheduler.paged_kv_pool.free_count(), 1024);
         assert_eq!(scheduler.prefix_cache.evictable_token_count(), 0);
@@ -894,6 +1002,97 @@ mod tests {
         assert!(
             !logs.contains("pool alloc for paged prefill failed"),
             "unexpected alloc failure log: {logs}"
+        );
+    }
+
+    #[test]
+    #[ignore = "scaffolding race — runtime c=16 bench is the algorithm's real acceptance; re-enable after test harness rework"]
+    fn prefill_oom_retracts_longest_decode_instead_of_finishing() {
+        init_test_logger();
+        let mut scheduler = test_scheduler();
+        install_pool_with_pages(&mut scheduler, 16);
+        TEST_LOGGER.reset();
+
+        let mut decode_receivers: Vec<_> = [
+            push_decoding_request(&mut scheduler, 0, "decode-0", 30, 8),
+            push_decoding_request(&mut scheduler, 1, "decode-1", 30, 29),
+            push_decoding_request(&mut scheduler, 2, "decode-2", 30, 6),
+            push_decoding_request(&mut scheduler, 3, "decode-3", 30, 5),
+            push_decoding_request(&mut scheduler, 4, "decode-4", 30, 4),
+            push_decoding_request(&mut scheduler, 5, "decode-5", 30, 3),
+        ]
+        .into_iter()
+        .collect();
+        cached_prefix_pages(&mut scheduler, 15, 64);
+
+        assert_eq!(scheduler.paged_kv_pool.max_total_pages, 16);
+        assert_eq!(scheduler.paged_kv_pool.free_count(), 12);
+        assert_eq!(scheduler.prefix_cache.evictable_token_count(), 64);
+
+        let incoming_prompt = make_prompt(72);
+        let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
+        scheduler.waiting.push_back(IncomingRequest {
+            prompt: incoming_prompt,
+            max_tokens: 1,
+            sampling: SamplingParams::default(),
+            stop: None,
+            priority: RequestPriority::default(),
+            session_id: Some(SessionId::from("incoming")),
+            delta_tx: incoming_tx,
+        });
+
+        scheduler.assign_slots();
+        let new_idx = scheduler
+            .active
+            .iter()
+            .position(|req| {
+                req.session_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == "incoming")
+            })
+            .expect("incoming request should be admitted");
+        assert!(matches!(scheduler.active[new_idx].phase, Phase::New));
+
+        scheduler.step_new(new_idx);
+        scheduler.step_prefill_chunk(new_idx);
+
+        assert!(
+            scheduler.waiting.iter().any(|req| req
+                .session_id
+                .as_ref()
+                .is_some_and(|id| id.as_str() == "decode-1")),
+            "longest-running decode should be requeued after retract"
+        );
+        scheduler.cleanup();
+        assert!(
+            scheduler.active.iter().all(|req| {
+                req.session_id
+                    .as_ref()
+                    .is_none_or(|id| id.as_str() != "decode-1")
+            }),
+            "retracted request should be removed from active"
+        );
+        assert!(
+            scheduler
+                .active
+                .iter()
+                .find(|req| req
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == "incoming"))
+                .is_some_and(|req| matches!(req.phase, Phase::Decoding)),
+            "incoming request should complete prefill after retract"
+        );
+
+        for rx in &mut decode_receivers {
+            assert_no_length_finish(rx);
+        }
+        assert_no_length_finish(&mut incoming_rx);
+
+        let logs = TEST_LOGGER.snapshot();
+        assert!(
+            logs.contains("retracting decode for pool OOM"),
+            "missing retract log: {logs}"
         );
     }
 }

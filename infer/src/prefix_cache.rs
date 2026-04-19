@@ -265,15 +265,6 @@ impl RadixCache {
         0
     }
 
-    fn subtree_has_allocated_block(&self, node_idx: usize) -> bool {
-        let node = &self.nodes[node_idx];
-        node.block_id.is_some()
-            || node
-                .children
-                .values()
-                .any(|&child_idx| self.subtree_has_allocated_block(child_idx))
-    }
-
     /// Allocate a node slot, reusing a reclaimed tombstone if possible.
     fn alloc_node(&mut self, node: Node) -> usize {
         if let Some(idx) = self.free_nodes.pop() {
@@ -741,18 +732,20 @@ impl RadixCache {
     /// `ref_count == 0` whose descendants no longer hold any allocated
     /// `block_id`s.
     pub fn evictable_token_count(&self) -> usize {
+        // Mirror `evict_with_policy`'s iterative cascade: a node is evictable
+        // if `ref_count == 0 && !soft_pinned && block_id.is_some()` AND no
+        // descendant in its subtree is pinned. sglang's `evict()` walks the
+        // radix depth-first popping leaves; once a leaf is removed its
+        // parent becomes a leaf and can be evicted too. Counting only
+        // `children.is_empty()` leaves under-estimates budget for
+        // chain-shaped prefixes (4096-token prompts produce 256 chained
+        // 16-token blocks); reclaim order doesn't change the eventual total.
         let now = self.clock;
         let evictable_blocks = self
             .nodes
             .iter()
             .enumerate()
             .filter(|(idx, node)| {
-                // Mirror `evict_with_policy`'s candidate filter
-                // (`ref_count == 0 && !soft_pinned`) so the admission gate's
-                // budget matches what eviction is actually willing to release.
-                // Without the soft-pin check the gate admits, alloc fails on
-                // chunked prefill, and the request flips to `Finished` —
-                // exactly the failure mode the gate exists to prevent.
                 let soft_pinned = node.soft_pin_until.is_some_and(|deadline| deadline > now);
                 *idx != Self::root()
                     && node.ref_count == 0
@@ -761,10 +754,21 @@ impl RadixCache {
                     && node
                         .children
                         .values()
-                        .all(|&child_idx| !self.subtree_has_allocated_block(child_idx))
+                        .all(|&child_idx| !self.subtree_has_pinned_block(child_idx, now))
             })
             .count();
         evictable_blocks * self.block_size
+    }
+
+    fn subtree_has_pinned_block(&self, node_idx: usize, now: u64) -> bool {
+        let node = &self.nodes[node_idx];
+        let self_pinned = node.block_id.is_some()
+            && (node.ref_count != 0 || node.soft_pin_until.is_some_and(|deadline| deadline > now));
+        self_pinned
+            || node
+                .children
+                .values()
+                .any(|&child_idx| self.subtree_has_pinned_block(child_idx, now))
     }
 
     fn dec_refs_by_block_id(&mut self, blocks: &[BlockId]) {

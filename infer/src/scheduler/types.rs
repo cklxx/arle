@@ -137,7 +137,10 @@ impl SchedulerConfig {
     pub fn runtime_defaults(max_slots: usize) -> Self {
         Self {
             max_slots,
-            prefill_chunk_size: 4096,
+            // sglang L4 default (server_args.py:1169-1172): 20-35 GB GPU →
+            // chunked_prefill_size=2048. Halving lets c=16 admission advance
+            // 2 requests per tick instead of serializing.
+            prefill_chunk_size: 2048,
             admission_clip_max_new_tokens: 4096,
             admission_new_token_ratio: 0.7,
             ..Self::default()
@@ -368,7 +371,7 @@ mod tests {
     fn runtime_defaults_match_documented_defaults() {
         let cfg = SchedulerConfig::runtime_defaults(8);
         assert_eq!(cfg.max_slots, 8);
-        assert_eq!(cfg.prefill_chunk_size, 4096);
+        assert_eq!(cfg.prefill_chunk_size, 2048);
         assert_eq!(cfg.admission_clip_max_new_tokens, 4096);
         assert_eq!(cfg.admission_new_token_ratio, 0.7);
         assert_eq!(cfg.prefix_cache_high_water, 0.75);

@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{
     ActiveRequest, Arc, AtomicUsize, GenerationState, IncomingRequest, ModelForward, PagedKVPool,
-    Phase, Result, SchedulerConfig, SchedulerHandle, SeedableRng, StdRng, Tokenizer, VecDeque,
-    error, info, mpsc, warn,
+    Phase, RequestPriority, Result, SchedulerConfig, SchedulerHandle, SeedableRng, StdRng,
+    Tokenizer, VecDeque, error, info, mpsc, warn,
 };
 use crate::kv_tier::BlockLocation;
 use crate::kv_tier::transport::DiskStore;
@@ -155,6 +155,10 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) pending_decode: Option<PendingDecode>,
     /// Prefill request consumed by the mixed decode launch in the current step.
     pub(super) pending_mixed_prefill_idx: Option<usize>,
+    /// Requests re-queued from `retract_longest_decode` stay tombstoned in
+    /// `active` until `cleanup()` so the current step's `active[idx]` stays
+    /// index-stable after pool-OOM recovery.
+    pub(super) retracted_request_ids: HashSet<u64>,
 }
 
 impl<M: ModelForward> Scheduler<M> {
@@ -173,13 +177,27 @@ impl<M: ModelForward> Scheduler<M> {
         let evictable = self.prefix_cache.evictable_token_count();
         let clip = self.config.admission_clip_max_new_tokens;
         let ratio = self.config.admission_new_token_ratio;
+        // Charge pre-Decoding requests for their remaining prompt tokens:
+        // `Phase::New` / `Phase::Prefilling` haven't materialized the prompt
+        // into the pool yet, so `pool.free_count()` still shows those pages
+        // as free while they're already promised. Without this term the gate
+        // double-books at c=16 × 4096-tok prompts.
         let running_offset: f64 = self
             .active
             .iter()
             .map(|r| {
-                let remaining = r.max_tokens.saturating_sub(r.generated_tokens.len());
-                let clipped = remaining.min(clip);
-                (clipped as f64) * ratio
+                let prefill_remaining: usize = match &r.phase {
+                    Phase::New => r.prompt_tokens.len().saturating_sub(r.reusable_prefix_len),
+                    Phase::Prefilling { progress, .. } => r
+                        .prompt_tokens
+                        .len()
+                        .saturating_sub(r.reusable_prefix_len)
+                        .saturating_sub(*progress),
+                    Phase::Decoding | Phase::Finished => 0,
+                };
+                let decode_remaining = r.max_tokens.saturating_sub(r.generated_tokens.len());
+                let clipped_decode = decode_remaining.min(clip);
+                prefill_remaining as f64 + (clipped_decode as f64) * ratio
             })
             .sum();
         (available + evictable).saturating_sub(running_offset.ceil() as usize)
@@ -432,6 +450,7 @@ impl<M: ModelForward> Scheduler<M> {
             peak_mem_bytes: 0,
             pending_decode: None,
             pending_mixed_prefill_idx: None,
+            retracted_request_ids: HashSet::new(),
         };
 
         let handle = SchedulerHandle::with_shared_waiting_count(
@@ -873,9 +892,83 @@ impl<M: ModelForward> Scheduler<M> {
         reclaimed_pages
     }
 
-    /// Allocate pool pages, forcing prefix-cache eviction and retrying once on
-    /// OOM. This is the M2b safety net for bursty admissions between cleanup
-    /// passes.
+    fn retract_longest_decode(&mut self, required_tokens: usize, protected_slot: usize) -> usize {
+        if required_tokens == 0 {
+            return 0;
+        }
+
+        let mut decode_candidates: Vec<(u64, usize)> = self
+            .active
+            .iter()
+            .filter(|req| matches!(req.phase, Phase::Decoding) && req.slot_idx != protected_slot)
+            .map(|req| (req.id, req.generated_tokens.len()))
+            .collect();
+        decode_candidates.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1));
+        if decode_candidates.is_empty() {
+            return 0;
+        }
+
+        let mut freed_tokens = 0usize;
+        for (req_id, decoded_len) in decode_candidates {
+            if freed_tokens >= required_tokens {
+                break;
+            }
+
+            let Some(victim_pos) = self.active.iter().position(|req| req.id == req_id) else {
+                continue;
+            };
+            let victim_slot = self.active[victim_pos].slot_idx;
+            let victim_session = self.active[victim_pos].session_id.clone();
+            let free_before = self.paged_kv_pool.free_count();
+            warn!(
+                "Request {}: retracting decode for pool OOM — {} generated tokens, pool free={}",
+                req_id, decoded_len, free_before
+            );
+
+            let requeue = {
+                let victim = &mut self.active[victim_pos];
+                IncomingRequest {
+                    prompt: std::mem::take(&mut victim.prompt),
+                    max_tokens: victim.max_tokens,
+                    sampling: victim.sampling.clone(),
+                    stop: victim.stop.take(),
+                    priority: RequestPriority::Normal,
+                    session_id: victim.session_id.clone(),
+                    delta_tx: victim.delta_tx.clone(),
+                }
+            };
+
+            self.paged_kv_pool.free_slot(victim_slot);
+            if let Err(err) = self.states[victim_slot].reset() {
+                error!(
+                    "Request {}: slot reset after retract failed: {}",
+                    req_id, err
+                );
+            }
+            self.slot_materialized_prompt_lens[victim_slot] = 0;
+            self.clear_slot_prefix_ownership(victim_slot);
+            self.active[victim_pos].phase = Phase::Finished;
+            self.retracted_request_ids.insert(req_id);
+            self.waiting.push_front(requeue);
+
+            let freed_now = self.paged_kv_pool.free_count().saturating_sub(free_before);
+            freed_tokens += freed_now;
+            info!(
+                "Request {}: re-queued after retract (session={:?}, freed={} tok, total_freed={}, target={})",
+                req_id,
+                victim_session.as_ref().map(|session| session.as_str()),
+                freed_now,
+                freed_tokens,
+                required_tokens
+            );
+        }
+
+        freed_tokens
+    }
+
+    /// Allocate pool pages, forcing prefix-cache eviction and decode retract
+    /// retries on OOM. This is the M2b safety net for bursty admissions
+    /// between cleanup passes.
     pub(super) fn alloc_pool_tokens_with_retry(
         &mut self,
         slot: usize,
@@ -885,15 +978,25 @@ impl<M: ModelForward> Scheduler<M> {
             Ok(indices) => Ok(indices),
             Err(first_err) => {
                 let reclaimed = self.evict_prefix_cache_for_allocation(count);
-                if reclaimed == 0 {
-                    Err(first_err)
-                } else {
-                    self.paged_kv_pool.alloc_tokens(slot, count).map_err(|retry_err| {
-                        anyhow::anyhow!(
-                            "TokenKVPool alloc retry failed after reclaiming {reclaimed} pages: \
-                             first error: {first_err}; retry error: {retry_err}"
-                        )
-                    })
+                match self.paged_kv_pool.alloc_tokens(slot, count) {
+                    Ok(indices) => Ok(indices),
+                    Err(second_err) => {
+                        let retract_target = count
+                            .saturating_sub(self.paged_kv_pool.free_count())
+                            .max(count.min(self.paged_kv_pool.page_size).max(1));
+                        let retracted = self.retract_longest_decode(retract_target, slot);
+                        if retracted == 0 {
+                            Err(first_err)
+                        } else {
+                            self.paged_kv_pool.alloc_tokens(slot, count).map_err(|retry_err| {
+                                anyhow::anyhow!(
+                                    "TokenKVPool alloc retry failed after reclaiming {reclaimed} pages \
+                                     and retracting {retracted} tokens: first error: {first_err}; \
+                                     post-evict error: {second_err}; retry error: {retry_err}"
+                                )
+                            })
+                        }
+                    }
                 }
             }
         }
@@ -910,7 +1013,7 @@ impl<M: ModelForward> Scheduler<M> {
         // When the model writes prefill K/V directly to the paged pool, there
         // is no per-slot contiguous scratch to size the chunk against, so the
         // `CONTIGUOUS_KV_TOKENS` cap does not apply and the configured
-        // `prefill_chunk_size` (default 4096) is the only upper bound.
+        // `prefill_chunk_size` (default 2048) is the only upper bound.
         let contiguous_cap = if self.model.prefill_uses_paged_pool() {
             usize::MAX
         } else {
