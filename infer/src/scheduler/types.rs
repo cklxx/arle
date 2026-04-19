@@ -137,12 +137,20 @@ impl SchedulerConfig {
     pub fn runtime_defaults(max_slots: usize) -> Self {
         Self {
             max_slots,
-            // sglang L4 (20-35 GB) default: chunked_prefill_size=2048
-            // (server_args.py:1169-1172). Halves first-wave prefill
-            // serialization at c=16; depends on PrefillBuffers being
-            // model-owned so per-forward alloc/free doesn't poison CUDA
-            // context (see this commit's prefill.rs changes).
-            prefill_chunk_size: 2048,
+            // L3 (sglang L4 default 2048, `server_args.py:1169-1172`) STAYS
+            // at 4096 pending a deeper root-cause investigation. Even with
+            // the model-owned PrefillBuffers refactor (prefill.rs), c=16 ×
+            // chunk=2048 panics with `gemm_cuda CUDA_ERROR_UNKNOWN` on the
+            // first forward. cuda-graph=false doesn't rescue it, so the
+            // culprit is neither the per-forward PrefillBuffers alloc nor
+            // the CUDA Graph capture. Candidates to probe next:
+            // cuBLAS handle / workspace reuse across shape-varying gemms;
+            // `slot_page_indices` H2D churn at finer chunk granularity;
+            // FlashInfer `PrefillPlan::plan_hd128` non-plan-once behaviour
+            // on chunk-sized seq_len (vs cached initial 4096 workspace).
+            // Research note: docs/research/2026-04-19-sglang-allocation-
+            // architecture-parity.md §1.
+            prefill_chunk_size: 4096,
             admission_clip_max_new_tokens: 4096,
             admission_new_token_ratio: 0.7,
             ..Self::default()
@@ -373,7 +381,7 @@ mod tests {
     fn runtime_defaults_match_documented_defaults() {
         let cfg = SchedulerConfig::runtime_defaults(8);
         assert_eq!(cfg.max_slots, 8);
-        assert_eq!(cfg.prefill_chunk_size, 2048);
+        assert_eq!(cfg.prefill_chunk_size, 4096);
         assert_eq!(cfg.admission_clip_max_new_tokens, 4096);
         assert_eq!(cfg.admission_new_token_ratio, 0.7);
         assert_eq!(cfg.prefix_cache_high_water, 0.75);
