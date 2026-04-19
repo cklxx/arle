@@ -39,6 +39,15 @@ pub(crate) struct HeadConfig {
     pub head_dim: usize,
 }
 
+/// FlashInfer paged-decode head configuration (HD128, HD256, tensor-core prefill).
+/// Groups the 4-tuple shared by every `flashinfer_*_run_layer` wrapper.
+pub struct FlashInferHeadConfig {
+    pub num_qo_heads: usize,
+    pub num_kv_heads: usize,
+    pub page_size: usize,
+    pub head_dim: usize,
+}
+
 /// Paged KV metadata for batched decode.
 pub(crate) struct PagedKVMeta<'a> {
     pub kv_pool: &'a PagedKVPool,
@@ -74,9 +83,7 @@ pub(crate) fn prefill_attention_batch(
     let num_kv_heads = heads.num_kv_heads;
     let head_dim = heads.head_dim;
     let rms_eps = nrp.rms_eps;
-    let _q_dim = num_q_heads * head_dim;
     assert!(num_kv_heads > 0, "num_kv_heads must be > 0");
-    let _gqa_ratio = num_q_heads / num_kv_heads;
 
     // Derive max_seq_len from KV cache buffer size.
     // Buffer layout: [num_kv_heads * max_seq_len * head_dim] u16 elements.
@@ -142,75 +149,6 @@ pub(crate) fn prefill_attention_batch(
                 ));
             }
         }
-    }
-
-    Ok(())
-}
-
-pub(crate) unsafe fn prefill_attention_batch_dual_write(
-    ctx: &DeviceContext,
-    q_batch: &mut HiddenStates,
-    k_batch: &mut HiddenStates,
-    v_batch: &HiddenStates,
-    nrp: &NormRopeParams,
-    k_cache: &mut DeviceVec,
-    v_cache: &mut DeviceVec,
-    heads: &HeadConfig,
-    start_pos: usize,
-    page_table: &[i32],
-    page_size: i32,
-    k_pool: *mut ffi::Half,
-    v_pool: *mut ffi::Half,
-) -> Result<()> {
-    let seq_len = q_batch.seq_len;
-    let num_q_heads = heads.num_q_heads;
-    let num_kv_heads = heads.num_kv_heads;
-    let head_dim = heads.head_dim;
-    let rms_eps = nrp.rms_eps;
-    let _q_dim = num_q_heads * head_dim;
-    assert!(num_kv_heads > 0, "num_kv_heads must be > 0");
-    let _gqa_ratio = num_q_heads / num_kv_heads;
-
-    // Derive max_seq_len from KV cache buffer size.
-    // Buffer layout: [num_kv_heads * max_seq_len * head_dim] u16 elements.
-    let kv_elements = k_cache.len;
-    let max_seq_len = kv_elements / (num_kv_heads * head_dim);
-
-    let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
-    let (k_ptr, _gk) = k_batch.data.device_ptr_mut(&ctx.stream);
-    let (v_ptr, _gv) = v_batch.data.device_ptr(&ctx.stream);
-    let (qn_ptr, _gqn) = nrp.q_norm.data.device_ptr(&ctx.stream);
-    let (kn_ptr, _gkn) = nrp.k_norm.data.device_ptr(&ctx.stream);
-    let (cos_ptr, _gc) = nrp.cos_cache.data.device_ptr(&ctx.stream);
-    let (sin_ptr, _gs) = nrp.sin_cache.data.device_ptr(&ctx.stream);
-    let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
-    let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
-
-    unsafe {
-        ffi::prefill_attention_prep_dual_write_cuda(
-            q_ptr as *mut ffi::Half,
-            k_ptr as *mut ffi::Half,
-            v_ptr as *const ffi::Half,
-            qn_ptr as *const ffi::Half,
-            kn_ptr as *const ffi::Half,
-            cos_ptr as *const ffi::Half,
-            sin_ptr as *const ffi::Half,
-            kc_ptr as *mut ffi::Half,
-            vc_ptr as *mut ffi::Half,
-            num_q_heads as i32,
-            num_kv_heads as i32,
-            head_dim as i32,
-            seq_len as i32,
-            start_pos as i32,
-            max_seq_len as i32,
-            rms_eps,
-            ctx.stream.cu_stream(),
-            page_table.as_ptr(),
-            page_size,
-            k_pool,
-            v_pool,
-        )
-        .result()?;
     }
 
     Ok(())
@@ -464,9 +402,6 @@ pub(crate) struct PagedPrefillForward<'a> {
     pub kv_last_page_len_dev: CudaSlice<i32>,
     pub seq_len: usize,
     pub start_pos: usize,
-    pub num_pages: usize,
-    pub num_q_heads: usize,
-    pub num_kv_heads: usize,
     pub page_size: usize,
 }
 
@@ -577,9 +512,6 @@ impl<'a> PagedPrefillForward<'a> {
             kv_last_page_len_dev,
             seq_len,
             start_pos,
-            num_pages,
-            num_q_heads,
-            num_kv_heads,
             page_size,
         })
     }
@@ -826,13 +758,13 @@ pub(crate) fn prefill_attention_hd256_paged_batch(
 /// 2*B launches from the per-request loop. Each request's KV cache is accessed
 /// via device pointer arrays.
 ///
-/// Q/K/V are already in contiguous batch buffers [B, dim]. Output is written
-/// directly to `output` batch buffer [B, q_dim]. No D2D copies needed.
+/// Q/K/V are already in contiguous batch buffers `[B, dim]`. Output is written
+/// directly to `output` batch buffer `[B, q_dim]`. No D2D copies needed.
 ///
-/// `positions`: [B] i32 on GPU — current_pos per request
-/// `seq_lens`: [B] i32 on GPU — seq_len per request (= pos + 1)
-/// `k_cache_ptrs`/`v_cache_ptrs`: [B] device pointers on GPU
-/// `partial_out/m/l`: pre-allocated FP32 scratch [B * num_qheads * NUM_KV_SPLITS * ...]
+/// `positions`: `[B]` i32 on GPU — current_pos per request
+/// `seq_lens`: `[B]` i32 on GPU — seq_len per request (= pos + 1)
+/// `k_cache_ptrs`/`v_cache_ptrs`: `[B]` device pointers on GPU
+/// `partial_out/m/l`: pre-allocated FP32 scratch `[B * num_qheads * NUM_KV_SPLITS * ...]`
 #[allow(clippy::too_many_arguments)]
 pub fn fused_attention_decode_batched_into(
     ctx: &DeviceContext,
@@ -1145,7 +1077,6 @@ pub(crate) fn decode_prep_paged_fused_qkv(
 }
 
 /// FlashInfer run step only (GPU kernel). Call once per layer after a single plan call.
-#[allow(clippy::too_many_arguments)]
 pub fn flashinfer_run_layer(
     ctx: &DeviceContext,
     q_batch: &HiddenStates,
@@ -1156,13 +1087,10 @@ pub fn flashinfer_run_layer(
     kv_last_page_len_gpu: &CudaSlice<i32>,
     output: &mut HiddenStates,
     workspace: &mut FlashInferWorkspace,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    head_dim: usize,
+    heads: &FlashInferHeadConfig,
 ) -> Result<()> {
     let batch_size = q_batch.seq_len;
-    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+    let sm_scale = 1.0 / (heads.head_dim as f32).sqrt();
 
     let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
     let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
@@ -1180,7 +1108,7 @@ pub fn flashinfer_run_layer(
         ffi::flashinfer_batch_decode_run(
             fw_ptr as *mut u8,
             iw_ptr as *mut u8,
-            workspace.plan_info as *const u8,
+            workspace.plan_info.cast_const(),
             q_ptr as *const ffi::Half,
             k_pool_ptr as *const ffi::Half,
             v_pool_ptr as *const ffi::Half,
@@ -1190,10 +1118,10 @@ pub fn flashinfer_run_layer(
             o_ptr as *mut ffi::Half,
             lse_ptr as *mut f32,
             batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            page_size as i32,
-            head_dim as i32,
+            heads.num_qo_heads as i32,
+            heads.num_kv_heads as i32,
+            heads.page_size as i32,
+            heads.head_dim as i32,
             sm_scale,
             ctx.stream.cu_stream(),
         )
@@ -1208,7 +1136,6 @@ pub fn flashinfer_run_layer(
 }
 
 /// FlashInfer tensor-core run step only (GPU kernel). Call once per layer after a single plan call.
-#[allow(clippy::too_many_arguments)]
 pub fn flashinfer_tc_run_layer(
     ctx: &DeviceContext,
     q_batch: &HiddenStates,
@@ -1220,13 +1147,10 @@ pub fn flashinfer_tc_run_layer(
     kv_last_page_len_gpu: &CudaSlice<i32>,
     output: &mut HiddenStates,
     workspace: &mut FlashInferWorkspace,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    head_dim: usize,
+    heads: &FlashInferHeadConfig,
 ) -> Result<()> {
     let batch_size = q_batch.seq_len;
-    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+    let sm_scale = 1.0 / (heads.head_dim as f32).sqrt();
 
     let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
     let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
@@ -1245,7 +1169,7 @@ pub fn flashinfer_tc_run_layer(
         ffi::flashinfer_tc_decode_run(
             fw_ptr as *mut u8,
             iw_ptr as *mut u8,
-            workspace.plan_info as *const u8,
+            workspace.plan_info.cast_const(),
             q_ptr as *mut ffi::Half,
             qoi_ptr as *mut i32,
             k_pool_ptr as *mut ffi::Half,
@@ -1256,9 +1180,9 @@ pub fn flashinfer_tc_run_layer(
             o_ptr as *mut ffi::Half,
             lse_ptr as *mut f32,
             batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            page_size as i32,
+            heads.num_qo_heads as i32,
+            heads.num_kv_heads as i32,
+            heads.page_size as i32,
             sm_scale,
             ctx.stream.cu_stream(),
         )
@@ -1372,7 +1296,6 @@ pub(crate) fn attention_gate_paged_hd256(
 }
 
 /// FlashInfer HD256 run-layer: uses the pre-computed plan to run attention for one layer.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn flashinfer_run_layer_hd256(
     ctx: &DeviceContext,
     q_batch: &HiddenStates,
@@ -1383,13 +1306,10 @@ pub(crate) fn flashinfer_run_layer_hd256(
     kv_last_page_len_gpu: &CudaSlice<i32>,
     output: &mut HiddenStates,
     workspace: &mut FlashInferWorkspace,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    head_dim: usize,
+    heads: &FlashInferHeadConfig,
 ) -> Result<()> {
     let batch_size = q_batch.seq_len;
-    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+    let sm_scale = 1.0 / (heads.head_dim as f32).sqrt();
 
     let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
     let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
@@ -1407,7 +1327,7 @@ pub(crate) fn flashinfer_run_layer_hd256(
         ffi::flashinfer_batch_decode_hd256_run(
             fw_ptr as *mut u8,
             iw_ptr as *mut u8,
-            workspace.plan_info as *const u8,
+            workspace.plan_info.cast_const(),
             q_ptr as *const ffi::Half,
             k_pool_ptr as *const ffi::Half,
             v_pool_ptr as *const ffi::Half,
@@ -1417,10 +1337,10 @@ pub(crate) fn flashinfer_run_layer_hd256(
             o_ptr as *mut ffi::Half,
             lse_ptr as *mut f32,
             batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            page_size as i32,
-            head_dim as i32,
+            heads.num_qo_heads as i32,
+            heads.num_kv_heads as i32,
+            heads.page_size as i32,
+            heads.head_dim as i32,
             sm_scale,
             ctx.stream.cu_stream(),
         )

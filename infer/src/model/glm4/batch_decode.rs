@@ -6,10 +6,10 @@
 //! and no Q/K normalization is applied.
 
 use anyhow::Result;
-use cudarc::driver::CudaSlice;
 use cudarc::driver::safe::CudaGraph;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use log::info;
 
 use super::config::Config;
@@ -43,7 +43,6 @@ pub struct BatchDecodeBuffers {
 
     embedding_out: HiddenStates,
     pub(super) logits_batch: Option<HiddenStates>,
-    logits_per_slot: Vec<DeviceVec>,
     pub(super) argmax_out: CudaSlice<i32>,
     pub(super) argmax_host: Vec<i32>,
 
@@ -98,7 +97,6 @@ impl BatchDecodeBuffers {
 
             embedding_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
             logits_batch: None,
-            logits_per_slot: Vec::new(),
             argmax_out: ctx
                 .stream
                 .alloc_zeros(max_batch_size)
@@ -316,7 +314,7 @@ impl GLM4Model {
             &mut bufs.embedding_out,
         )?;
 
-        let hidden_ptr = &mut bufs.embedding_out as *mut HiddenStates;
+        let hidden_ptr = &raw mut bufs.embedding_out;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let hidden = unsafe { &mut *hidden_ptr };
@@ -544,10 +542,12 @@ impl GLM4Model {
                         &bufs.metadata.kv_last_page_len,
                         &mut bufs.attn_output,
                         &mut bufs.metadata.flashinfer_ws,
-                        num_heads,
-                        num_kv_heads,
-                        page_size,
-                        head_dim,
+                        &ops::FlashInferHeadConfig {
+                            num_qo_heads: num_heads,
+                            num_kv_heads,
+                            page_size,
+                            head_dim,
+                        },
                     )?;
                 }
                 KVFormat::TurboQuant { .. } => {
@@ -557,14 +557,13 @@ impl GLM4Model {
                     let sm_scale = 1.0 / (head_dim as f32).sqrt();
 
                     // Step 1: Rotate Q → Q_rot (sign flip + FWHT)
-                    use cudarc::driver::{DevicePtr, DevicePtrMut};
                     let q_ptr = {
                         let (p, _g) = bufs.q_batch.data.device_ptr(stream);
-                        p as u64
+                        p
                     };
                     let q_rot_ptr = {
                         let (p, _g) = bufs.q_rot.data.device_ptr_mut(stream);
-                        p as u64
+                        p
                     };
                     kv_turboquant::turboquant_rotate_query(
                         &self.ctx,
@@ -579,7 +578,7 @@ impl GLM4Model {
                     // Step 2: Fused attention
                     let attn_ptr = {
                         let (p, _g) = bufs.attn_output.data.device_ptr_mut(stream);
-                        p as u64
+                        p
                     };
                     kv_turboquant::turboquant_fused_decode_attention(
                         &self.ctx,

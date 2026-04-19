@@ -148,7 +148,7 @@ impl DeviceContext {
 pub struct DeviceVec {
     pub data: CudaSlice<bf16>,
     pub len: usize,
-    /// Debug label describing the tensor's semantic shape (e.g., "norm_weight[hidden]", "kv_cache[heads,seq,dim]").
+    /// Debug label describing the tensor's semantic shape (e.g., `norm_weight[hidden]`, `kv_cache[heads,seq,dim]`).
     pub label: &'static str,
 }
 
@@ -379,11 +379,11 @@ pub struct DeviceMatrix {
     /// TQ packed indices [rows, packed_cols] u8.
     /// 3-bit uses 4-bit nibble packing (2 per byte), 2-bit uses 4 per byte.
     pub tq_packed: Option<CudaSlice<u8>>,
-    /// TQ per-group f16 norms [rows, cols/group_size], stored as u16 on device.
+    /// TQ per-group f16 norms `[rows, cols/group_size]`, stored as u16 on device.
     pub tq_scales: Option<CudaSlice<u16>>,
-    /// TQ Hadamard signs [cols] i8 (+1/-1), shared across rows.
+    /// TQ Hadamard signs `[cols]` i8 (+1/-1), shared across rows.
     pub tq_signs: Option<CudaSlice<i8>>,
-    /// TQ Lloyd-Max centroids [2^bits] f32, shared across all layers.
+    /// TQ Lloyd-Max centroids `[2^bits]` f32, shared across all layers.
     pub tq_centroids: Option<CudaSlice<f32>>,
     /// TQ bit width (2, 3, or 4). 0 = not TQ.
     pub tq_bits: u8,
@@ -518,7 +518,10 @@ impl DeviceMatrix {
         rows: usize,
         cols: usize,
     ) -> Result<Self> {
-        assert!(cols % 256 == 0, "Q6_K requires cols % 256 == 0, got {cols}");
+        assert!(
+            cols.is_multiple_of(256),
+            "Q6_K requires cols % 256 == 0, got {cols}"
+        );
         let expected = rows * cols * 210 / 256;
         assert_eq!(
             packed_bytes.len(),
@@ -573,7 +576,10 @@ impl DeviceMatrix {
         rows: usize,
         cols: usize,
     ) -> Result<Self> {
-        assert!(cols % 256 == 0, "Q3_K requires cols % 256 == 0, got {cols}");
+        assert!(
+            cols.is_multiple_of(256),
+            "Q3_K requires cols % 256 == 0, got {cols}"
+        );
         let expected = rows * cols * 55 / 128; // (cols/256) * 110 per row
         assert_eq!(
             packed_bytes.len(),
@@ -633,7 +639,10 @@ impl DeviceMatrix {
         rows: usize,
         cols: usize,
     ) -> Result<Self> {
-        assert!(cols % 256 == 0, "Q4_K requires cols % 256 == 0, got {cols}");
+        assert!(
+            cols.is_multiple_of(256),
+            "Q4_K requires cols % 256 == 0, got {cols}"
+        );
         let expected = rows * cols * 9 / 16; // (cols/256) * 144 per row
         assert_eq!(
             packed_bytes.len(),
@@ -807,7 +816,7 @@ impl DeviceMatrix {
         let k = self.cols; // input dim
 
         // Skip if dimensions not Marlin-compatible (need K%16==0, N%64==0)
-        if k % 16 != 0 || n % 64 != 0 {
+        if !k.is_multiple_of(16) || !n.is_multiple_of(64) {
             log::warn!("Marlin repack skipped: [{n}x{k}] not tile-aligned (need K%16==0, N%64==0)");
             return Ok(());
         }

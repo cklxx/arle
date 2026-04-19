@@ -13,7 +13,6 @@ use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 
 /// Per-request mutable state for Qwen3.
 pub struct Qwen3State {
-    pub(super) ctx: DeviceContext,
     pub(crate) decode_bufs: DecodeBuffers,
     pub(crate) base: GenerationStateBase,
 }
@@ -83,7 +82,6 @@ impl ModelForward for Qwen3Model {
 
     fn create_state(&self) -> Result<Self::State> {
         Ok(Qwen3State {
-            ctx: self.ctx.clone(),
             decode_bufs: DecodeBuffers::new(&self.ctx, &self.config)?,
             base: GenerationStateBase::new(
                 self.config.num_hidden_layers,
@@ -287,8 +285,7 @@ impl ModelForward for Qwen3Model {
 
         // Phase 3: Readback all results
         let mut tokens = Vec::with_capacity(b);
-        for i in 0..b {
-            let si = slot_indices[i];
+        for &si in slot_indices {
             tokens.push(crate::ops::gpu_sample_readback(
                 &self.ctx,
                 &states[si].decode_bufs.sample_out,
@@ -436,7 +433,19 @@ impl ModelForward for Qwen3Model {
     }
 
     fn supports_mixed_batch(&self) -> bool {
-        true
+        // The fused mixed decode+prefill path does not apply LoRA adapters
+        // yet. Reporting `true` would let the scheduler double-reserve
+        // decode slots (once in `step_decode_launch_mixed`, again in the
+        // `Ok(false)` fallback inside `decode_batch_with_prefill`), which
+        // corrupts paged-KV `seq_len`. Opt out entirely when LoRA is live.
+        self.lora.is_none()
+    }
+
+    fn supports_cuda_graph_decode(&self) -> bool {
+        // LoRA decode allocates per-call temp DeviceVecs inside
+        // `apply_lora_{gemv,gemm}_add`; CUDA stream capture rejects those.
+        // The LoRA-aware batched decode runs eagerly, so skip warmup.
+        self.lora.is_none()
     }
 
     fn forward_mixed_batch(

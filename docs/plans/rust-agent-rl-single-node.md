@@ -225,10 +225,10 @@ M3 是**自证"训推一体"概念能跑的标志**。ckl 应能自主判断：
 
 | # | 任务 | 备注 |
 |---|---|---|
-| M5.1 | 调研 `mlx-sys` 是否能暴露 MLX autograd：MLX C++ 有 `mlx::core::grad`，但 mlx-sys 当前 bridge 只有 forward | 调研产出更新到 [`infer/src/backend/metal/AGENTS.md`](../../infer/src/backend/metal/AGENTS.md) |
-| M5.2 | **两条路线二选一**：<br>(a) 扩 mlx-sys 桥接 `grad`，复用 MLX autograd → 快，但形状和我们的 tape 不对齐<br>(b) 在我们的 tape 上实现 Metal op（matmul/add/... 通过 mlx-sys forward 调用），bwd 公式我们自己写 → 一致性好，和 CUDA 同 tape | 预测选 (b)，一致性 > 便利 |
-| M5.3 | 实现 Metal 版 matmul / add / mul_scalar / sum / log_softmax / gather / AdamW，全部经过 autograd tape | 每个 op 数值对拍 CPU f64 参考 ≤ 1e-3 |
-| M5.4 | Mac 上跑 M2 的合成 supervised fine-tune，Qwen 1.5B，LoRA rank=8 | loss 曲线形状和 CUDA 一致 |
+| M5.1 | ✅ 2026-04-18 调研完成：`mlx::core::grad` 存在但 mlx-sys bridge 只暴露 forward | 结论见下方 M5.2 |
+| M5.2 | ✅ 2026-04-18 路线锁定 = **(b)**：在我们的 tape 上用 mlx-sys forward 调 MLX op，bwd 公式自己写，和 CUDA 同 tape。commit `a46fc00` 落地 `Backend` trait + `CpuBackend`/`MetalBackend`/`CudaBackend`（per-call upload/compute/download） | 选 (b) 的原因：一致性 > 便利；和 CUDA 同 tape |
+| M5.3 | 🚧 架构决定已下（2026-04-19）：先做 device-resident tensor，再把剩余 Metal ops 批量上。Matmul 已上 Metal（3-shape 对拍 ≤ 1e-3，commit `a46fc00`）但 per-call FFI 瓶颈主导——TinyLM 尺度 Metal 比 CPU 慢 1.9×，只有 d_model≥256 才领先 1.4×（见 `2026-04-18-bench-train-multi-turn.md`）。MLX 上游 [lazy-eval 文档](https://ml-explore.github.io/mlx/build/html/usage/lazy_evaluation.html) 明确把当前 1-op 图 + eval + readback 模式点名为 degenerate，推荐 "tens-to-thousands of ops per evaluation"。架构方案：(i) `GpuTensor` 内部持 `Option<mx::Array>`（lazy），(ii) 上层 op 组图不 eval，(iii) `backward()` 或 `optimizer_step()` 触发一次 eval 覆盖一轮前后向。详细技术规格：[`docs/plans/m5.3-device-resident-tensor.md`](m5.3-device-resident-tensor.md)。落地顺序：M5.3a 架构重构（device-resident tensor + eval boundary） → M5.3b 剩余 ops 批量上 Metal（add/mul_scalar/sum/log_softmax/gather/AdamW）。ckl 2026-04-19 方向决策："先把架构做好然后把所有的feature 推进"。 | 架构就位后每个 op 数值对拍 CPU f64 参考 ≤ 1e-3 |
+| M5.4 | ⏳ 未开工：Mac 上跑 M2 的合成 supervised fine-tune，Qwen 1.5B，LoRA rank=8 | 前置 = M5.3a + M5.3b 完成；loss 曲线形状和 CUDA 一致 |
 
 ### 7.3 验收门槛
 
@@ -321,7 +321,7 @@ M0 Day 5:
 | 2026-04-18 | Plan + project doc + research note 提交 | ✅ | 锁定 scope v3；准备开工 M0 |
 | 2026-04-18 | M0–M1 Autograd + 核心 op + AdamW | ✅ | TinyLM (~8.4M) CPU SFT 收敛到位 |
 | 2026-04-18 | M2a LoRA on TinyLM (self-contained) | ✅ | frozen base + rank-r adapters, grad 仅流向 A/B |
-| 2026-04-18 | M2b LoRA hook into Qwen3 `linear.rs` | ⛔ Blocker | 见 [`docs/plans/m2b-blocker-analysis.md`](m2b-blocker-analysis.md)（train CPU TensorStore vs infer cudarc DeviceMatrix 不共享）|
+| 2026-04-18 | M2b LoRA hook into Qwen3 `linear.rs` | ✅ | 走 [`m2b-blocker-analysis.md`](m2b-blocker-analysis.md) 选项 (b)：`LoRAAdapter { a/b: DeviceMatrix }` 落在 `infer/src/model/qwen3/lora.rs`（不与 train `TensorStore` 共享），PEFT loader + additive apply ops + prefill/decode hot-path wiring + synthetic safetensors integration test；CUDA Graph decode 在 LoRA 激活时自动降级为 eager（`supports_cuda_graph_decode`），warmup 仍跑两遍以预热 cublasLt autotune cache；train↔infer gradient loop 仍走选项 (a)/M1-CUDA, 未在此 phase 内 |
 | 2026-04-18 | M3 GRPO 单 verifier 闭环 | ✅ | rollout_group + group_advantages + PPO-clip surrogate |
 | 2026-04-18 | M3.5 PPO clip + multi-verifier scaffolding | ✅ | host-space active-mask；Copy/ReverseCopy/Palette/WeightedEnsemble |
 | 2026-04-18 | M4.1 Multi-turn episode scaffolding | ✅ | Episode / TurnSpec / Environment / rollout_episode |
@@ -331,7 +331,7 @@ M0 Day 5:
 | 2026-04-18 | M4.4 Reward aggregation config | ✅ | `RewardConfig` + `VerifierKind` 数据驱动；`WeightedEnsemble::from_config` 与 fluent builder 语义等价 (测试对拍) |
 | 2026-04-18 | M4.5 基础 curriculum（task pool + auto-retire） | ✅ | `TaskPool` 滚动 pass@1 窗口 + `min_samples_before_retire` 门槛；`sample` 排除 retired；`active_distribution` 导出分级存活数（8 test 全过） |
 | 2026-04-18 | M4.6 Task generator（self-play scaffold） | ✅ | `TaskGenerator` + `TierSpec`：每个 `GeneratedTask` 结构性绑定 `VerifierKind`（verifier-grounded invariant），参数落在 tier bounds 内，权重分布对拍 ±5%（5 test 全过） |
-| — | M4.7 /v1/train HTTP control plane | ⏳ Pending | 现阶段 CLI (`train_multi_turn --save-path …`) 已覆盖"起停/保存/加载"；HTTP 绑定等 infer_agent chat 路径稳定后再接 |
+| 2026-04-18 | M4.7 /v1/train HTTP control plane | ✅ | `train::control::TrainingController`（`Arc<Mutex<TrainingStatus>>` + `AtomicBool` stop/save，save 为 `swap(false)` 边沿触发）+ `train::server`（std `TcpListener`，0 新依赖，8 KiB 请求上限）；routes `GET /v1/train/status` / `POST /v1/train/stop` / `POST /v1/train/save`；`train_multi_turn --serve PORT` 启动控制面，`iter`/`mean_reward`/`best_reward`/`last_kl`/`last_loss`/`wall_secs` 每步回写；curl 三端点 + 404 端到端冒烟通过（5 test 全过） |
 | 2026-04-18 | M4.8 Self-evolve 冒烟 + 训练速度 baseline | ✅ | `train_multi_turn` 内建 `bench:` 行（wall / iter/s / episode/s / token/s）；CPU vs Metal snapshot → `docs/experience/wins/2026-04-18-bench-train-multi-turn.md`；TinyLM-scale CPU 833 tok/s、d_model=256 Metal 1.40× 超 CPU；24h full self-evolve 待 Arithmetic verifier 驱动硬任务后再跑 |
 | 2026-04-18 | M5 Backend trait + Metal matmul + CUDA matmul (标记待验证) | ✅ | `Backend` trait + `CpuBackend`/`MetalBackend`/`CudaBackend`；Metal 对 CPU 参考 ≤1e-3（4 test 全过）；CUDA 路径 Mac typecheck 通过，等 GPU 机器验证；`train_multi_turn --backend metal` 端到端通过 |
 

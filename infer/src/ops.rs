@@ -22,24 +22,26 @@ mod sampling;
 mod tests;
 
 // pub re-exports
+pub use attention::{
+    FlashInferHeadConfig, flashinfer_run_layer, flashinfer_tc_run_layer,
+    fused_attention_decode_batched_into, fused_attention_decode_into,
+};
 pub(crate) use attention::{
     decode_prep_paged, decode_prep_paged_fused_qkv, prefill_attention_batch,
     prefill_attention_hd256_batch, prefill_attention_hd256_batch_with_scratch,
     prefill_attention_hd256_paged_batch, prefill_attention_paged_batch,
 };
-pub use attention::{
-    flashinfer_run_layer, flashinfer_tc_run_layer, fused_attention_decode_batched_into,
-    fused_attention_decode_into,
-};
 pub use elementwise::{add_batch, silu_mul_batch};
 pub use embedding::{embedding_batch, embedding_decode_into};
 pub use kv_ops::scatter_write_kv;
-pub use linear::{fused_mlp_into, gemm, gemv};
+pub use linear::{
+    apply_lora_gemm_add, apply_lora_gemv_add, fused_mlp_into, gemm, gemv, mlp_decode_with_lora_into,
+};
 pub use norm::{
     fused_add_rms_norm_into, fused_add_rms_norm_offset_into, rms_norm_batch_offset_into,
     rms_norm_gated_into, rms_norm_into, rms_norm_offset_into,
 };
-pub use recurrent::gated_delta_rule_prefill_chunkwise_into;
+pub use recurrent::{GdrHeadConfig, GdrWeights, gated_delta_rule_prefill_chunkwise_into};
 pub use sampling::{
     argmax, argmax_with_logprob, gpu_sample, gpu_sample_into, gpu_sample_launch,
     gpu_sample_readback,

@@ -6,10 +6,10 @@
 //! via pointer arrays.
 
 use anyhow::Result;
-use cudarc::driver::CudaSlice;
 use cudarc::driver::safe::CudaGraph;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use log::info;
 
 use super::forward::Qwen35State;
@@ -277,7 +277,7 @@ impl BatchDecodeBuffers35 {
                 let num_groups = if num_linear_layers > 0 {
                     // Groups of consecutive linear layers between full attention layers
                     // For interval=4: groups = num_hidden_layers / interval
-                    (num_linear_layers + 2) / 3 // ceil(num_linear_layers / 3)
+                    num_linear_layers.div_ceil(3) // ceil(num_linear_layers / 3)
                 } else {
                     0
                 };
@@ -417,7 +417,6 @@ impl Qwen35Model {
         // ── Pre-upload all recurrent state pointer arrays ──
         // Moving all H2D before the forward pass enables future CUDA Graph capture.
         {
-            use cudarc::driver::DevicePtrMut;
             let mut linear_idx = 0usize;
             for layer in &self.layers {
                 if matches!(layer.attn, LayerKind::LinearAttention(_)) {
@@ -426,8 +425,8 @@ impl Qwen35Model {
                         let (conv_ptr, _) =
                             layer_state.conv_state.data.device_ptr_mut(&self.ctx.stream);
                         let (gdr_ptr, _) = layer_state.state.device_ptr_mut(&self.ctx.stream);
-                        bufs.recurrent.conv_state_ptrs_host[b] = conv_ptr as u64;
-                        bufs.recurrent.gdr_state_ptrs_host[b] = gdr_ptr as u64;
+                        bufs.recurrent.conv_state_ptrs_host[b] = conv_ptr;
+                        bufs.recurrent.gdr_state_ptrs_host[b] = gdr_ptr;
                     }
                     self.ctx
                         .stream
@@ -491,7 +490,7 @@ impl Qwen35Model {
             &mut bufs.common.embedding_out,
         )?;
 
-        let hidden_ptr = &mut bufs.common.embedding_out as *mut HiddenStates;
+        let hidden_ptr = &raw mut bufs.common.embedding_out;
 
         // Process layers in groups: each group is consecutive linear layers
         // followed by one full attention layer. Linear groups are graph-captured.
@@ -592,7 +591,7 @@ impl Qwen35Model {
         }
 
         // Run the linear layers
-        let hidden_ptr = &mut bufs.common.embedding_out as *mut HiddenStates;
+        let hidden_ptr = &raw mut bufs.common.embedding_out;
         let mut li = linear_idx_start;
         for layer in &self.layers[layer_start..layer_end] {
             if let LayerKind::LinearAttention(attn) = &layer.attn {
@@ -699,14 +698,18 @@ impl Qwen35Model {
             &bufs.recurrent.qkv_conv_batch,
             &bufs.recurrent.b_batch,
             &bufs.recurrent.a_batch,
-            &attn.dt_bias,
-            &attn.a_log,
+            &ops::GdrWeights {
+                dt_bias: &attn.dt_bias,
+                a_log: &attn.a_log,
+            },
             &mut bufs.recurrent.gdr_state_ptrs_per_layer[linear_idx],
             &mut bufs.recurrent.gdr_out_batch,
-            c.linear_num_key_heads,
-            c.linear_num_value_heads,
-            c.linear_key_head_dim,
-            c.linear_value_head_dim,
+            &ops::GdrHeadConfig {
+                num_key_heads: c.linear_num_key_heads,
+                num_value_heads: c.linear_num_value_heads,
+                key_dim: c.linear_key_head_dim,
+                val_dim: c.linear_value_head_dim,
+            },
             batch_size,
         )?;
 
@@ -949,10 +952,12 @@ impl Qwen35Model {
                         &bufs.metadata.kv_last_page_len,
                         &mut bufs.attn.attn_output,
                         &mut bufs.metadata.flashinfer_ws,
-                        num_heads,
-                        num_kv_heads,
-                        page_size,
-                        head_dim,
+                        &ops::FlashInferHeadConfig {
+                            num_qo_heads: num_heads,
+                            num_kv_heads,
+                            page_size,
+                            head_dim,
+                        },
                     )?;
                 }
                 KVFormat::TurboQuant { .. } => {
@@ -962,14 +967,13 @@ impl Qwen35Model {
                     let sm_scale = 1.0 / (head_dim as f32).sqrt();
 
                     // Step 1: Rotate Q → Q_rot (sign flip + FWHT)
-                    use cudarc::driver::{DevicePtr, DevicePtrMut};
                     let q_ptr = {
                         let (p, _g) = bufs.attn.q_batch.data.device_ptr(stream);
-                        p as u64
+                        p
                     };
                     let q_rot_ptr = {
                         let (p, _g) = bufs.attn.q_rot.data.device_ptr_mut(stream);
-                        p as u64
+                        p
                     };
                     kv_turboquant::turboquant_rotate_query(
                         &self.ctx,
@@ -984,7 +988,7 @@ impl Qwen35Model {
                     // Step 2: Fused attention
                     let attn_ptr = {
                         let (p, _g) = bufs.attn.attn_output.data.device_ptr_mut(stream);
-                        p as u64
+                        p
                     };
                     kv_turboquant::turboquant_fused_decode_attention(
                         &self.ctx,
@@ -1101,14 +1105,18 @@ impl Qwen35Model {
                 &bufs.recurrent.qkv_conv_batch,
                 &bufs.recurrent.b_batch,
                 &bufs.recurrent.a_batch,
-                &attn.dt_bias,
-                &attn.a_log,
+                &ops::GdrWeights {
+                    dt_bias: &attn.dt_bias,
+                    a_log: &attn.a_log,
+                },
                 &mut bufs.recurrent.gdr_state_ptrs_per_layer[linear_idx],
                 &mut bufs.recurrent.gdr_out_batch,
-                c.linear_num_key_heads,
-                c.linear_num_value_heads,
-                c.linear_key_head_dim,
-                c.linear_value_head_dim,
+                &ops::GdrHeadConfig {
+                    num_key_heads: c.linear_num_key_heads,
+                    num_value_heads: c.linear_num_value_heads,
+                    key_dim: c.linear_key_head_dim,
+                    val_dim: c.linear_value_head_dim,
+                },
                 batch_size,
             )?;
         }

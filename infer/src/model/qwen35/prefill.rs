@@ -222,15 +222,19 @@ impl Qwen35Model {
             &qkv_conv_batch,
             &b_batch,
             &a_batch,
-            &attn.dt_bias,
-            &attn.a_log,
+            &ops::GdrWeights {
+                dt_bias: &attn.dt_bias,
+                a_log: &attn.a_log,
+            },
             &mut layer_state.state,
             gdr_chunkwise_scratch,
             &mut gdr_out_batch,
-            c.linear_num_key_heads,
-            c.linear_num_value_heads,
-            c.linear_key_head_dim,
-            c.linear_value_head_dim,
+            &ops::GdrHeadConfig {
+                num_key_heads: c.linear_num_key_heads,
+                num_value_heads: c.linear_num_value_heads,
+                key_dim: c.linear_key_head_dim,
+                val_dim: c.linear_value_head_dim,
+            },
         )?;
 
         let mut normed_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
@@ -340,7 +344,7 @@ impl Qwen35Model {
         let mut full_idx = 0usize;
         let mut gdr_chunkwise_scratch = GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?;
 
-        for layer in self.layers.iter() {
+        for layer in &self.layers {
             hidden_batch = self.prefill_layer_paged(
                 layer,
                 &hidden_batch,
@@ -644,14 +648,18 @@ impl Qwen35Model {
                         &bufs.qkv_conv,
                         &bufs.b_proj,
                         &bufs.a_proj,
-                        &attn.dt_bias,
-                        &attn.a_log,
+                        &ops::GdrWeights {
+                            dt_bias: &attn.dt_bias,
+                            a_log: &attn.a_log,
+                        },
                         &mut layer_state.state,
                         &mut bufs.gdr_out,
-                        c.linear_num_key_heads,
-                        c.linear_num_value_heads,
-                        c.linear_key_head_dim,
-                        c.linear_value_head_dim,
+                        &ops::GdrHeadConfig {
+                            num_key_heads: c.linear_num_key_heads,
+                            num_value_heads: c.linear_num_value_heads,
+                            key_dim: c.linear_key_head_dim,
+                            val_dim: c.linear_value_head_dim,
+                        },
                     )?;
 
                     // Gated RMSNorm

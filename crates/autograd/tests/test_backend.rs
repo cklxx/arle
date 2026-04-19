@@ -31,14 +31,28 @@ fn assert_close(got: &[f32], want: &[f32], tol: f32, label: &str) {
     }
 }
 
+fn run_lazy_matmul<B: Backend>(
+    backend: &B,
+    a: &[f32],
+    a_shape: &[usize],
+    b: &[f32],
+    b_shape: &[usize],
+) -> autograd::Result<(Vec<f32>, Vec<usize>)> {
+    let a_handle = backend.upload(a, a_shape)?;
+    let b_handle = backend.upload(b, b_shape)?;
+    let (out_handle, out_shape) = backend.matmul(&a_handle, a_shape, &b_handle, b_shape)?;
+    backend.eval(&[&out_handle])?;
+    let out = backend.readback(&out_handle)?;
+    Ok((out, out_shape))
+}
+
 #[test]
 fn cpu_backend_matches_reference_2d() {
     let backend = CpuBackend;
     let a = make_rows(&[8, 16], 1);
     let b = make_rows(&[16, 32], 2);
-    let (got, got_shape) = backend
-        .matmul_forward(&a, &[8, 16], &b, &[16, 32])
-        .expect("cpu matmul");
+    let (got, got_shape) =
+        run_lazy_matmul(&backend, &a, &[8, 16], &b, &[16, 32]).expect("cpu matmul");
     let (want, want_shape) = cpu_matmul_forward(&a, &[8, 16], &b, &[16, 32]).expect("ref");
     assert_eq!(got_shape, want_shape);
     assert_close(&got, &want, 1e-6, "cpu 2d");
@@ -52,9 +66,8 @@ fn metal_backend_matches_cpu_small_2d() {
     let backend = MetalBackend;
     let a = make_rows(&[8, 16], 11);
     let b = make_rows(&[16, 32], 22);
-    let (got, got_shape) = backend
-        .matmul_forward(&a, &[8, 16], &b, &[16, 32])
-        .expect("metal matmul");
+    let (got, got_shape) =
+        run_lazy_matmul(&backend, &a, &[8, 16], &b, &[16, 32]).expect("metal matmul");
     let (want, _) = cpu_matmul_forward(&a, &[8, 16], &b, &[16, 32]).expect("ref");
     assert_eq!(got_shape, vec![8, 32]);
     assert_close(&got, &want, 1e-3, "metal 2d small");
@@ -68,9 +81,8 @@ fn metal_backend_matches_cpu_square_2d() {
     let backend = MetalBackend;
     let a = make_rows(&[4, 64], 33);
     let b = make_rows(&[64, 64], 44);
-    let (got, got_shape) = backend
-        .matmul_forward(&a, &[4, 64], &b, &[64, 64])
-        .expect("metal matmul");
+    let (got, got_shape) =
+        run_lazy_matmul(&backend, &a, &[4, 64], &b, &[64, 64]).expect("metal matmul");
     let (want, _) = cpu_matmul_forward(&a, &[4, 64], &b, &[64, 64]).expect("ref");
     assert_eq!(got_shape, vec![4, 64]);
     assert_close(&got, &want, 1e-3, "metal 2d square");
@@ -84,12 +96,61 @@ fn metal_backend_matches_cpu_batched_3d() {
     let backend = MetalBackend;
     let a = make_rows(&[3, 8, 16], 55);
     let b = make_rows(&[3, 16, 32], 66);
-    let (got, got_shape) = backend
-        .matmul_forward(&a, &[3, 8, 16], &b, &[3, 16, 32])
-        .expect("metal matmul");
+    let (got, got_shape) =
+        run_lazy_matmul(&backend, &a, &[3, 8, 16], &b, &[3, 16, 32]).expect("metal matmul");
     let (want, _) = cpu_matmul_forward(&a, &[3, 8, 16], &b, &[3, 16, 32]).expect("ref");
     assert_eq!(got_shape, vec![3, 8, 32]);
     assert_close(&got, &want, 1e-3, "metal 3d batched");
+}
+
+fn run_lazy_add<B: Backend>(
+    backend: &B,
+    a: &[f32],
+    b: &[f32],
+    shape: &[usize],
+) -> autograd::Result<Vec<f32>> {
+    let a_handle = backend.upload(a, shape)?;
+    let b_handle = backend.upload(b, shape)?;
+    let out_handle = backend.add(&a_handle, &b_handle, shape)?;
+    backend.eval(&[&out_handle])?;
+    backend.readback(&out_handle)
+}
+
+fn reference_add(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter().zip(b.iter()).map(|(x, y)| x + y).collect()
+}
+
+#[test]
+fn cpu_backend_add_matches_reference() {
+    let backend = CpuBackend;
+    let a = make_rows(&[4, 16], 7);
+    let b = make_rows(&[4, 16], 8);
+    let got = run_lazy_add(&backend, &a, &b, &[4, 16]).expect("cpu add");
+    assert_close(&got, &reference_add(&a, &b), 1e-6, "cpu add 2d");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_add_matches_cpu_2d() {
+    use autograd::backend_metal::MetalBackend;
+
+    let backend = MetalBackend;
+    let a = make_rows(&[8, 32], 101);
+    let b = make_rows(&[8, 32], 202);
+    let got = run_lazy_add(&backend, &a, &b, &[8, 32]).expect("metal add");
+    assert_close(&got, &reference_add(&a, &b), 1e-3, "metal add 2d");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_add_matches_cpu_3d() {
+    use autograd::backend_metal::MetalBackend;
+
+    let backend = MetalBackend;
+    let a = make_rows(&[3, 8, 16], 303);
+    let b = make_rows(&[3, 8, 16], 404);
+    let got = run_lazy_add(&backend, &a, &b, &[3, 8, 16]).expect("metal add");
+    assert_close(&got, &reference_add(&a, &b), 1e-3, "metal add 3d");
 }
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]

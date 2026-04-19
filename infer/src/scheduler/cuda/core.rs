@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 
-use super::*;
+use super::{
+    ActiveRequest, Arc, AtomicUsize, GenerationState, IncomingRequest, ModelForward, PagedKVPool,
+    Phase, Result, SchedulerConfig, SchedulerHandle, SeedableRng, StdRng, Tokenizer, VecDeque,
+    error, info, mpsc, warn,
+};
 use crate::kv_tier::BlockLocation;
 use crate::kv_tier::transport::DiskStore;
 use crate::prefix_cache::{BlockId, BlockMetadataUpdate, RadixCache};
@@ -57,9 +61,7 @@ pub(super) struct StagedAdmission {
 pub(super) struct PendingDecode {
     pub decode_indices: Vec<usize>,
     pub slot_indices: Vec<usize>,
-    pub all_greedy: bool,
     /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
-    /// Distinct from `all_greedy` which tracks sampling policy, not launch state.
     pub greedy_launched: bool,
     pub sampling_params_greedy: Vec<bool>,
     pub mixed_prefill_request_idx: Option<usize>,
@@ -565,7 +567,7 @@ impl<M: ModelForward> Scheduler<M> {
                     .to_vec()
             })
             .collect();
-        let required_pages = block_pages.iter().map(|pages| pages.len()).sum::<usize>();
+        let required_pages = block_pages.iter().map(std::vec::Vec::len).sum::<usize>();
         let retained_pages = self.paged_kv_pool.retained_count();
         let total_pages = self.paged_kv_pool.max_total_pages;
         let retain_cap_fraction = self.config.prefix_cache_retain_hard_cap;
@@ -603,21 +605,20 @@ impl<M: ModelForward> Scheduler<M> {
         // but not to the disk format), publish silently with no
         // fingerprints — persistence is not available for that
         // format yet. Warn once per publish so operators notice.
-        let kv_format_tag = match self.paged_kv_pool.format.stable_tag() {
-            Some(tag) => tag,
-            None => {
-                warn!(
-                    "prefix_cache publish: live KV format has no stable_tag assignment; \
-                     fingerprints skipped for slot {} (format = {:?})",
-                    slot_idx, self.paged_kv_pool.format,
-                );
-                // Zero = "unset"; persistence code refuses format 0
-                // at load time, so this can never drive a cross-format
-                // reload. Still stamp fingerprints because Tier C's
-                // O(1) block_index and M4c's reconcile both want a
-                // non-zero fingerprint on each published node.
-                0
-            }
+        let kv_format_tag = if let Some(tag) = self.paged_kv_pool.format.stable_tag() {
+            tag
+        } else {
+            warn!(
+                "prefix_cache publish: live KV format has no stable_tag assignment; \
+                 fingerprints skipped for slot {} (format = {:?})",
+                slot_idx, self.paged_kv_pool.format,
+            );
+            // Zero = "unset"; persistence code refuses format 0
+            // at load time, so this can never drive a cross-format
+            // reload. Still stamp fingerprints because Tier C's
+            // O(1) block_index and M4c's reconcile both want a
+            // non-zero fingerprint on each published node.
+            0
         };
         let mut parent_fingerprint: Option<BlockFingerprint> = None;
         let mut block_fingerprints: Vec<BlockFingerprint> = Vec::with_capacity(num_blocks);
@@ -716,7 +717,7 @@ impl<M: ModelForward> Scheduler<M> {
                             warn!(
                                 "page lifecycle unknown page {} during publish: {}",
                                 page, err
-                            )
+                            );
                         }
                     }
                 }
@@ -941,99 +942,137 @@ impl<M: ModelForward> Scheduler<M> {
     /// counts without capturing every single size.
     ///
     /// Two-pass warmup:
-    /// 1. Pass 1 captures graphs with heuristic-selected cublasLt algorithms.
+    /// 1. Pass 1 drives forward_decode_batch per batch size, which populates the
+    ///    cublasLt heuristic algo cache for every shape. In graph-capture mode
+    ///    it also records a graph per batch size.
     /// 2. `autotune_all_cached_gemms_cuda` benchmarks all heuristic candidates and
     ///    replaces each shape's algo with the measured-fastest one.
-    /// 3. Pass 2 re-captures graphs with the autotuned algorithms.
+    /// 3. Pass 2 (graph-capture mode only) re-captures graphs with the autotuned
+    ///    algorithms. Eager decode (e.g. LoRA) skips pass 2 since no graphs
+    ///    were cached.
     pub(super) fn warmup_cuda_graphs(&mut self) {
         let num_slots = self.states.len();
         if !self.paged_kv_pool.is_active() {
             return;
         }
 
+        let graph_capture_enabled = self.model.supports_cuda_graph_decode();
         let max_bs = num_slots.min(256);
         let warmup_sizes = Self::cuda_graph_batch_sizes(max_bs);
 
-        info!(
-            "Warming up CUDA Graphs for {} batch sizes (max {})...",
-            warmup_sizes.len(),
-            max_bs,
-        );
+        if graph_capture_enabled {
+            info!(
+                "Warming up CUDA Graphs for {} batch sizes (max {})...",
+                warmup_sizes.len(),
+                max_bs,
+            );
+        } else {
+            info!(
+                "Graph capture disabled (eager decode, e.g. LoRA); running \
+                 eager warmup + cublasLt autotune for {} batch sizes (max {})...",
+                warmup_sizes.len(),
+                max_bs,
+            );
+        }
         let t0 = std::time::Instant::now();
 
-        for slot in 0..max_bs {
-            if let Err(e) = self.paged_kv_pool.alloc_tokens(slot, 1) {
-                error!("Warmup: pool alloc for slot {} failed: {}", slot, e);
-                return;
-            }
-        }
+        // Track how many slots we actually allocated so any early exit below
+        // still frees them in the cleanup loop. Previously, a failing
+        // `alloc_tokens` or `create_decode_context` would `return` with slots
+        // still holding warmup tokens — `free_slots()` would then consider
+        // them free while the pool still had dirty state, and the first real
+        // request could inherit stale paged-KV entries.
+        let mut allocated: usize = 0;
+        let mut warmed: usize = 0;
 
-        // Lazy-init decode context before warmup.
-        if self.decode_bufs.is_none() {
-            match self
-                .model
-                .create_decode_context(self.states.len(), &self.paged_kv_pool)
-            {
-                Ok(ctx) => self.decode_bufs = Some(ctx),
-                Err(e) => {
-                    error!("Warmup: failed to create decode context: {}", e);
-                    return;
+        'warmup: {
+            for slot in 0..max_bs {
+                if let Err(e) = self.paged_kv_pool.alloc_tokens(slot, 1) {
+                    error!("Warmup: pool alloc for slot {} failed: {}", slot, e);
+                    break 'warmup;
+                }
+                allocated = slot + 1;
+            }
+
+            // Lazy-init decode context before warmup.
+            if self.decode_bufs.is_none() {
+                match self
+                    .model
+                    .create_decode_context(self.states.len(), &self.paged_kv_pool)
+                {
+                    Ok(ctx) => self.decode_bufs = Some(ctx),
+                    Err(e) => {
+                        error!("Warmup: failed to create decode context: {}", e);
+                        break 'warmup;
+                    }
                 }
             }
-        }
 
-        let dummy_tokens: Vec<u32> = vec![0; max_bs];
-        let slot_indices: Vec<usize> = (0..max_bs).collect();
+            let dummy_tokens: Vec<u32> = vec![0; max_bs];
+            let slot_indices: Vec<usize> = (0..max_bs).collect();
 
-        // Pass 1: capture graphs (populates cublasLt heuristic algo cache).
-        let captured = self.warmup_graphs_pass(&warmup_sizes, &dummy_tokens, &slot_indices);
+            // Pass 1: drive forward for each warmup batch size. Populates the
+            // cublasLt heuristic algo cache for all GEMM shapes used by decode.
+            // In graph-capture mode, also captures a graph per batch size.
+            warmed = self.warmup_graphs_pass(&warmup_sizes, &dummy_tokens, &slot_indices);
 
-        // Autotune: benchmark all heuristic candidates, replace with measured best.
-        if captured > 0 {
-            info!(
-                "Autotuning cublasLt GEMM algorithms ({} shapes)...",
-                captured
-            );
-            let t_at = std::time::Instant::now();
-            unsafe {
-                infer_cuda_kernels::ffi::autotune_all_cached_gemms_cuda(
-                    self.model.device_context().stream.cu_stream(),
+            // Autotune: benchmark all heuristic candidates, replace with measured best.
+            // Runs regardless of graph mode so eager LoRA decode lands on the same
+            // tuned algorithms as graph-mode decode.
+            if warmed > 0 {
+                info!("Autotuning cublasLt GEMM algorithms ({} shapes)...", warmed);
+                let t_at = std::time::Instant::now();
+                unsafe {
+                    infer_cuda_kernels::ffi::autotune_all_cached_gemms_cuda(
+                        self.model.device_context().stream.cu_stream(),
+                    );
+                }
+                info!(
+                    "cublasLt autotune done in {:.0}ms",
+                    t_at.elapsed().as_secs_f64() * 1e3,
                 );
-            }
-            info!(
-                "cublasLt autotune done in {:.0}ms",
-                t_at.elapsed().as_secs_f64() * 1e3,
-            );
 
-            // Invalidate all graphs captured with heuristic algos.
-            {
-                use crate::model::DecodeContextOps;
-                let decode_ctx = self
-                    .decode_bufs
-                    .as_mut()
-                    .expect("invariant: decode_bufs initialized above");
-                for &bs in &warmup_sizes[..captured] {
-                    decode_ctx.invalidate_graph_cache(bs);
+                if graph_capture_enabled {
+                    // Invalidate graphs captured with heuristic algos.
+                    {
+                        use crate::model::DecodeContextOps;
+                        let decode_ctx = self
+                            .decode_bufs
+                            .as_mut()
+                            .expect("invariant: decode_bufs initialized above");
+                        for &bs in &warmup_sizes[..warmed] {
+                            decode_ctx.invalidate_graph_cache(bs);
+                        }
+                    }
+
+                    // Pass 2: re-capture with autotuned algorithms.
+                    let recaptured =
+                        self.warmup_graphs_pass(&warmup_sizes, &dummy_tokens, &slot_indices);
+                    info!(
+                        "Re-captured {} graphs with autotuned GEMM algorithms",
+                        recaptured,
+                    );
                 }
             }
-
-            // Pass 2: re-capture with autotuned algorithms.
-            let recaptured = self.warmup_graphs_pass(&warmup_sizes, &dummy_tokens, &slot_indices);
-            info!(
-                "Re-captured {} graphs with autotuned GEMM algorithms",
-                recaptured,
-            );
         }
 
-        for slot in 0..max_bs {
+        // Always reached: frees any slots the warmup body allocated, whether
+        // the body ran to completion or bailed on an error above.
+        for slot in 0..allocated {
             self.paged_kv_pool.free_slot(slot);
             let _ = self.states[slot].reset();
         }
 
+        let mode = if graph_capture_enabled {
+            "CUDA Graph warmup"
+        } else {
+            "Eager warmup + cublasLt autotune"
+        };
         info!(
-            "CUDA Graph warmup done in {:.0}ms ({} batch sizes, max {})",
+            "{} done in {:.0}ms ({} batch sizes, max {})",
+            mode,
             t0.elapsed().as_secs_f64() * 1e3,
-            captured,
+            warmed,
             warmup_sizes.last().copied().unwrap_or(0),
         );
     }
@@ -1166,10 +1205,10 @@ impl<M: ModelForward> Drop for Scheduler<M> {
         // sufficient to unwedge `run_once`; we do both for safety.
         let (dummy_coord, dummy_handle, dummy_events) = crate::kv_tier::Coordinator::new(1);
         drop(dummy_coord);
-        let _old_handle = std::mem::replace(&mut self.coordinator_handle, dummy_handle);
-        let _old_events = std::mem::replace(&mut self.coordinator_events, dummy_events);
-        drop(_old_handle);
-        drop(_old_events);
+        let old_handle = std::mem::replace(&mut self.coordinator_handle, dummy_handle);
+        let old_events = std::mem::replace(&mut self.coordinator_events, dummy_events);
+        drop(old_handle);
+        drop(old_events);
         if let Some(thread) = self.coordinator_thread.take() {
             match thread.join() {
                 Ok(Ok(())) => {}

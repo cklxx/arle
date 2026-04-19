@@ -110,15 +110,15 @@ pub(crate) fn debug_dump_hidden(
     label: &str,
     hidden_dim: usize,
 ) {
+    use half::bf16;
     if std::env::var("INFER_DEBUG_DUMP").is_err() {
         return;
     }
-    use half::bf16;
     let last_idx = hidden.seq_len.saturating_sub(1);
     let view = hidden
         .data
         .slice(last_idx * hidden_dim..last_idx * hidden_dim + hidden_dim);
-    let buf: Vec<bf16> = match ctx.stream.memcpy_dtov(&view) {
+    let buf: Vec<bf16> = match ctx.stream.clone_dtoh(&view) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[debug-dump] {label}: copy failed: {e}");
@@ -134,8 +134,8 @@ pub(crate) fn debug_dump_hidden(
         .skip(tail_start)
         .map(|v| format!("{v:+.5}"))
         .collect();
-    let max = f32s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let min = f32s.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max = f32s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let min = f32s.iter().copied().fold(f32::INFINITY, f32::min);
     let nan = f32s.iter().any(|v| v.is_nan());
     let inf = f32s.iter().any(|v| v.is_infinite());
     let rms = (f32s.iter().map(|v| v * v).sum::<f32>() / hidden_dim as f32).sqrt();
@@ -180,10 +180,10 @@ pub(crate) fn compute_logits_batch(
 /// Return the output projection matrix: separate LM head if present, otherwise
 /// tied embeddings.
 pub(crate) fn output_projection<'a>(
-    lm_head: &'a Option<DeviceMatrix>,
+    lm_head: Option<&'a DeviceMatrix>,
     embed_tokens: &'a DeviceMatrix,
 ) -> &'a DeviceMatrix {
-    lm_head.as_ref().unwrap_or(embed_tokens)
+    lm_head.unwrap_or(embed_tokens)
 }
 
 // ─── Weight loading ──────────────────────────────────────────────────────────

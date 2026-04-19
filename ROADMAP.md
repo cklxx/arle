@@ -14,7 +14,7 @@ Related docs:
 
 ---
 
-## Current State (2026-04-17)
+## Current State (2026-04-19)
 
 Working: Qwen3/Qwen3.5/GLM4 inference on CUDA + Metal, FlashInfer single prefill (HD128) + Triton FA2 (HD256), FlashInfer batched decode attention, **Tiered KV cache (T0 GPU → T1 host pinned → T2 NVMe → T3 remote NIXL)** with radix-driven prefix reuse and page-level staging (`page_size=16` for BF16), token-level KV pool, continuous batching with chunked prefill (4096 tok), decode-priority scheduling, prefix-aware slot assignment with **recurrent state snapshot/restore for hybrid models**, merged QKV + gate-up GEMM (96 fewer launches/step), CUDA Graph batched decode (per batch size), top-k/p/temp/min-p/penalty sampling, batched sampling, OpenAI `/v1/completions` + `/v1/chat/completions` + `/v1/responses` (non-streaming) + `/v1/models` + SSE, Rust agent binary, Python async agent, Prometheus `/metrics` + `/v1/stats` endpoints, model architecture registry, radix-tree prefix cache (tier-aware `RadixNode` with fingerprint + session affinity), speculative decoding framework (CPU stubs) + Metal DFlash experimental path on Qwen3, tensor parallel config/sharding math (CPU stubs), **weight quantization W2/W4/W8 + Marlin W4 prefill + TurboQuant 3-bit**, **KV quantization FP8/INT8/TurboQuant 2-4 bit + fused-dequant attention**, **native Q4_K GPU kernel + GGUF loader (BF16/F16/Q8_0/Q4_K_M)**, **Metal backend with resumable request state (M0.2a)**, throughput benchmark suite.
 
@@ -29,12 +29,15 @@ Working: Qwen3/Qwen3.5/GLM4 inference on CUDA + Metal, FlashInfer single prefill
 - **Tiered KV Cache M2b + M0.3 + M3a + M3b + M3c locally shipped and remote-accepted on L4 (2026-04-15)**: scheduler selector flip to radix, BF16 `page_size=16`, host-tier skeleton, `lookup_or_stage` contract + page-lifecycle state machine, legacy contiguous CPU KV offload retired. See `docs/projects/tiered-kv-cache.md`.
 - **`infer-cuda-kernels` kernel crate extracted** (commit `a4e12f5`): CUDA Rust layer (`paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `ffi`, `kv_quant`, `kv_turboquant`) moved to `crates/infer-cuda-kernels/`; `infer/src/backend/cuda/` keeps only `bootstrap.rs`. One-way dependency `infer → infer-cuda-kernels`.
 - **Q4_K native GPU kernel shipped**: `q4k_gemv_kernel` + packed GGUF loader fast path fits Carnice-27B on L4-24GB. See `docs/plans/q4k-native-gpu.md`.
-- **Metal M0.2a resumable request state**: Qwen3 + Qwen3.5 request state objects (prefill-in-chunks, one-step decode, deterministic cleanup). Scheduler-backed serving wiring (M0.2b) still blocked on `BackendRuntimeHandle` replacement.
+- **Metal M0.2a resumable request state + M0.2b scheduler-backed serving**: Qwen3 + Qwen3.5 request state objects (prefill-in-chunks, one-step decode, deterministic cleanup); `metal_serve` now routes through `SchedulerHandle` via `spawn_metal_scheduler_handle_from_path_with_options_and_metrics` (`infer/src/backend/metal/runtime.rs:580`). M0.2 throughput exit still pending variable-length decode + per-step batch-state rebuild cost work — see [docs/plans/2026-04-15-metal-backend-acceptance-plan.md](docs/plans/2026-04-15-metal-backend-acceptance-plan.md).
 - **Metal packed-batch concurrent decode fixed (2026-04-16)**: `extend_kv_cache` batch-dim bug that crashed the scheduler when packed cache rolled past `KV_CACHE_CHUNK` was repaired; varlen additive mask now emitted in bf16 for MLX ≥ 0.32 SDPA.
 - **Qwen3.5 DFlash correctness landed (2026-04-17)**: end-to-end DFlash tape + sticky-state reset + bf16 cast of `g`/`k` produces coherent deterministic output matching baseline. Currently a perf regression (~5× slower single-stream vs baseline; acceptance ~28%; serial across concurrent requests). Follow-ups: acceptance investigation and batch-axis packing over 16-token blocks. See [`docs/experience/wins/2026-04-17-metal-qwen35-dflash-correctness-bench.md`](docs/experience/wins/2026-04-17-metal-qwen35-dflash-correctness-bench.md).
 - **CPU offload retired**: the legacy contiguous `model/kv_cache.rs` CPU-offload surface (`k_host/v_host`, `OFFLOAD_BLOCK_SIZE=64`, `prefetch/offload` hooks) deleted in M3c (`c3f65f7`). `set_max_gpu_kv` remains as a compatibility no-op warning only.
+- **Phase 6 M4 stepwise GRPO + M5 autograd Backend trait (2026-04-18)**: `train_multi_turn` binary runs per-position GRPO with autoregressive rollout and held-out eval harness; `Backend` trait + `CpuBackend` land in `crates/autograd/src/backend.rs`; `MetalBackend` (mlx-sys `mlx_matmul`) in `crates/autograd/src/backend_metal.rs`; `CudaBackend` (cuBLAS SGEMM, Mac-typecheck via `todo!()` stubs, pending remote GPU validation) in `crates/autograd/src/backend_cuda.rs`. CPU vs Metal matmul parity ≤1e-3 across 3 TinyLM shapes; `--backend {cpu,metal,cuda}` flag wired. At TinyLM scale CPU beats Metal ~2× (FFI dominates); at d_model=256/4-layer scale Metal pulls ~1.4× ahead. See [`docs/experience/wins/2026-04-18-bench-train-multi-turn.md`](docs/experience/wins/2026-04-18-bench-train-multi-turn.md).
+- **Qwen3.5 Metal concurrent decode closed to ceiling (2026-04-19)**: Iter 7 session-API commit `e97d52a` lands per-step FFI-amortized single-request decode; c=1 HTTP 73.1 tok/s (~13% off the 84.1 tok/s in-process tight-loop ceiling = mlx_lm parity), c=4 HTTP 162.5 tok/s is the concurrent ceiling (c=8 flat at 162.9). StepDriver tight loop 76.5 tok/s; scheduler-tick latency — not FFI — now dominates the HTTP residual gap. Eleven-iteration arc archived in [`docs/experience/wins/2026-04-19-metal-qwen35-final-state.md`](docs/experience/wins/2026-04-19-metal-qwen35-final-state.md).
+- **Paged-prefill Phase 3 hoisted + follow-ups (2026-04-18)**: `prefill.rs` chunk loop hoists per-layer constants out of the hot path; guidellm sweep snapshot landed in `docs/experience/wins/2026-04-18-bench-guidellm-paged-phase3a-hoisted.md`. Throughput regression investigation + Qwen3.5 crash repro tracked in [`docs/plans/paged-prefill-followups-2026-04-18.md`](docs/plans/paged-prefill-followups-2026-04-18.md) §1/§3 (CUDA-gated).
 
-Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi — detection shipped in `model_registry.rs`, per-model forward not wired), MLA attention, tensor parallel communication (NCCL), speculative decoding GPU integration (CPU framework only), FlashAttention-3 (H100), Metal scheduler-backed serving (M0.2b — still `BackendRuntimeHandle` today), Qwen3.5 CUDA batched prefill, scheduler preemption with KV swap.
+Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi — detection shipped in `model_registry.rs`, per-model forward not wired), MLA attention, tensor parallel communication (NCCL), speculative decoding GPU integration (CPU framework only), FlashAttention-3 (H100), Metal M0.2 throughput exit (scheduler-backed `metal_serve` shipped; pending variable-length decode + per-step batch-state rebuild cost work), Qwen3.5 CUDA batched prefill, scheduler preemption with KV swap.
 
 ---
 
@@ -527,9 +530,11 @@ Focus on performance, robustness, and Metal parity:
 4. ~~**Overlap scheduling (H2D/D2H with compute)**~~ — ✅ dual-stream + decode-first reordering
 5. ~~**Tiered KV Cache M0–M3**~~ — ✅ M2b+M0.3+M3a+M3b+M3c locally + L4 remote-accepted.
    Next: M3b runtime promotion path, M4 disk persistence + session save/load.
-6. **Metal M0.2b scheduler-backed serving** — `metal_serve` still goes through `BackendRuntimeHandle`;
-   M0.2a request state is landed but the scheduler wire-up + observability exit (M0.3/M0.4) are
-   still the hard blocker. See [docs/plans/2026-04-15-metal-backend-acceptance-plan.md](docs/plans/2026-04-15-metal-backend-acceptance-plan.md).
+6. **Metal M0.2 throughput exit** — `metal_serve` routes through `SchedulerHandle` (M0.2b shipped
+   via `spawn_metal_scheduler_handle_from_path_with_options_and_metrics`); M0.2a/c/d also landed
+   locally. Throughput exit still gated on variable-length decode + per-step batch-state rebuild
+   cost. Observability exit (M0.3/M0.4) tracks separately. See
+   [docs/plans/2026-04-15-metal-backend-acceptance-plan.md](docs/plans/2026-04-15-metal-backend-acceptance-plan.md).
 7. **Qwen3.5 batched prefill** — prefill multiple requests in one forward pass (CUDA)
 8. **4.2 Speculative Decoding GPU integration** — `speculative.rs` CPU framework ✅ done;
    need: DraftEngine, KV rollback in PagedKvPool, SpeculativeScheduler, CUDA Graph 2-phase.
@@ -571,13 +576,22 @@ Focus on performance, robustness, and Metal parity:
 | 0.5 Scheduler++ | ✅ Mock ModelForward | ✅ Done |
 | 0.6 Model Registry | ✅ Config parsing | ✅ Done |
 | 0.7 Benchmarks | ✅ Mock HTTP server | ✅ Done |
-| 1.x–5.x | ❌ GPU required | 5.1 ✅ Done |
-| 6.0 M0 autograd skeleton | ✅ CPU-only tape + add/mul/sum + grad_check | ⏳ Pending |
-| 6.1 M1 core op suite | ⚠️ CPU for grad-check oracle; CUDA for cuBLAS | ⏳ Pending |
-| 6.2 M2 LoRA graft | ❌ needs Qwen weights + CUDA | ⏳ Pending |
-| 6.3 M3 GRPO closed loop | ❌ needs CUDA, ~1 h | ⏳ Pending |
-| 6.4 M4 agent self-evolution | ❌ needs CUDA, ~24 h | ⏳ Pending |
-| 6.5 M5 Metal parity | ⚠️ Mac-local dev path | ⏳ Pending (parallel) |
+| 1.1 PagedAttention | ❌ GPU required | ✅ Shipped |
+| 1.2 FlashAttention-3 | ❌ GPU required | ⏳ Pending (H100) |
+| 1.3–1.8 Multi-arch models | ❌ GPU required | Detection shipped; per-model forward pending (Llama/DeepSeek/Mistral/Gemma/Phi) |
+| 2.1–2.5 Quantization | ⚠️ Config parse CPU; kernels GPU | ✅ GPTQ/AWQ/FP8/INT8/TurboQuant/GGUF+Q4_K shipped |
+| 3.x Tensor Parallel | ❌ GPU + multi-GPU | ⏳ Pending |
+| 4.1 Beam Search | ✅ CPU | ⏳ Pending |
+| 4.2 Speculative Decoding | ⚠️ CPU framework + GPU integration | CPU framework ✅; GPU integration ⏳ |
+| 4.3 Structured Output | ✅ CPU | ⏳ Pending |
+| 5.1 CUDA Graph | ❌ GPU required | ✅ Shipped |
+| 5.2–5.4 Perf opt | ❌ GPU required | Overlap scheduling ✅; others ⏳ |
+| 6.0 M0 autograd skeleton | ✅ CPU-only tape + add/mul/sum + grad_check | ✅ Done (`ef95994`) |
+| 6.1 M1 core op suite | ⚠️ CPU for grad-check oracle; CUDA for cuBLAS | ✅ Done CPU (`318cbf4`); CUDA cuBLAS path pending remote verify |
+| 6.2 M2 LoRA graft | ❌ needs Qwen weights + CUDA | ✅ Done — M2a TinyLM CPU (`f183f80`); M2b Qwen3 hot-path LoRA + codex rounds 1–3 (`1e87b4f`…`b5377f6`) |
+| 6.3 M3 GRPO closed loop | ❌ needs CUDA, ~1 h | ✅ Done — TinyLM GRPO (`f86a9c7`) + PPO clip (`19b8e02`); 6 h Qwen+CUDA acceptance run remote-pending |
+| 6.4 M4 agent self-evolution | ❌ needs CUDA, ~24 h | ✅ Done — M4.1–M4.8 infra shipped (multi-turn, stepwise return, verifiers, curriculum, task gen, /v1/train); 24 h hard-set pass@1 remote-pending |
+| 6.5 M5 Metal parity | ⚠️ Mac-local dev path | Partial — M5.1 research + M5.2 route (b) locked (own-tape + mlx-sys forward; see `a46fc00`) + M5.3 matmul only (3-shape parity ≤ 1e-3). **Architecture decision 2026-04-19**: per-call FFI is degenerate at TinyLM scale (Metal 1.9× slower than CPU); M5.3a device-resident tensor + single eval boundary landed (`17b3599`, `7d024d8`); M5.3b per-op Backend ports underway — `add` done (`af861f2`), rest (mul/mul_scalar/sum/log_softmax/gather/AdamW) pending. Parallel CUDA kernel push (Phase C1–C6) specced in [`docs/plans/m5.3b-cuda-autograd-kernels.md`](docs/plans/m5.3b-cuda-autograd-kernels.md); C1 in flight. Spec: [`docs/plans/m5.3-device-resident-tensor.md`](docs/plans/m5.3-device-resident-tensor.md). Blocks M5.4 Mac Qwen LoRA demo. |
 
 ---
 
@@ -590,7 +604,9 @@ Reference analysis: [docs/research/mni-ml-framework-notes.md](docs/research/mni-
 
 **Motivation**: agent-infer has been a pure inference engine. Continuing down that road makes us a commodity rollout backend behind Python+Megatron training stacks. Phase 6 is the deliberate move to **训推一体** — a single-node, same-process Rust RL trainer + inference engine that self-evolves via agent tool use and multi-verifier rewards. Rust's structural advantage here (no GIL, `Arc`-shared weights, no NCCL IPC tax) is only realized if we stay single-process; this phase commits to that shape.
 
-**Non-goals (explicit)**: distributed training (DDP/ZeRO/TP/PP), full-parameter training, PPO with critic, Python dependency, multi-backend abstraction layer, general-purpose autograd. Each of these is rejected in favor of the LoRA+GRPO+single-process minimum that produces a working self-evolving agent.
+**Non-goals (explicit)**: distributed training (DDP/ZeRO/TP/PP), full-parameter training, PPO with critic, Python dependency, **multi-backend abstraction layer on the *inference* side** (the `infer/` backend split stays `#[cfg]`-only per CLAUDE.md §Backend isolation), general-purpose autograd. Each of these is rejected in favor of the LoRA+GRPO+single-process minimum that produces a working self-evolving agent.
+
+The 2026-04-18 `Backend` trait in `crates/autograd/` (M5) is NOT a violation: it is a minimal, per-call upload/compute/download matmul hook narrowly scoped to the autograd crate's training matmul forward, not a device-resident tensor abstraction for inference. See [`docs/plans/rust-agent-rl-single-node.md`](docs/plans/rust-agent-rl-single-node.md) §7 for the M5 scope lock.
 
 ### 6.0 Autograd Crate — from scratch (`crates/autograd/`)
 

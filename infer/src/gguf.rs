@@ -302,7 +302,7 @@ impl GgufFile {
             .is_some_and(|t| !matches!(t.dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16))
     }
 
-    /// Read Q8_0 tensor in packed format: split into (qweight: Vec<i8>, scales: Vec<bf16>).
+    /// Read Q8_0 tensor in packed format: split into (`qweight: Vec<i8>`, `scales: Vec<bf16>`).
     ///
     /// Returns data suitable for `DeviceMatrix::from_quantized_int8`:
     ///   - qweight: `[numel]` i8 values (one per element)
@@ -1153,9 +1153,7 @@ mod tests {
         let mut block = Vec::new();
         block.extend_from_slice(&scale_bytes);
         // Pack: lo=8 (→0 after -8 offset), hi=9 (→1 after -8)
-        for _ in 0..16 {
-            block.push(0x98); // hi=9, lo=8
-        }
+        block.extend(std::iter::repeat_n(0x98u8, 16)); // hi=9, lo=8 × 16 bytes
 
         let result = dequant_q4_0(&block, 32);
         assert_eq!(result.len(), 32);

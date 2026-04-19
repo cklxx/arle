@@ -365,3 +365,51 @@ Captured `samply --rate 1000` profiles of both stacks running Qwen3.5-4B-MLX-4bi
 - `/tmp/mlx_lm_c1.json.gz` — mlx_lm.generate single-decode (Thread 1 is Python main)
 
 **2-strike status:** stopping loop iteration here. Previous attempts (P0e reorder, refcount recompute, leaf-only profiling) each added incremental knowledge; this cycle produced the first quantitative comparison that names the gap's cause. Implementing the session API is a ~230 LOC refactor outside one loop's scope.
+
+---
+
+## 2026-04-18 later (iter 3) — control profile: direct metal_bench path
+
+Added a third profile for triangulation: `target/release/metal_bench` single-prompt path = `cpp_model.generate()` direct C++ decode loop (no Rust FFI per step). This isolates the FFI-boundary contribution vs the C++ code-path contribution.
+
+| path | tok/s | `mach_vm_protect` share |
+|------|-------|-------------------------|
+| mlx_lm Python (`mlx_lm.generate`) | 84.4 | 12.4% |
+| **metal_bench (direct C++ generate)** | **84.0** | **44.1%** |
+| metal_serve (Rust FFI per-step) | 78.9 | 58.3% |
+
+**Revised hypothesis breakdown:**
+- **~30% of the 5 tok/s gap** (14 pp: 58.3% → 44.1%) = FFI wrapper churn at `CppQwen35Model::step`. Addressable via session API refactor (~230 LOC, keeps caches in C++ `std::vector<array>` for session lifetime).
+- **~70% of the gap** (32 pp: 44.1% → 12.4%) = C++ step code emits more MLX ops / more VM-protection than mlx_lm's Python step. NOT addressable by session API. Needs op-sequence diff between `mlx_qwen35_model.cpp::qwen35_compiled_step` and `mlx_lm/models/qwen3_5.py::Model.__call__`.
+
+**Revised action priorities:**
+1. **Session API** (~1.5 tok/s recovery): still worth doing, bigger win under concurrency.
+2. **Op trace diff** (~3.5 tok/s recovery): the real lever for c=1 parity. Instrument both paths to log MLX op sequence per token. Candidates for extra ops on our side: broadcast_to that Python avoids via implicit broadcasting, explicit reshape where Python uses stride-view, temp scratch arrays in quantized matmul path.
+
+**Profile artifacts (session handoff):**
+- `/tmp/qwen35_c1.json.gz` — metal_serve HTTP c=1
+- `/tmp/mlx_lm_c1.json.gz` — mlx_lm.generate
+- `/tmp/metal_bench_c1.json.gz` — metal_bench direct
+
+---
+
+## 2026-04-18 later (iter 4) — prior hypothesis correction
+
+Re-examining iter 3 findings: the 44% vs 12% `mach_vm_protect` gap between metal_bench and mlx_lm **does not cost tok/s** — both hit ~84 tok/s. `samply` sample-share measures CPU time, not critical-path time; vm_protect happens on Metal driver threads in parallel with GPU compute.
+
+**Corrected picture:**
+
+| Path | tok/s | Status |
+|------|-------|--------|
+| mlx_lm | 84.4 | baseline |
+| metal_bench (direct C++ generate) | 84.0 | **parity ✓** |
+| metal_serve HTTP c=1 | 78.9 | –5 tok/s gap (6%) |
+
+**All 5 tok/s of c=1 gap sits in the Rust FFI + scheduler layer.** The C++ model code path has full mlx_lm parity. Prior iter-3 conclusion that "70% of gap is in C++ step code" was an artifact of using `mach_vm_protect` share as a throughput-bottleneck proxy — it isn't one. vm_protect CPU time parallelizes with GPU compute.
+
+**Revised action plan:**
+1. **Session API refactor** — primary lever, expected to close most of the 5 tok/s gap. Scope: ~230 LOC (C++ stateful API `qwen35_session_begin/step/end` holding caches in `std::vector<array>` + Rust driver using it directly, no per-step `MlxArray` wrapper swap).
+2. **Scheduler tick overhead** — secondary lever. If session API closes <3 tok/s, the remainder is in Tokio scheduler / prefix-hit HashMap / mpsc / streaming. Requires separate profile.
+3. **Cancel**: op-sequence diff against mlx_lm Python. Our C++ is already at parity.
+
+**Rule:** `samply --rate 1000` without full stacks can only say "CPU spent time here", not "throughput is limited by this." Comparing sample shares across different runtimes is unsafe unless you verify the shared bottleneck is on the CPU critical path.

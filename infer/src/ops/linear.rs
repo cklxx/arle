@@ -33,6 +33,120 @@ mod qbits {
     pub(super) const Q6K: usize = 66;
 }
 
+/// Additive LoRA GEMV: `y += B @ (A @ x)`.
+///
+/// The B matrix is expected to be pre-scaled at load time (see
+/// `model::qwen3::lora::upload_as_bf16` — it folds `scale = alpha / r`
+/// into B), so no runtime scalar multiply is needed here.
+///
+/// Shapes:
+///   * `a` — `[rank, in_features]`  (LoRA A)
+///   * `b` — `[out_features, rank]` (LoRA B, pre-scaled)
+///   * `x` — `[in_features]`
+///   * `y` — `[out_features]`  (accumulated, not overwritten)
+///
+/// Allocates two small temporaries (`tmp_a` size `rank`, `tmp_b` size
+/// `out_features`); `rank` is typically 8–64 so the alloc cost is
+/// negligible relative to the two GEMVs. Phase 2 will revisit if the
+/// decode path shows churn overhead in practice.
+pub fn apply_lora_gemv_add(
+    ctx: &DeviceContext,
+    a: &DeviceMatrix,
+    b: &DeviceMatrix,
+    x: &DeviceVec,
+    y: &mut DeviceVec,
+) -> Result<()> {
+    assert_eq!(a.cols, x.len, "lora A cols {} != x len {}", a.cols, x.len);
+    assert_eq!(b.rows, y.len, "lora B rows {} != y len {}", b.rows, y.len);
+    assert_eq!(
+        a.rows, b.cols,
+        "lora rank mismatch: A rows {} != B cols {}",
+        a.rows, b.cols
+    );
+
+    let rank = a.rows;
+    let mut tmp_a = DeviceVec::zeros(ctx, rank)?;
+    gemv(ctx, a, x, &mut tmp_a)?;
+
+    let mut tmp_b = DeviceVec::zeros(ctx, b.rows)?;
+    gemv(ctx, b, &tmp_a, &mut tmp_b)?;
+
+    let (tmp_ptr, _gt) = tmp_b.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::add_cuda(
+            y_ptr as *const ffi::Half,
+            tmp_ptr as *const ffi::Half,
+            y_ptr as *mut ffi::Half,
+            y.len as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Additive LoRA GEMM: `Y += B @ (A @ X)`, batched across `seq_len`.
+///
+/// Mirrors `apply_lora_gemv_add` for the prefill path. Shapes:
+///   * `a` — `[rank, in_features]`
+///   * `b` — `[out_features, rank]` (pre-scaled)
+///   * `x` — `HiddenStates [in_features, seq_len]`
+///   * `y` — `HiddenStates [out_features, seq_len]` (accumulated)
+///
+/// Allocates `tmp_a` of shape `[rank, seq_len]` and `tmp_b` of shape
+/// `[out_features, seq_len]`.
+pub fn apply_lora_gemm_add(
+    ctx: &DeviceContext,
+    a: &DeviceMatrix,
+    b: &DeviceMatrix,
+    x: &HiddenStates,
+    y: &mut HiddenStates,
+) -> Result<()> {
+    assert_eq!(
+        a.cols, x.hidden_dim,
+        "lora A cols {} != x hidden_dim {}",
+        a.cols, x.hidden_dim
+    );
+    assert_eq!(
+        b.rows, y.hidden_dim,
+        "lora B rows {} != y hidden_dim {}",
+        b.rows, y.hidden_dim
+    );
+    assert_eq!(
+        a.rows, b.cols,
+        "lora rank mismatch: A rows {} != B cols {}",
+        a.rows, b.cols
+    );
+    assert_eq!(
+        x.seq_len, y.seq_len,
+        "lora gemm seq_len mismatch: x {} != y {}",
+        x.seq_len, y.seq_len
+    );
+
+    let rank = a.rows;
+    let mut tmp_a = HiddenStates::zeros(ctx, rank, x.seq_len)?;
+    gemm_into(ctx, a, x, &mut tmp_a);
+
+    let mut tmp_b = HiddenStates::zeros(ctx, b.rows, x.seq_len)?;
+    gemm_into(ctx, b, &tmp_a, &mut tmp_b);
+
+    let n = y.hidden_dim * y.seq_len;
+    let (tmp_ptr, _gt) = tmp_b.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::add_cuda(
+            y_ptr as *const ffi::Half,
+            tmp_ptr as *const ffi::Half,
+            y_ptr as *mut ffi::Half,
+            n as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Matrix-vector multiplication: y = A @ x
 /// A: (M, K) row-major, x: (K,), y: (M,)
 /// Supports BF16, W8A16, W4A16, and W2A16 weights.
@@ -63,7 +177,7 @@ pub fn gemv(ctx: &DeviceContext, a: &DeviceMatrix, x: &DeviceVec, y: &mut Device
         let sptr = qs_ptr as *const ffi::Half;
 
         unsafe {
-            use qbits::*;
+            use qbits::{Q3K, Q4K, Q6K, W2, W4};
             let res = match a.quant_bits {
                 Q3K => ffi::q3k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
                 Q4K => ffi::q4k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
@@ -191,6 +305,72 @@ pub fn fused_mlp_into(
     Ok(())
 }
 
+/// Unfused decode-path MLP with optional LoRA adapters on any of gate/up/down.
+///
+/// Used when LoRA is active on one or more of gate_proj / up_proj / down_proj,
+/// since the fused kernel has no LoRA hook. Numerically matches the quantized
+/// fallback branch of `fused_mlp_into`:
+///   * `act = silu(gate_proj(x)) * up_proj(x)`
+///   * `out = down_proj(act)`
+///
+/// LoRA adds applied right after their respective base GEMVs (before the
+/// SiLU for gate/up, after the base GEMV for down).
+///
+/// `up_scratch` must be a caller-owned `DeviceVec` of length `intermediate_size`
+/// (see `DecodeBuffers::mlp_up_scratch`).
+pub fn mlp_decode_with_lora_into(
+    ctx: &DeviceContext,
+    x: &DeviceVec,
+    gate_proj: &DeviceMatrix,
+    up_proj: &DeviceMatrix,
+    down_proj: &DeviceMatrix,
+    lora_gate: Option<(&DeviceMatrix, &DeviceMatrix)>,
+    lora_up: Option<(&DeviceMatrix, &DeviceMatrix)>,
+    lora_down: Option<(&DeviceMatrix, &DeviceMatrix)>,
+    act: &mut DeviceVec,
+    up_scratch: &mut DeviceVec,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    let intermediate_size = gate_proj.rows;
+    assert_eq!(
+        up_scratch.len, intermediate_size,
+        "up_scratch len {} != intermediate_size {}",
+        up_scratch.len, intermediate_size
+    );
+
+    gemv(ctx, gate_proj, x, act)?;
+    if let Some((a, b)) = lora_gate {
+        apply_lora_gemv_add(ctx, a, b, x, act)?;
+    }
+    gemv(ctx, up_proj, x, up_scratch)?;
+    if let Some((a, b)) = lora_up {
+        apply_lora_gemv_add(ctx, a, b, x, up_scratch)?;
+    }
+
+    // silu(gate) * up → act (in-place)
+    {
+        let (act_ptr, _ga) = act.data.device_ptr_mut(&ctx.stream);
+        let (up_ptr, _gu) = up_scratch.data.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::silu_mul_triton_aot_cuda(
+                act_ptr as *const ffi::Half,
+                up_ptr as *const ffi::Half,
+                act_ptr as *mut ffi::Half,
+                intermediate_size as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    gemv(ctx, down_proj, act, out)?;
+    if let Some((a, b)) = lora_down {
+        apply_lora_gemv_add(ctx, a, b, act, out)?;
+    }
+
+    Ok(())
+}
+
 /// GEMM: Y = weight @ X (batched linear projection)
 /// weight: [out_dim, in_dim] row-major, X: HiddenStates [in_dim, seq_len], Y: HiddenStates [out_dim, seq_len]
 pub fn gemm(ctx: &DeviceContext, weight: &DeviceMatrix, x: &HiddenStates) -> Result<HiddenStates> {
@@ -258,7 +438,7 @@ pub(crate) fn gemm_into(
         // Marlin workspace (lock buffer)
         let sms = ctx.sm_count() as i32;
         let ws_size = unsafe { ffi::marlin_workspace_size(n as i32, sms) };
-        let ws_elems = (ws_size + 3) / 4; // round up to i32 count
+        let ws_elems = ws_size.div_ceil(4); // round up to i32 count
         let mut workspace: CudaSlice<i32> = ctx
             .stream
             .alloc_zeros(ws_elems)
@@ -328,7 +508,7 @@ pub(crate) fn gemm_into(
         } else {
             weight.tq_bits as usize
         };
-        let packed_cols = ((weight.cols * effective_bits + 7) / 8) as i32;
+        let packed_cols = (weight.cols * effective_bits).div_ceil(8) as i32;
         let bits = weight.tq_bits as i32;
         let stream = ctx.stream.cu_stream();
 
@@ -447,7 +627,7 @@ pub(crate) fn gemm_into(
                     _ => unreachable!(),
                 };
                 dq.result().expect("qxk_dequant_chunk_cuda failed");
-                ffi::gemm_cuda(tile as *const ffi::Half, xptr, yptr, n, b, k, stream)
+                ffi::gemm_cuda(tile.cast_const(), xptr, yptr, n, b, k, stream)
                     .result()
                     .expect("QxK prefill cuBLAS GEMM failed");
             }
@@ -456,7 +636,7 @@ pub(crate) fn gemm_into(
 
         // GEMV path for everything else (decode or batched).
         unsafe {
-            use qbits::*;
+            use qbits::{Q3K, Q4K, Q6K, W2, W4};
             let res = match (b == 1, weight.quant_bits) {
                 (true, Q3K) => ffi::q3k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
                 (true, Q4K) => ffi::q4k_gemv_cuda(wptr, xptr, yptr, n, k, stream),

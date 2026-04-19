@@ -47,7 +47,7 @@ CUDA kernels live at `crates/infer-cuda-kernels/csrc/`, **not** `infer/csrc/`
 | **Explore** (trace callers, grep prior art, list trait implementors) | You can name every file you will touch. |
 | **Plan** (ask "how would this fail?" first; >5 files or irreversible → stop + flag) | Written approach the user accepted. |
 | **Implement** (check prior art in `infer/src/` + `docs/`; outside plan → update plan) | Diff compiles under the relevant feature set. |
-| **Verify** (`cargo test --workspace`; justify every new `unwrap()`/alloc/async path) | Tests green, `cargo clippy -- -D warnings` clean. |
+| **Verify** (`cargo test --workspace`; justify every new `unwrap()`/alloc/async path; **bench entry per §Benchmarks** if diff is in-scope) | Tests green, `cargo clippy -- -D warnings` clean, **wins/ entry committed (or stub with `pending-remote`)**. |
 | **Reflect** (bug >1 attempt → `docs/experience/errors/`; correction → feedback memory) | Experience entry committed. |
 
 Skip rules: trivial → Implement + Verify; exploration questions → Explore only.
@@ -68,30 +68,44 @@ Skip rules: trivial → Implement + Verify; exploration questions → Explore on
 - Pre-push type check on Mac without nvcc:
   `cargo check -p infer --no-default-features --features cuda,no-cuda`.
 
-### Delegation to Codex
+### Delegation (subagents execute, Codex reviews, parallel by default)
 
-Claude = **direction**; Codex = **execution**. Reach via `codex:codex-rescue`
-(Agent `subagent_type: "codex:codex-rescue"`) or `mcp__openmax__execute_with_codex`.
+Claude = **direction + integration**. Execution runs through **subagents**
+(Agent tool: `general-purpose`, `Explore`, `Plan`, `codex:codex-rescue`).
+Review runs through **`codex review`** at the Bash tool. Reserve direct
+hand-written diffs for edits ≤ ~3 files / trivial mechanical changes.
 
 | Area | Owner |
 |------|-------|
 | Docs, planning, architecture, roadmaps | Claude |
-| Code execution (implement/refactor/tests) | **Codex** (delegate) |
+| Code execution (implement/refactor/tests) | **Subagent** (delegate via Agent tool) |
 | Code review of non-trivial diffs | **Claude runs `codex review`** |
-| Stuck-problem rescue | **Codex** (after 2 failed attempts) |
+| Broad codebase exploration | **Explore / general-purpose subagent** |
+| Implementation planning spanning >5 files | **Plan subagent** |
+| Stuck-problem rescue (2-strike hand-off) | **`codex:codex-rescue` subagent** |
 
-- **Task-execution bias:** when a task is "write/change code", draft a brief
-  (files, constraints, acceptance criteria) and delegate. Claude integrates
-  and verifies — Claude does not hand-write substantial diffs.
-- **Code review is Claude-driven:** invoke `codex review --uncommitted` (or
-  `--commit <sha>` / `--base <branch>`) directly from the Bash tool and relay
-  the findings. Do NOT spawn a `codex:codex-rescue` agent for review. Reserve
-  agent delegation for execution tasks.
-- **2-strike rule:** two good-faith failed attempts → hand off. Brief must
-  list what was tried, what was observed, why each attempt failed, so Codex
-  picks a different angle.
+- **Parallelize by default.** When multiple delegated tasks are independent
+  (different files, different layers, research + execution), fire them in a
+  **single message with multiple Agent tool uses** so they run concurrently.
+  Serial delegation is reserved for genuinely data-dependent steps.
+- **Execution bias:** when a task is "write/change code", draft a brief
+  (files, constraints, acceptance criteria) and delegate to a subagent.
+  Claude integrates and verifies — Claude does not hand-write substantial
+  diffs. Reach Codex via `subagent_type: "codex:codex-rescue"` or
+  `mcp__openmax__execute_with_codex` when the task specifically benefits
+  from Codex's strengths (complex refactors, unfamiliar codebases); use
+  `general-purpose` for routine implementation work.
+- **Code review is Claude-driven via Codex CLI:** invoke
+  `codex review --uncommitted` (or `--commit <sha>` / `--base <branch>`)
+  directly from the Bash tool and relay the findings. Do NOT spawn a
+  `codex:codex-rescue` agent for review — review is a shell command, not
+  a delegation.
+- **2-strike rule:** two good-faith failed attempts → hand off to Codex.
+  Brief must list what was tried, what was observed, why each attempt
+  failed, so Codex picks a different angle.
 - **Claude always owns:** planning docs, experience entries, roadmap edits,
-  user-facing explanations, final integration after Codex reports back.
+  user-facing explanations, final integration after subagents report back,
+  and the `codex review` pass before commit on non-trivial diffs.
 
 ### Benchmarks
 
@@ -101,6 +115,29 @@ Claude = **direction**; Codex = **execution**. Reach via `codex:codex-rescue`
   Learnings), goal taxonomy, watch-list during runs, and **auto-iteration
   rules** (§7: when to loop, when to stop, information-volume triggers).
   Applies to both benchmarks and traces.
+- **MANDATORY — every runtime change produces a bench entry.** A change is
+  not "done" until a dated entry lands under `docs/experience/wins/` (or
+  `errors/` if a regression was found). This is the Verify phase exit
+  condition for any diff that could move numbers. No bench entry → not
+  shipped.
+  - **In scope** (bench required): anything under `infer/src/`,
+    `crates/infer-cuda-kernels/csrc/`, `crates/mlx-sys/src/`, `src/`, any
+    `scripts/bench_*.{sh,py}` parameter change, feature-flag default flips,
+    scheduler/kernel/ops/model/backend edits, dependency bumps that touch
+    the hot path.
+  - **Exempt** (no bench): pure docs (`docs/`, `*.md`, `AGENTS.md`),
+    comment-only diffs, `CLAUDE.md` / memory, dev-only tooling,
+    gitignored-output paths. When exempt, state so in the commit body.
+  - **Regression-check minimum.** Even a "small" change: one
+    `scripts/bench_guidellm.sh` run against the most recent baseline for
+    the affected backend+model, with a Δ% row. Full sweep only when the
+    change is an optimization or architectural.
+  - **If the bench can't run locally** (e.g. CUDA change on a Mac),
+    the commit body MUST cite the remote-machine ticket or plan entry
+    that will execute it, and the entry is opened as a stub under
+    `wins/` with status `pending-remote`. No silent skips.
+  - **Auto-iterate** per spec §7 until stopping rules hold; then cross-link
+    the wins entry from the project/plan that commissioned the change.
 - Snapshot to `docs/experience/wins/YYYY-MM-DD-bench-guidellm-<label>.md`
   using the [`TEMPLATE-bench-guidellm.md`](docs/experience/wins/TEMPLATE-bench-guidellm.md)
   skeleton. **Never overwrite**; after-snapshots cite before-snapshots with deltas.

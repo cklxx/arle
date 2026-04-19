@@ -1,7 +1,14 @@
 # Metal DFlash Qwen3.5 — batched verify roadmap
 
-**Status**: Layer 1 landed 2026-04-17 (single-forward intra-request
-verify).  Layer 2 / Layer 3 pending benchmarks.
+**Status**: Layer 1 landed 2026-04-17. Layer 2a (`mlx_tape_replay_varlen`)
+landed 2026-04-18 (FFI at `crates/mlx-sys/src/lib.rs:621`, kernel at
+`mlx_bridge.cpp:154`). Layer 2b (`qwen35_compiled_verify_block_batched`)
+landed 2026-04-18 (commit `29e0e31`) and verified bit-identical at B=1
+on 2026-04-19
+([`docs/experience/wins/2026-04-19-verify-metal-qwen35-dflash-2b-bit-ident.md`](../experience/wins/2026-04-19-verify-metal-qwen35-dflash-2b-bit-ident.md)).
+Layer 2c–2d still pending. See port-vs-reference
+snapshot:
+[`docs/experience/wins/2026-04-18-metal-dflash-kernel-port-vs-reference.md`](../experience/wins/2026-04-18-metal-dflash-kernel-port-vs-reference.md).
 **Scope**: Apple Silicon Metal backend, Qwen3.5-4B hybrid model,
 `qwen35_dflash_speculative_block`.
 
@@ -65,26 +72,35 @@ Layer 2 flips that policy by making packed verify cheap enough to keep
 DFlash on under concurrency.  Decomposes into four sub-pieces that
 **must land in order**:
 
-**2a — varlen `mlx_tape_replay_varlen` kernel** (in flight, 2026-04-18)
+**2a — varlen `mlx_tape_replay_varlen` kernel** ✅ landed 2026-04-18
 - Kernel + FFI accept `steps: mlx_array([B], int32)` instead of scalar
-  `int steps`.  Keeps scalar `mlx_tape_replay` alongside for the
+  `int steps`.  Scalar `mlx_tape_replay` kept alongside for the
   single-row callsite.
-- Unblocks (but does not depend on) 2b/2c/2d.
-- Acceptance: gdr.rs `test_tape_replay_varlen_matches_scalar` passes;
-  bit-identical output when per-row steps are uniform.
+- Implementation: `mlx_bridge.cpp:154` (`tape_replay_varlen_kernel`),
+  `lib.rs:621` (`mlx_tape_replay_varlen` FFI).
+- Beyond reference (`bstnxbt/dflash-mlx`) — reference assumes single
+  request and has no varlen variant.
+- Unblocks 2b/2c/2d.
 
-**2b — `qwen35_compiled_verify_block_batched` C++ FFI**
-- New C++ FFI mirroring `qwen35_compiled_verify_block` but accepting
-  `[B, S_padded]` tokens, `attn_mask: [B, 1, S_padded, key_len]`
-  additive, `rope_offsets: int32[B]`, per-row `cache_lens: int32[B]`.
+**2b — `qwen35_compiled_verify_block_batched` C++ FFI** ✅ landed
+2026-04-18 (commit `29e0e31`), verified 2026-04-19.
+- New C++ FFI at `mlx_qwen35_model.cpp:1752` mirroring
+  `qwen35_compiled_verify_block` but accepting `[B, S_padded]` tokens,
+  `attn_mask: [B, 1, S_padded, key_len]` additive, `rope_offsets:
+  int32[B]`, per-row `cache_pos_arr: int32[B]`.
 - Reuses the `step_batch_packed` plumbing
   (`crates/mlx-sys/src/mlx_qwen35_model.cpp`) that already lands
   varlen plain-decode with per-row RoPE offsets.
 - Emits logits `[B, S_padded, V]`, GDR tapes `[B, S_padded, Hv, Dv]`
   (one set per GDR layer), capture hidden `[B, S_padded, H]`.
-- Acceptance: `cargo test --release --features metal -- --test-threads=1
-  qwen35_compiled_verify_block_batched` — B=1 run is bit-identical to
-  existing `qwen35_compiled_verify_block`.
+- Acceptance (B=1 bit-identity) confirmed by
+  `backend::metal::qwen35::tests::verify_block_batched_matches_verify_block_for_b1`;
+  regression-check entry at
+  [`docs/experience/wins/2026-04-19-verify-metal-qwen35-dflash-2b-bit-ident.md`](../experience/wins/2026-04-19-verify-metal-qwen35-dflash-2b-bit-ident.md).
+- **Outstanding for 2c:** promote the test-local `verify_block_batched_b1`
+  helper (`infer/src/backend/metal/qwen35.rs:1681`) to a
+  `pub(super) fn verify_block_batched` on `CppQwen35Model` — the
+  scheduler dispatch cannot live inside a `#[cfg(test)]` block.
 
 **2c — Lift the `open.len() >= 2` downgrade + packed verify dispatch**
 - Remove (or gate behind a config toggle) the permanent DFlash disable
@@ -120,19 +136,35 @@ DFlash on under concurrency.  Decomposes into four sub-pieces that
   over Layer 1 on mixed-length prompts.
 
 **Trip wires** (carry forward from the original plan + new discoveries):
-- Per-row RoPE offsets for verify positions: the existing varlen RoPE
-  path (`fast::rope` with int32[B] offsets) works for S=1 plain decode;
-  confirm it handles S>1 where each column within a row needs a
-  different absolute position (`cache_lens[b] + s`).  If `fast::rope`'s
-  array-offset signature only accepts scalar-per-row (no per-column
-  offset), the kernel path may need a broadcast trick: feed
-  `base_offsets[b]` and let the kernel's internal `t_axis` add the
-  column index — verify in isolation before 2b.
-- GDR state shape under B>1: today `target_gdr_flat` is flat-indexed
-  per-layer.  Packed version needs `[B, Hv, Dv, Dk]` rooted at the
-  batch axis.  `qwen35_set_tape_mode` / `qwen35_set_capture_layers`
-  toggle applies to the whole C++ model — capture is all-rows or no-rows,
-  which is fine since every DFlash slot needs tapes.
+- ✅ **Per-row RoPE offsets for verify positions — resolved 2026-04-19
+  via MLX upstream source (`mlx/fast.cpp`).** The array overload
+  `fast::rope(x, dims, traditional, base, scale, offset)` validates
+  `offset` as a 1-D tensor of length B (scalar-per-row); internally it
+  computes `position[b,s] = (offset[b] + s) * scale` by broadcasting
+  `arange(S)` against `offset[B]`. So passing `int32[B]` where
+  `rope_offsets[b] = cache_lens[b]` is sufficient for S>1 — no
+  per-column offset plumbing needed, and no broadcast-trick workaround
+  required. The existing B=1 S=1 callsite at
+  `mlx_qwen35_model.cpp:560-561` already uses this signature; Layer 2b
+  just reuses it with S=S_padded. Documented signature:
+  `MLX_API array rope(const array& x, int dims, bool traditional,
+  std::optional<float> base, float scale, const array& offset,
+  const std::optional<array>& freqs, StreamOrDevice s);` — source at
+  [ml-explore/mlx@main/mlx/fast.h](https://github.com/ml-explore/mlx/blob/main/mlx/fast.h).
+- ✅ **GDR state shape under B>1 — resolved 2026-04-19 via code read.**
+  `gdr_step` (`mlx_qwen35_model.cpp:684-864`) already threads
+  `int B = ctx.batch_size` end-to-end: state-in/state-out are 4-D
+  `[B, hv, dv, dk]` and the kernel path `s_decayed + delta * k_4d`
+  (line 854) operates batch-wise. The FFI carries GDR states as
+  `mlx_array** gdr_states, int32_t n_gdr` — one tensor per *layer*,
+  not per (row, layer). So Layer 2b's Rust-side packing is: for each
+  GDR layer `g`, `mx::stack` the B per-row states at axis 0 to produce
+  a single `[B, hv, dv, dk]` tensor, pass the array-of-pointers with
+  `n_gdr` unchanged. Partial-accept rollback (per-row) unstacks via
+  `mx::split` along axis 0. `qwen35_set_tape_mode` /
+  `qwen35_set_capture_layers` toggle applies to the whole C++ model —
+  capture is all-rows or no-rows, which is fine since every DFlash
+  slot needs tapes.
 - Single-session single-request workloads get **nothing** from Layer 2
   (B=1 already).  The single-session regression on Qwen3.5-4B-4bit
   documented in `wins/2026-04-17-metal-qwen35-dflash-block-verify.md`
@@ -181,8 +213,8 @@ Steady-state throughput under concurrency 16 ≥ 1.5× Layer 2.
 | Layer | ETA | Owner |
 |-------|-----|-------|
 | 1 (intra-request single forward) | **Done 2026-04-17** | Claude |
-| 2a (varlen `mlx_tape_replay`) | **In flight 2026-04-18** | Codex |
-| 2b (`verify_block_batched` FFI) | After 2a | Codex |
+| 2a (varlen `mlx_tape_replay`) | **Done 2026-04-18** | Codex |
+| 2b (`verify_block_batched` FFI) | **Done 2026-04-18, verified 2026-04-19** | Codex |
 | 2c (DFlash scheduler integration) | After 2b | Claude (direction) + Codex (impl) |
 | 2d (packed verify wire-up) | After 2c | Codex |
 | 3 (cross-slot scheduling) | After 2d; may collapse into 2c | TBD |

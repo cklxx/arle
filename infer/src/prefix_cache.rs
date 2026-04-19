@@ -216,7 +216,7 @@ impl RadixCache {
         }
     }
 
-    /// Rebuild [`Self::block_index`] from the current `nodes` array.
+    /// Rebuild `block_index` from the current `nodes` array.
     ///
     /// Callers that deserialize a snapshot (which does not persist the index)
     /// or that bulk-mutate `block_id`s via [`Self::reconcile`] should
@@ -549,8 +549,19 @@ impl RadixCache {
                     self.nodes[child_idx].last_access = now;
                     pos += match_len;
 
-                    // Update block_id if child has the right size.
-                    if child_tokens.len() == self.block_size && block_idx < blocks.len() {
+                    // Advance block_idx when walking through a block-bearing
+                    // node — regardless of this edge's token length.
+                    //
+                    // Block-bearing nodes may carry a short edge when the
+                    // node was created under an edge split: the block_id
+                    // represents block_size tokens on the path *through* the
+                    // node from the last block boundary, not the node's own
+                    // edge length. The older guard (`child_tokens.len() ==
+                    // block_size`) under-counted those walks and reused the
+                    // caller's `blocks[0]` for downstream blocks, corrupting
+                    // `block_index`. Checking block_id presence covers both
+                    // full-size and post-split short-edge block-bearing nodes.
+                    if self.nodes[child_idx].block_id.is_some() && block_idx < blocks.len() {
                         let new_bid = blocks[block_idx];
                         if let Some(old_bid) = self.nodes[child_idx].block_id
                             && old_bid != new_bid
@@ -603,15 +614,54 @@ impl RadixCache {
                     // Replace the original child pointer with the shared node.
                     self.nodes[node_idx].children.insert(next_token, shared_idx);
 
-                    // Don't advance block_idx — the shared node has < block_size tokens.
+                    // Place the caller's current block as a NEW sibling under
+                    // shared_idx, completing the current block window at the
+                    // next block boundary. The sibling covers
+                    // tokens[pos+match_len .. (block_idx+1)*block_size].
+                    // Computing the end from (block_idx+1)*block_size — not
+                    // pos+block_size — is load-bearing: when the walk passed
+                    // through an outer shared intermediate (no block_id), pos
+                    // can be mid-block while block_idx still points at the
+                    // block that window should register. Path-from-last-
+                    // boundary to this new node sums to block_size, so the
+                    // block-id alignment invariant holds. The new sibling's
+                    // first token differs from first_old by construction
+                    // (that's why match_len stopped short).
+                    let rest_end = (block_idx + 1) * self.block_size;
+                    if block_idx < blocks.len() && rest_end <= tokens.len() {
+                        let new_block_tokens = tokens[pos + match_len..rest_end].to_vec();
+                        let new_bid = blocks[block_idx];
+                        let new_fp = fps[block_idx];
+                        let mut new_node = Node::new(new_block_tokens, Some(new_bid), now);
+                        new_node.fingerprint = Some(new_fp);
+                        let new_idx = self.alloc_node(new_node);
+                        self.block_index.insert(new_bid, new_idx);
+                        let first_new = self.nodes[new_idx].tokens[0];
+                        self.nodes[shared_idx].children.insert(first_new, new_idx);
+                        pos = rest_end;
+                        block_idx += 1;
+                        node_idx = new_idx;
+                        continue;
+                    }
+                    // No room for an aligned block (partial tail or out of
+                    // block_ids) — leave shared intermediate as the terminal
+                    // insertion point and stop.
                     break;
                 }
             } else {
                 // No matching child — insert remaining tokens as a new subtree.
+                // Edge windows are computed from the next block boundary
+                // ((block_idx+1)*block_size), not pos+block_size. When the
+                // walk landed here via a shared non-block-bearing parent, pos
+                // is mid-block and the first new edge needs to complete the
+                // current block (len < block_size, path-from-last-boundary
+                // still sums to block_size so it takes the caller's block_id).
                 while pos < tokens.len() && block_idx < blocks.len() {
-                    let end = (pos + self.block_size).min(tokens.len());
+                    let next_boundary = (block_idx + 1) * self.block_size;
+                    let end = next_boundary.min(tokens.len());
                     let edge_tokens = tokens[pos..end].to_vec();
-                    let (block_id, fingerprint) = if edge_tokens.len() == self.block_size {
+                    let is_full_block = end == next_boundary;
+                    let (block_id, fingerprint) = if is_full_block {
                         let bid = blocks[block_idx];
                         let fp = fps[block_idx];
                         block_idx += 1;
@@ -633,7 +683,7 @@ impl RadixCache {
                     pos = end;
                     node_idx = new_idx;
 
-                    if edge_tokens.len() < self.block_size {
+                    if !is_full_block {
                         break;
                     }
                 }
@@ -1176,7 +1226,7 @@ mod tests {
 
         // Access the second sequence to make it more recently used.
         let _ = cache.lookup(&[5, 6, 7, 8]);
-        let _ = cache.release(&bids(&[20])); // release so ref_count drops
+        let () = cache.release(&bids(&[20])); // release so ref_count drops
 
         // After insert, ref_count is 0 by default.
         // First lookup incremented ref on block 10. Release it.
@@ -1399,6 +1449,152 @@ mod tests {
             shared_node.ref_count, 1,
             "shared split node must inherit ref_count from the locked child"
         );
+    }
+
+    // Before 2026-04-19, insert_with_fingerprints bailed with `break` on any
+    // partial-edge-split, returning 0 tokens when the split hit in block 1 and
+    // N-1 blocks worth when it hit later. The caller (scheduler/cuda/core.rs)
+    // then logged `prefix_cache.insert: expected X, got Y` and refused to pin
+    // any pages. The fix creates a new sibling under the shared intermediate
+    // covering the caller's current block, preserving block-id alignment.
+
+    #[test]
+    fn split_on_first_block_inserts_remaining_blocks_as_sibling() {
+        // "got 0" regression: before the fix, this insert returned 0.
+        // block_size=4, existing tree has root → [1,2,3,4] (block 10).
+        // New request shares only the first token [1], then diverges.
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+
+        let inserted = cache.insert(&[1, 5, 6, 7, 8, 9, 10, 11], &bids(&[100, 200]));
+        assert_eq!(
+            inserted, 8,
+            "after split on first token, the full 2 blocks should be registered \
+             (would return 0 before the fix)",
+        );
+
+        // Both requests remain reachable.
+        let (len_a, blocks_a) = cache.lookup(&[1, 2, 3, 4]);
+        assert_eq!(len_a, 4);
+        assert_eq!(blocks_a, bids(&[10]));
+
+        let (len_b, blocks_b) = cache.lookup(&[1, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(len_b, 8);
+        assert_eq!(blocks_b, bids(&[100, 200]));
+    }
+
+    #[test]
+    fn split_on_later_block_inserts_divergent_block_under_shared() {
+        // "got 4080" regression at scale 2-blocks: split fires on block 2, the
+        // prior code returned 1 * block_size (4) instead of 8.
+        // block_size=4, existing tree has root → [1,2,3,4] (block 10) →
+        // [5,6,7,8] (block 20). New request shares block 1 fully, then
+        // diverges mid-block-2.
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+
+        let inserted = cache.insert(&[1, 2, 3, 4, 5, 6, 9, 10], &bids(&[10, 99]));
+        assert_eq!(
+            inserted, 8,
+            "after split on block 2, both blocks should be registered \
+             (would return 4 before the fix)",
+        );
+
+        // Original request still reachable.
+        let (len_orig, blocks_orig) = cache.lookup(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(len_orig, 8);
+        assert_eq!(blocks_orig, bids(&[10, 20]));
+
+        // New divergent request also reachable, with its new block_id=99.
+        let (len_new, blocks_new) = cache.lookup(&[1, 2, 3, 4, 5, 6, 9, 10]);
+        assert_eq!(len_new, 8);
+        assert_eq!(blocks_new, bids(&[10, 99]));
+    }
+
+    #[test]
+    fn reinsert_after_split_does_not_reuse_first_block_id() {
+        // Codex-caught P1 regression (2026-04-19): the initial split fix
+        // created short-edge block-bearing nodes, and the full-match branch
+        // only advanced block_idx when child.tokens.len() == block_size,
+        // causing subsequent walks through the short edge to reuse
+        // blocks[0] for the second block. Lookup then returned [100, 100]
+        // instead of [100, 300].
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+        cache.insert(&[1, 5, 6, 7, 8, 9, 10, 11], &bids(&[100, 200]));
+
+        let inserted = cache.insert(&[1, 5, 6, 7, 12, 13, 14, 15], &bids(&[100, 300]));
+        assert_eq!(inserted, 8);
+
+        let (len, blocks) = cache.lookup(&[1, 5, 6, 7, 12, 13, 14, 15]);
+        assert_eq!(len, 8);
+        assert_eq!(blocks, bids(&[100, 300]));
+    }
+
+    #[test]
+    fn split_mid_block_via_shared_intermediate_registers_tail_block() {
+        // Codex-caught P1 regression round 2 (2026-04-19): after the walk
+        // passed through a non-block-bearing shared intermediate, `pos` was
+        // mid-block but the split branch computed `rest_end = pos + block_size`,
+        // which overshot the block boundary and failed the bounds check,
+        // dropping the tail block silently. Fix: compute rest_end from
+        // (block_idx+1)*block_size.
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+        cache.insert(&[1, 5, 6, 7, 8, 9, 10, 11], &bids(&[100, 200]));
+        cache.insert(&[1, 5, 6, 7, 8, 12, 13, 14], &bids(&[100, 300]));
+
+        // Walk: @1→shared_a (no block), @5→blk100 (advance), @8→shared_b
+        // (no block — now pos=5 mid-block), @9→blk200 matches only [9],
+        // split at match_len=1. rest_end must be 8, not 9 (8+1+4).
+        let inserted = cache.insert(&[1, 5, 6, 7, 8, 9, 20, 21], &bids(&[100, 400]));
+        assert_eq!(inserted, 8);
+
+        let (len, blocks) = cache.lookup(&[1, 5, 6, 7, 8, 9, 20, 21]);
+        assert_eq!(len, 8);
+        assert_eq!(blocks, bids(&[100, 400]));
+    }
+
+    #[test]
+    fn else_branch_mid_block_via_shared_intermediate_registers_tail_block() {
+        // Codex-caught P1 regression round 2 (2026-04-19): symmetric to the
+        // split case but lands in the else (no-matching-child) branch. Walk
+        // lands mid-block (pos=5, block_idx=1), else branch's edge window
+        // used `pos+block_size` so the first new edge was len 3 < block_size
+        // and was registered without a block_id — dropping the caller's
+        // final block. Fix: compute edge end from (block_idx+1)*block_size,
+        // assign block_id when end lands on the next boundary.
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+        cache.insert(&[1, 5, 6, 7, 8, 9, 10, 11], &bids(&[100, 200]));
+        cache.insert(&[1, 5, 6, 7, 8, 12, 13, 14], &bids(&[100, 300]));
+
+        // Walk: @1→shared_a (no block), @5→blk100 (advance), @8→shared_b
+        // (no block — pos=5 mid-block). shared_b has children at 9 and 12;
+        // token 16 hits no match → else branch. First edge must complete
+        // block 2 with tokens[5..8] and take blocks[1].
+        let inserted = cache.insert(&[1, 5, 6, 7, 8, 16, 17, 18], &bids(&[100, 500]));
+        assert_eq!(inserted, 8);
+
+        let (len, blocks) = cache.lookup(&[1, 5, 6, 7, 8, 16, 17, 18]);
+        assert_eq!(len, 8);
+        assert_eq!(blocks, bids(&[100, 500]));
+    }
+
+    #[test]
+    fn split_with_short_tail_still_registers_aligned_block() {
+        // Edge case: caller's tokens end exactly at block_size * n, with the
+        // split on block n. The new sibling must still be created.
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+
+        // Shares only token [1], diverges, has exactly one block of tokens.
+        let inserted = cache.insert(&[1, 5, 6, 7], &bids(&[100]));
+        assert_eq!(inserted, 4);
+
+        let (len, blocks) = cache.lookup(&[1, 5, 6, 7]);
+        assert_eq!(len, 4);
+        assert_eq!(blocks, bids(&[100]));
     }
 
     #[test]
@@ -1824,25 +2020,30 @@ mod tests {
         let mut cache = RadixCache::new(4);
 
         cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
-        // Force a split at the second block so the shared parent becomes
-        // a blockless tombstone once the leaf is evicted.
+        // Split at block 2: after the fix (2026-04-19), both divergent
+        // branches are registered under a shared [5,6] tombstone:
+        //   root → [1..4](10) → shared[5,6] → {[7,8](20), [9,10](99)}
         cache.insert(&[1, 2, 3, 4, 5, 6, 9, 10], &bids(&[10, 99]));
 
-        assert_eq!(cache.cached_block_count(), 2);
+        assert_eq!(cache.cached_block_count(), 3);
         let before_nodes = cache.node_count();
 
-        let freed = cache.evict(1);
-        assert_eq!(freed, bids(&[20]));
+        // Evict both divergent leaves so shared becomes a blockless orphan
+        // tombstone and cascades into the free list.
+        let freed = cache.evict(2);
+        let mut freed_ids: Vec<u32> = freed.iter().map(|b| b.0).collect();
+        freed_ids.sort_unstable();
+        assert_eq!(freed_ids, vec![20, 99]);
         assert_eq!(cache.cached_block_count(), 1);
         assert_eq!(
             cache.free_node_count(),
-            2,
-            "leaf and shared tombstone should be reclaimed"
+            3,
+            "two leaves and shared tombstone should be reclaimed"
         );
         assert_eq!(
             cache.node_count(),
             before_nodes,
-            "reclaiming a tombstone should not grow the backing node array"
+            "reclaiming tombstones should not grow the backing node array"
         );
     }
 
@@ -1852,22 +2053,23 @@ mod tests {
 
         cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
         cache.insert(&[1, 2, 3, 4, 5, 6, 9, 10], &bids(&[10, 99]));
-        let _ = cache.evict(1);
+        // Evict both divergent leaves → shared cascades → 3 free slots.
+        let _ = cache.evict(2);
 
         let before_nodes = cache.node_count();
-        assert_eq!(cache.free_node_count(), 2);
+        assert_eq!(cache.free_node_count(), 3);
 
         cache.insert(&[1, 2, 3, 4, 11, 12, 13, 14], &bids(&[10, 77]));
 
         assert_eq!(
             cache.node_count(),
             before_nodes,
-            "insert should reuse the reclaimed tombstone slot instead of appending"
+            "insert should reuse a reclaimed slot instead of appending"
         );
         assert_eq!(
             cache.free_node_count(),
-            1,
-            "reused tombstone slot should be removed from the free list"
+            2,
+            "one reclaimed slot should be removed from the free list"
         );
     }
 

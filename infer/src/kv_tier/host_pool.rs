@@ -39,6 +39,9 @@ enum Backing {
     /// Non-CUDA backing used both on the no-cuda feature lane and in
     /// scheduler tests on CUDA hosts that do not want to spend real
     /// pinned memory. Plain `Vec<u8>` — Send + Sync via std.
+    // Only constructed under `not(feature = "cuda")`. Under the `cuda,no-cuda`
+    // Mac typecheck this variant is dead; allow silences the false positive.
+    #[cfg_attr(feature = "cuda", allow(dead_code))]
     InMemory { buffer: Vec<u8> },
 }
 
@@ -101,7 +104,7 @@ impl HostPinnedPool {
             // error.
             let status = unsafe {
                 cudarc::driver::sys::cuMemAllocHost_v2(
-                    &mut ptr as *mut *mut u8 as *mut *mut std::ffi::c_void,
+                    (&raw mut ptr).cast::<*mut std::ffi::c_void>(),
                     capacity_bytes,
                 )
             };
@@ -295,8 +298,9 @@ impl Drop for HostPinnedPool {
                     // FlashInfer workspace pattern — a failure here
                     // during shutdown is unrecoverable anyway.
                     unsafe {
-                        let _ =
-                            cudarc::driver::sys::cuMemFreeHost(*base_ptr as *mut std::ffi::c_void);
+                        let _ = cudarc::driver::sys::cuMemFreeHost(
+                            (*base_ptr).cast::<std::ffi::c_void>(),
+                        );
                     }
                     *base_ptr = std::ptr::null_mut();
                 }
