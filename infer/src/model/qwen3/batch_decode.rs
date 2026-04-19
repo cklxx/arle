@@ -361,11 +361,10 @@ impl Qwen3Model {
         }
 
         let prefill_state = &mut states[prefill_slot_idx];
-        if prefill_state.base.kv_cache.k_caches().is_empty()
-            || prefill_start_pos + c > prefill_state.base.kv_cache.max_seq_len()
-        {
-            return Ok(false);
-        }
+        // Paged-only mixed path: K/V writes land directly in the page pool via
+        // `prefill_attention_paged_prep_cuda`. No contiguous `k_cache` headroom
+        // required — the `max_seq_len()` bound was a stale hold-over from the
+        // dual-write prep kernel.
 
         paged_kv_pool.alloc_tokens(prefill_slot_idx, c)?;
 
@@ -418,11 +417,21 @@ impl Qwen3Model {
             &mut mixed.embedding_out,
         )?;
 
-        let prefill_page_table: Vec<i32> = paged_kv_pool
+        let prefill_page_table_host: Vec<i32> = paged_kv_pool
             .page_indices(prefill_slot_idx)
             .iter()
             .map(|&idx| idx as i32)
             .collect();
+        // Paged prep kernel dereferences `page_table` as a device pointer — the
+        // host Vec must be uploaded before the call. Previously latent under the
+        // dual-write path (contiguous write was primary); surfaces as
+        // `gemm_cuda CUDA_ERROR_UNKNOWN` at next sync when the prep does an
+        // OOB device read of a host address.
+        let prefill_page_table_dev = self
+            .ctx
+            .stream
+            .memcpy_stod(&prefill_page_table_host)
+            .map_err(|e| anyhow::anyhow!("H2D prefill_page_table: {e}"))?;
 
         let hidden_ptr = &raw mut mixed.embedding_out;
         let eps = self.config.rms_norm_eps;
@@ -433,7 +442,6 @@ impl Qwen3Model {
         let kv_dim = num_kv_heads * head_dim;
         let bf16_size = std::mem::size_of::<u16>();
         let page_size = paged_kv_pool.page_size;
-        let prefill_max_seq_len = prefill_state.base.kv_cache.max_seq_len() as i32;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let hidden = unsafe { &mut *hidden_ptr };
@@ -539,12 +547,12 @@ impl Qwen3Model {
             let q_prefill_ptr = (q_ptr as usize + b * q_dim * bf16_size) as *mut ffi::Half;
             let k_prefill_ptr = (k_ptr as usize + b * kv_dim * bf16_size) as *mut ffi::Half;
             let v_prefill_ptr = (v_ptr as usize + b * kv_dim * bf16_size) as *const ffi::Half;
-            let (k_cache, v_cache) = prefill_state.base.kv_cache.layer_kv_caches_mut(layer_idx);
-            let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&self.ctx.stream);
-            let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&self.ctx.stream);
 
+            // Paged-only prep: QK-norm + partial RoPE + page-table scatter of
+            // K/V into `k_pool`/`v_pool`. sglang's `--enable-mixed-chunk`
+            // equivalent — no contiguous write, no `max_seq_len()` cap.
             unsafe {
-                ffi::prefill_attention_prep_dual_write_cuda(
+                ffi::prefill_attention_paged_prep_cuda(
                     q_prefill_ptr,
                     k_prefill_ptr,
                     v_prefill_ptr,
@@ -552,20 +560,20 @@ impl Qwen3Model {
                     kn_ptr as *const ffi::Half,
                     cos_ptr as *const ffi::Half,
                     sin_ptr as *const ffi::Half,
-                    kc_ptr as *mut ffi::Half,
-                    vc_ptr as *mut ffi::Half,
+                    {
+                        let (ptr, _g) = prefill_page_table_dev.device_ptr(&self.ctx.stream);
+                        ptr as *const i32
+                    },
+                    page_size as i32,
+                    k_pool_ptr as *mut ffi::Half,
+                    v_pool_ptr as *mut ffi::Half,
                     num_heads as i32,
                     num_kv_heads as i32,
                     head_dim as i32,
                     c as i32,
                     prefill_start_pos as i32,
-                    prefill_max_seq_len,
                     eps,
                     self.ctx.stream.cu_stream(),
-                    prefill_page_table.as_ptr(),
-                    page_size as i32,
-                    k_pool_ptr as *mut ffi::Half,
-                    v_pool_ptr as *mut ffi::Half,
                 )
                 .result()?;
             }
