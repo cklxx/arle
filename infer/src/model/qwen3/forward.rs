@@ -454,22 +454,18 @@ impl ModelForward for Qwen3Model {
     fn forward_mixed_batch(
         &self,
         decode_tokens: &[u32],
-        prefill_tokens: &[u32],
+        prefills: &[crate::model::PrefillSection<'_>],
         states: &mut [Self::State],
         decode_slot_indices: &[usize],
-        prefill_slot_idx: usize,
-        prefill_start_pos: usize,
         paged_kv_pool: Option<&mut PagedKVPool>,
         decode_ctx: &mut Self::DecodeContext,
     ) -> Result<bool> {
         match paged_kv_pool {
-            Some(pool) if pool.is_active() => self.decode_batch_with_prefill(
+            Some(pool) if pool.is_active() => self.decode_batch_with_prefills(
                 decode_tokens,
-                prefill_tokens,
+                prefills,
                 states,
                 decode_slot_indices,
-                prefill_slot_idx,
-                prefill_start_pos,
                 pool,
                 decode_ctx,
             ),

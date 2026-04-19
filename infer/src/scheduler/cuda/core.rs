@@ -54,6 +54,27 @@ pub(super) struct StagedAdmission {
     pub(super) enqueued_at_clock: u64,
 }
 
+/// One prefill request fused into a mixed decode+prefill tick, preserved
+/// between the launch and readback halves of `step_decode_*`.
+///
+/// `req_idx` indexes `Scheduler.active` at the time the mixed step was
+/// launched; since `step_decode_readback` runs before any new admission,
+/// these indices stay valid.
+///
+/// `logit_row` is the row index into the mixed batch's logits at which
+/// this section's last-token logits land: for section `i`,
+/// `logit_row = B + Σ_{j≤i} c_j - 1`. Kept as a documentation hook and
+/// for a future batched-logit-scatter path; today the model extracts
+/// each row straight into `state.base.prefill_logits` so the readback
+/// loop samples via `select_token` without referencing `logit_row`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PendingPrefillChunk {
+    pub req_idx: usize,
+    pub completes: bool,
+    #[allow(dead_code)]
+    pub logit_row: usize,
+}
+
 /// State preserved between decode launch and readback for GPU/CPU overlap.
 pub(super) struct PendingDecode {
     pub decode_indices: Vec<usize>,
@@ -61,8 +82,9 @@ pub(super) struct PendingDecode {
     /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
     pub greedy_launched: bool,
     pub sampling_params_greedy: Vec<bool>,
-    pub mixed_prefill_request_idx: Option<usize>,
-    pub mixed_prefill_chunk_complete: bool,
+    /// Prefill chunks fused into the current tick. Empty when no mixed
+    /// prefill ran (plain decode path).
+    pub mixed_prefill_chunks: Vec<PendingPrefillChunk>,
 }
 
 /// CUDA-backed scheduler state and initialization.
@@ -153,8 +175,13 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) peak_mem_bytes: u64,
     /// Pending decode state for GPU/CPU overlap.
     pub(super) pending_decode: Option<PendingDecode>,
-    /// Prefill request consumed by the mixed decode launch in the current step.
-    pub(super) pending_mixed_prefill_idx: Option<usize>,
+    /// Prefill requests consumed by the mixed decode launch in the current
+    /// step. Populated by `step_decode_launch_mixed`, read by the regular
+    /// prefill section in `execution.rs` so we skip reqs already fused.
+    pub(super) pending_mixed_prefill_idxs: Vec<usize>,
+    /// Round-robin cursor into `active` for fair mixed-prefill selection.
+    /// Advances by the number of prefills actually fused each tick.
+    pub(super) last_mixed_prefill_cursor: usize,
     /// Requests retracted by `retract_longest_decode` to free pool pages for
     /// another slot's admission. Populated when we mark a victim
     /// `Phase::Finished`, consumed by `cleanup()` so the re-queued
@@ -450,7 +477,8 @@ impl<M: ModelForward> Scheduler<M> {
             last_mem_query: std::time::Instant::now(),
             peak_mem_bytes: 0,
             pending_decode: None,
-            pending_mixed_prefill_idx: None,
+            pending_mixed_prefill_idxs: Vec::new(),
+            last_mixed_prefill_cursor: 0,
             retracted_request_ids: std::collections::HashSet::new(),
         };
 

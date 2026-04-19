@@ -1,5 +1,11 @@
 use super::{ModelForward, Phase, Scheduler, info};
 
+/// Maximum number of prefill requests fused into one mixed decode+prefill
+/// tick. Mirrors the model-side `MIXED_PREFILL_MAX_REQS` — kept in sync by
+/// hand; `FlashInferDecodeMetadata.qo_indptr` is sized for B + this many
+/// + 1 entries in `model::qwen3::batch_decode::BatchDecodeBuffers::new`.
+const MIXED_PREFILL_MAX_REQS: usize = 4;
+
 impl<M: ModelForward> Scheduler<M> {
     pub(super) fn step(&mut self) {
         let num = self.active.len();
@@ -29,21 +35,37 @@ impl<M: ModelForward> Scheduler<M> {
             self.pending_decode.is_none(),
             "pending decode must be cleared before scheduler step"
         );
-        self.pending_mixed_prefill_idx = None;
+        self.pending_mixed_prefill_idxs.clear();
         let decode_launch_us = if has_decode {
             let t = std::time::Instant::now();
-            let mixed_prefill_idx = self
-                .active
-                .iter()
-                .enumerate()
-                .find(|(_, r)| {
-                    matches!(r.phase, Phase::Prefilling { .. }) && !r.delta_tx.is_closed()
-                })
-                .map(|(i, _)| i);
-            if let Some(pi) = mixed_prefill_idx {
-                self.step_decode_launch_mixed(pi);
+            // Round-robin selection of up to MIXED_PREFILL_MAX_REQS prefill
+            // requests to fuse with the decode batch. Starts at
+            // `last_mixed_prefill_cursor` so a busy request doesn't starve
+            // a late-admitted one; cursor advances by the number actually
+            // fused (not the number attempted).
+            let n_active = self.active.len();
+            let mixed_prefill_idxs: Vec<usize> = if n_active == 0 {
+                Vec::new()
             } else {
+                let start = self.last_mixed_prefill_cursor % n_active;
+                (0..n_active)
+                    .map(|k| (start + k) % n_active)
+                    .filter(|&i| {
+                        matches!(self.active[i].phase, Phase::Prefilling { .. })
+                            && !self.active[i].delta_tx.is_closed()
+                    })
+                    .take(MIXED_PREFILL_MAX_REQS)
+                    .collect()
+            };
+            if mixed_prefill_idxs.is_empty() {
                 self.step_decode_launch();
+            } else {
+                // Advance cursor past the last selected req so next tick
+                // picks up where this one left off.
+                if let Some(&last) = mixed_prefill_idxs.last() {
+                    self.last_mixed_prefill_cursor = (last + 1) % n_active.max(1);
+                }
+                self.step_decode_launch_mixed(&mixed_prefill_idxs);
             }
             t.elapsed().as_micros()
         } else {
@@ -122,10 +144,10 @@ impl<M: ModelForward> Scheduler<M> {
         } else {
             1 // High concurrency: protect decode latency
         };
-        let already_mixed = self.pending_mixed_prefill_idx.take();
+        let already_mixed: Vec<usize> = std::mem::take(&mut self.pending_mixed_prefill_idxs);
         let prefill_indices: Vec<usize> = (0..self.active.len())
             .filter(|&i| matches!(self.active[i].phase, Phase::Prefilling { .. }))
-            .filter(|&i| Some(i) != already_mixed)
+            .filter(|&i| !already_mixed.contains(&i))
             .take(max_prefills)
             .collect();
         for idx in prefill_indices {

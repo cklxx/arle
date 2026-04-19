@@ -441,6 +441,48 @@ impl TokenKVPool {
         Ok(new_pages)
     }
 
+    /// Roll back the last `count` logical tokens allocated to `slot`.
+    ///
+    /// Used by the multi-request mixed-prefill path: when `alloc_tokens`
+    /// succeeds for earlier prefill requests in a tick but fails for a
+    /// later one, we need to revert the successful allocations so the
+    /// next tick sees a consistent pool state. Any trailing physical
+    /// pages that become empty are released back to `free_pages` if
+    /// their external reference count is zero; otherwise they stay in
+    /// limbo (identical semantics to `free_slot`, see its doc).
+    ///
+    /// `count` must be ≤ `seq_len(slot)`. Does nothing on `count == 0`.
+    /// Does **not** advance the slot epoch — rollback is an internal
+    /// scheduler transaction, not a logical occupant change.
+    pub fn free_tokens_from_tail(&mut self, slot: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        debug_assert!(
+            count <= self.seq_lens[slot],
+            "free_tokens_from_tail: count={count} exceeds seq_len={}",
+            self.seq_lens[slot],
+        );
+        let new_seq_len = self.seq_lens[slot].saturating_sub(count);
+        // Number of full pages that remain allocated after the shrink.
+        let pages_after = new_seq_len.div_ceil(self.page_size);
+        let pages_before = self.page_indices[slot].len();
+        if pages_after < pages_before {
+            // Drain the trailing pages that are now unused.
+            let to_release: Vec<u32> = self.page_indices[slot].drain(pages_after..).collect();
+            for idx in to_release {
+                let usize_idx = idx as usize;
+                if self.page_ref_count[usize_idx] == 0 {
+                    self.free_pages.push(idx);
+                }
+                // else: page pinned by an external reference (e.g. radix
+                // cache) — leave it in limbo, `release_pages` will
+                // reclaim it when the refcount hits zero.
+            }
+        }
+        self.seq_lens[slot] = new_seq_len;
+    }
+
     /// Allocate detached physical pages that are not yet owned by any slot.
     ///
     /// This is the minimal pool primitive needed by the session-restore path:

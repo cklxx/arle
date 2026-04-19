@@ -11,6 +11,18 @@ use super::ffi;
 use super::paged_kv::PagedKVPool;
 use super::tensor::DeviceContext;
 
+/// Description of one prefill request fused into a mixed decode+prefill tick.
+///
+/// Supplied by the scheduler/model to [`FlashInferDecodeMetadata::update_mixed_multi`]
+/// so the metadata builder can fold all fused prefills into a single batched
+/// FlashInfer plan without needing to peek at scheduler state.
+#[derive(Clone, Copy, Debug)]
+pub struct PrefillSlot {
+    pub slot_idx: usize,
+    pub start_pos: usize,
+    pub token_count: usize,
+}
+
 /// GPU-side metadata buffers for FlashInfer batched decode attention.
 ///
 /// Manages positions, KV indptr/indices/last_page_len arrays, the FlashInfer
@@ -912,55 +924,71 @@ impl FlashInferDecodeMetadata {
         Ok(reallocated)
     }
 
-    /// Upload metadata for a mixed decode + single-chunk prefill batch.
+    /// Upload metadata for a mixed decode + multi-chunk prefill batch.
     ///
-    /// Layout:
-    /// - decode requests: one Q row each
-    /// - prefill request: `prefill_token_count` consecutive Q rows
-    /// - `qo_indptr`: `[0, 1, 2, ..., B, B + C]`
-    pub fn update_mixed(
+    /// Layout with B decode requests and N prefill chunks `c_0..c_{N-1}`:
+    /// - decode requests occupy the first B Q rows (one each)
+    /// - prefill chunk `i` occupies the next `c_i` Q rows, in the order
+    ///   given by `prefills`
+    /// - `qo_indptr = [0, 1, 2, ..., B, B+c_0, B+c_0+c_1, ..., B+Σc_i]`
+    ///   (length B + N + 1)
+    /// - `kv_indptr` / `kv_indices` / `kv_last_page_len` follow the same
+    ///   B-then-N ordering, pulled directly from the pool.
+    pub fn update_mixed_multi(
         &mut self,
         ctx: &DeviceContext,
         pool: &PagedKVPool,
         decode_slot_indices: &[usize],
-        prefill_slot_idx: usize,
-        prefill_start_pos: usize,
-        prefill_token_count: usize,
+        prefills: &[PrefillSlot],
     ) -> Result<bool> {
-        if decode_slot_indices.is_empty() || prefill_token_count == 0 {
+        if decode_slot_indices.is_empty() || prefills.is_empty() {
             return Ok(false);
         }
 
-        let request_count = decode_slot_indices.len() + 1;
-        let total_qo_rows = decode_slot_indices.len() + prefill_token_count;
-        let mut all_slots = Vec::with_capacity(request_count);
-        all_slots.extend_from_slice(decode_slot_indices);
-        all_slots.push(prefill_slot_idx);
+        let b = decode_slot_indices.len();
+        let n = prefills.len();
+        let prefill_token_total: usize = prefills.iter().map(|p| p.token_count).sum();
+        if prefill_token_total == 0 {
+            return Ok(false);
+        }
+        let total_qo_rows = b + prefill_token_total;
 
+        let mut all_slots = Vec::with_capacity(b + n);
+        all_slots.extend_from_slice(decode_slot_indices);
+        all_slots.extend(prefills.iter().map(|p| p.slot_idx));
+
+        // positions: B decode positions, then per-prefill (start..start+c).
         self.positions_scratch.clear();
         self.positions_scratch.extend(
             decode_slot_indices
                 .iter()
                 .map(|&slot| (pool.seq_len(slot) - 1) as i32),
         );
-        self.positions_scratch.extend(
-            (prefill_start_pos..prefill_start_pos + prefill_token_count).map(|pos| pos as i32),
-        );
+        for p in prefills {
+            self.positions_scratch
+                .extend((p.start_pos..p.start_pos + p.token_count).map(|pos| pos as i32));
+        }
 
         self.indptr_h = pool.build_indptr(&all_slots);
 
         let mut last_page_lens_h = pool.build_last_page_lens(decode_slot_indices);
-        let prefill_seq_len = pool.seq_len(prefill_slot_idx);
-        last_page_lens_h.push(if prefill_seq_len == 0 {
-            0
-        } else {
-            ((prefill_seq_len - 1) % pool.page_size + 1) as i32
-        });
+        for p in prefills {
+            let prefill_seq_len = pool.seq_len(p.slot_idx);
+            last_page_lens_h.push(if prefill_seq_len == 0 {
+                0
+            } else {
+                ((prefill_seq_len - 1) % pool.page_size + 1) as i32
+            });
+        }
 
+        // qo_indptr: [0, 1, 2, ..., B, B+c_0, B+c_0+c_1, ..., B+Σc_i].
         self.qo_indptr_h.clear();
-        self.qo_indptr_h
-            .extend(0..=decode_slot_indices.len() as i32);
-        self.qo_indptr_h.push(total_qo_rows as i32);
+        self.qo_indptr_h.extend(0..=b as i32);
+        let mut running = b as i32;
+        for p in prefills {
+            running += p.token_count as i32;
+            self.qo_indptr_h.push(running);
+        }
 
         self.indices_scratch.clear();
         self.indices_scratch.extend(flatten_page_indices(
@@ -1000,10 +1028,14 @@ impl FlashInferDecodeMetadata {
             as usize;
         self.plan_dirty = true;
         self.plan_batch_size = 0;
+        // Invalidate decode steady-state identity tracking: the next plain
+        // `update()` call must rebuild from scratch since we just wrote a
+        // mixed layout.
         self.prev_slot_indices.clear();
         self.prev_slot_epochs.clear();
         self.last_token_scratch.clear();
 
+        let _ = total_qo_rows; // consumed implicitly via qo_indptr_h last entry
         Ok(reallocated)
     }
 

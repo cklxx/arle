@@ -372,19 +372,43 @@ pub trait ModelForward: Send {
         true
     }
 
-    /// Mixed-batch forward: B decode tokens + C prefill tokens in one eager forward pass.
-    /// Returns `Ok(true)` if mixed forward was performed, `Ok(false)` if not supported.
+    /// Mixed-batch forward: B decode tokens + multiple C_i prefill chunks in
+    /// one eager forward pass.
+    ///
+    /// The scheduler supplies one [`PrefillSection`] per prefill request
+    /// fused into this tick. The model implementation processes all of them
+    /// alongside the B decode rows on a single GPU dispatch.
+    ///
+    /// Returns `Ok(true)` if mixed forward was performed, `Ok(false)` if
+    /// not supported (scheduler falls back to plain decode + separate
+    /// prefill chunks).
     fn forward_mixed_batch(
         &self,
         _decode_tokens: &[u32],
-        _prefill_tokens: &[u32],
+        _prefills: &[PrefillSection<'_>],
         _states: &mut [Self::State],
         _decode_slot_indices: &[usize],
-        _prefill_slot_idx: usize,
-        _prefill_start_pos: usize,
         _paged_kv_pool: Option<&mut PagedKVPool>,
         _decode_ctx: &mut Self::DecodeContext,
     ) -> Result<bool> {
         Ok(false)
     }
+}
+
+/// One prefill request fused into a mixed decode+prefill tick.
+///
+/// Borrowed fields keep the scheduler in charge of `tokens` / `page_table_host`
+/// lifetimes — the model consumes this in a single forward call and does
+/// not persist the reference.
+#[derive(Clone, Copy, Debug)]
+pub struct PrefillSection<'a> {
+    pub slot_idx: usize,
+    pub start_pos: usize,
+    /// Prefill chunk tokens to process this tick (already clipped by the
+    /// scheduler to the per-req chunk size).
+    pub tokens: &'a [u32],
+    /// Full host-side page table for this slot (as `i32`), ready to H2D.
+    /// Length is the slot's current page count; the mixed-batch prep
+    /// kernel uses it to scatter K/V into the paged pool.
+    pub page_table_host: &'a [i32],
 }
