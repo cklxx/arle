@@ -290,6 +290,40 @@ above were measured against this drifted baseline for apples-to-apples.
 If the drift is guidellm 0.6 metric changes, the historical wins still
 hold on the old tool; re-baselining or pinning guidellm is a follow-up.)
 
+### Second probe: K=2 cap=256 (larger payload, same K)
+
+Ran another zero-code-change probe on the orthogonal axis. Each req
+still gets distributed an equal slice, but total tokens/tick = 256
+(4× baseline). Total qo rows = B + ΣC = 16 + 256 = 272, midway
+between baseline 80 and attempt 1's disastrous 528.
+
+| metric | K=2 cap=64 (baseline-fresh) | **K=2 cap=256** | Δ |
+|---|---|---|---|
+| TTFT p50 (ms) | 5511 | 6766 | +23% ❌ |
+| TTFT p99 (ms) | 16694 | **14786** | **−11%** ✓ |
+| ITL p50 (ms) | 87 | 92 | +6% |
+| ITL p99 (ms) | 199 | 212 | +7% ❌ |
+| out tok/s | 123 | 94 | −24% ❌ |
+
+Again a partial win trading TTFT p99 (−11%) for throughput (−24%).
+Reverted. Combined with K=3 cap=64, these two probes plot the
+ITL–TTFT–throughput Pareto surface at the current kernel shape:
+
+| setting | TTFT p99 | ITL p99 | tok/s | net |
+|---|---|---|---|---|
+| sglang | 10727 | 113 | 140 | reference |
+| K=2 cap=64 (shipped) | 16694 | 199 | 123 | **Pareto-best under current kernel** |
+| K=3 cap=64 | 21497 | 105 | 98 | ITL wins / TTFT, tok/s lose |
+| K=2 cap=256 | 14787 | 212 | 94 | TTFT wins a bit / tok/s loses a lot |
+| attempt 1 K=4 cap=512 | 20879 | 266 | 55 | worst — shape mismatch at 528 rows |
+
+**Conclusion.** Three axes of the mixed-step input space (K, cap,
+per-req split) have been exhaustively probed. None beats K=2 cap=64
+across the full metric set at the current kernel shape. The ceiling
+is the kernel itself — FlashInfer TC-decode isn't optimised for
+large qo counts, and the mixed step lacks CUDA graph replay
+amortisation. **ROI #2 remains the single unconstrained lever.**
+
 ## Citations
 
 - sglang 0.5.10 source: https://github.com/sgl-project/sglang/tree/v0.5.10/python/sglang/srt
