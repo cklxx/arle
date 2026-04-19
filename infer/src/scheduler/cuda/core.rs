@@ -179,31 +179,26 @@ impl<M: ModelForward> Scheduler<M> {
         let evictable = self.prefix_cache.evictable_token_count();
         let clip = self.config.admission_clip_max_new_tokens;
         let ratio = self.config.admission_new_token_ratio;
-        // P1#2: charge BOTH the prefill tokens not yet materialized AND the
-        // decode-growth reservation. `pool.free_count()` only reflects
-        // tokens already claimed; a request in `Phase::New` /
-        // `Phase::Prefilling` has promised pool pages that haven't been
-        // `alloc_tokens`-ed yet, so without the prefill offset the gate
-        // double-books the pool at c=16 × 4096-prompt.
+        // Decode-only running offset (sglang PrefillAdder
+        // `_get_running_request_total_token_offset` parity —
+        // `schedule_policy.py:447-454`). The prior commit (ff8228e)
+        // also charged `prefill_remaining` for Phase::New/Prefilling,
+        // which double-counted for one tick (the incoming-admit cost
+        // already burned `extend_input + clipped_max_new + page_overhead`
+        // from `tick_budget_tokens` in the same `assign_slots` loop)
+        // and dropped c=16 throughput from 114 → 74 out tok/s. The
+        // pool's own `free_count()` shrinks monotonically as chunks
+        // alloc, so the next tick's budget naturally reflects pages
+        // already claimed. Mid-tick reservation gaps are absorbed by
+        // the `retract_longest_decode` backstop in
+        // `alloc_pool_tokens_with_retry`.
         let running_offset: f64 = self
             .active
             .iter()
             .map(|r| {
-                let prefill_remaining = match &r.phase {
-                    crate::scheduler::cuda::request::Phase::New => {
-                        r.prompt_tokens.len().saturating_sub(r.reusable_prefix_len)
-                    }
-                    crate::scheduler::cuda::request::Phase::Prefilling { progress, .. } => r
-                        .prompt_tokens
-                        .len()
-                        .saturating_sub(r.reusable_prefix_len)
-                        .saturating_sub(*progress),
-                    crate::scheduler::cuda::request::Phase::Decoding
-                    | crate::scheduler::cuda::request::Phase::Finished => 0,
-                };
                 let decode_remaining = r.max_tokens.saturating_sub(r.generated_tokens.len());
                 let clipped_decode = decode_remaining.min(clip);
-                (prefill_remaining as f64) + (clipped_decode as f64) * ratio
+                (clipped_decode as f64) * ratio
             })
             .sum();
         (available + evictable).saturating_sub(running_offset.ceil() as usize)
