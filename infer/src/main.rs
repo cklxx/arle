@@ -57,6 +57,16 @@ struct Args {
     #[arg(long, default_value_t = 0.88)]
     mem_fraction_static: f64,
 
+    /// Admission gate: upper clamp for per-request decode reservation (tokens).
+    /// Matches sglang's `SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION`. Default 4096.
+    #[arg(long, default_value_t = 4096)]
+    admission_clip_max_new_tokens: usize,
+
+    /// Admission gate: decode reservation scaling for running requests.
+    /// Matches sglang's `SGLANG_INIT_NEW_TOKEN_RATIO`. Default 0.7.
+    #[arg(long, default_value_t = 0.7)]
+    admission_new_token_ratio: f64,
+
     /// Minimum sequence length per slot when auto-sizing KV cache.
     #[arg(long, default_value_t = 256)]
     min_seq_len: usize,
@@ -128,6 +138,8 @@ async fn main() {
         scheduler: SchedulerConfig {
             decode_active_prefill_cap: args.decode_prefill_cap,
             mem_fraction_static: args.mem_fraction_static,
+            admission_clip_max_new_tokens: args.admission_clip_max_new_tokens,
+            admission_new_token_ratio: args.admission_new_token_ratio,
             min_seq_len: args.min_seq_len,
             kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
             ..SchedulerConfig::runtime_defaults(num_slots)

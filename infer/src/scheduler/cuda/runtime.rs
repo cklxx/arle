@@ -257,6 +257,7 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn assign_slots(&mut self) {
+        let mut tick_budget_tokens = self.admission_budget_tokens();
         while !self.waiting.is_empty() {
             let _ = self.evict_prefix_cache_if_pressured();
             let free_slots = self.free_slots();
@@ -335,6 +336,21 @@ impl<M: ModelForward> Scheduler<M> {
             } else {
                 0
             };
+            let extend_input_tokens = prompt_tokens.len().saturating_sub(radix_hit_len);
+            let clipped_max_new = incoming.max_tokens.min(super::core::CLIP_MAX_NEW_TOKENS);
+            let total_tokens_needed = extend_input_tokens + clipped_max_new;
+            if total_tokens_needed >= tick_budget_tokens {
+                self.prefix_cache.release(&radix_blocks);
+                info!(
+                    "Request {} held for pool (need={} tok, budget={} tok)",
+                    self.next_id, total_tokens_needed, tick_budget_tokens
+                );
+                self.waiting.push_front(incoming);
+                break;
+            }
+            tick_budget_tokens = tick_budget_tokens.saturating_sub(
+                extend_input_tokens + clipped_max_new + super::core::PREFILL_PAGE_OVERHEAD_TOKENS,
+            );
             let gpu_ready_prefix_blocks: Vec<_> = lookup
                 .blocks
                 .iter()
@@ -512,9 +528,279 @@ impl<M: ModelForward> Scheduler<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::best_reusable_slot_for_radix_hit;
+    use super::{Scheduler, best_reusable_slot_for_radix_hit};
+    use crate::backend::cuda::paged_kv::PagedKVPool;
+    use crate::kv_tier::coordinator::PageLifecycle;
+    use crate::metrics::ServerMetrics;
+    use crate::model::kv_cache::{KVCacheDtype, KVFormat};
+    use crate::model::{DecodeContextOps, GenerationState, ModelForward};
     use crate::prefix_cache::BlockId;
+    use crate::sampler::SamplingParams;
+    use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerConfig};
+    use crate::tokenizer::Tokenizer;
+    use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec};
+    use log::{Level, LevelFilter, Log, Metadata, Record};
     use std::collections::HashMap;
+    use std::sync::{Mutex, Once};
+    use tokio::sync::mpsc;
+
+    struct TestLogger {
+        entries: Mutex<Vec<String>>,
+    }
+
+    impl TestLogger {
+        const fn new() -> Self {
+            Self {
+                entries: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn reset(&self) {
+            self.entries.lock().expect("logger mutex poisoned").clear();
+        }
+
+        fn snapshot(&self) -> String {
+            self.entries
+                .lock()
+                .expect("logger mutex poisoned")
+                .join("\n")
+        }
+    }
+
+    impl Log for TestLogger {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.level() <= Level::Info
+        }
+
+        fn log(&self, record: &Record<'_>) {
+            if self.enabled(record.metadata()) {
+                self.entries
+                    .lock()
+                    .expect("logger mutex poisoned")
+                    .push(format!("{} {}", record.level(), record.args()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static TEST_LOGGER: TestLogger = TestLogger::new();
+    static TEST_LOGGER_INIT: Once = Once::new();
+
+    fn init_test_logger() {
+        TEST_LOGGER_INIT.call_once(|| {
+            log::set_logger(&TEST_LOGGER).expect("test logger should initialize once");
+            log::set_max_level(LevelFilter::Info);
+        });
+        TEST_LOGGER.reset();
+    }
+
+    struct FakeDecodeContext;
+
+    impl DecodeContextOps for FakeDecodeContext {
+        fn upload_token_ids(
+            &mut self,
+            _ctx: &DeviceContext,
+            _tokens: &[u32],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn update_metadata(
+            &mut self,
+            _ctx: &DeviceContext,
+            _pool: &PagedKVPool,
+            _slot_indices: &[usize],
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        fn plan_attention(
+            &mut self,
+            _ctx: &DeviceContext,
+            _batch_size: usize,
+            _num_q_heads: usize,
+            _num_kv_heads: usize,
+            _page_size: usize,
+            _head_dim: usize,
+            _kv_format: KVFormat,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn set_batch_size(&mut self, _bs: usize) {}
+
+        fn invalidate_graph_cache(&mut self, _batch_size: usize) {}
+    }
+
+    struct FakeState {
+        logits: DeviceVec,
+    }
+
+    impl GenerationState for FakeState {
+        fn logits(&self) -> &DeviceVec {
+            &self.logits
+        }
+
+        fn reset(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn truncate_to(&mut self, _len: usize) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn set_max_seq_len(&mut self, _max_seq: usize) {}
+
+        fn set_kv_dtype(&mut self, _dtype: KVCacheDtype) {}
+
+        fn migrate_kv_to_paged(
+            &mut self,
+            _ctx: &DeviceContext,
+            _pool: &PagedKVPool,
+            _slot: usize,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn migrate_kv_range_to_paged(
+            &mut self,
+            _ctx: &DeviceContext,
+            _pool: &PagedKVPool,
+            _slot: usize,
+            _start_pos: usize,
+            _token_count: usize,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FakeModel {
+        ctx: DeviceContext,
+    }
+
+    impl FakeModel {
+        fn new() -> anyhow::Result<Self> {
+            Ok(Self {
+                ctx: DeviceContext::new()?,
+            })
+        }
+    }
+
+    impl ModelForward for FakeModel {
+        type State = FakeState;
+        type DecodeContext = FakeDecodeContext;
+
+        fn create_state(&self) -> anyhow::Result<Self::State> {
+            Ok(FakeState {
+                logits: DeviceVec::zeros(&self.ctx, 1)?,
+            })
+        }
+
+        fn create_decode_context(
+            &self,
+            _max_batch_size: usize,
+            _pool: &PagedKVPool,
+        ) -> anyhow::Result<Self::DecodeContext> {
+            Ok(FakeDecodeContext)
+        }
+
+        fn kv_cache_bytes_per_token(&self) -> usize {
+            4
+        }
+
+        fn num_kv_layers(&self) -> usize {
+            1
+        }
+
+        fn num_kv_heads(&self) -> usize {
+            1
+        }
+
+        fn head_dim(&self) -> usize {
+            1
+        }
+
+        fn num_q_heads(&self) -> usize {
+            1
+        }
+
+        fn forward_prefill(&self, _tokens: &[u32], _state: &mut Self::State) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn forward_decode(&self, _token: u32, _state: &mut Self::State) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn select_token(
+            &self,
+            _state: &mut Self::State,
+            _params: &SamplingParams,
+            _rng: &mut rand::rngs::StdRng,
+        ) -> anyhow::Result<u32> {
+            Ok(0)
+        }
+
+        fn is_stop_token(&self, _token_id: u32) -> bool {
+            false
+        }
+
+        fn device_context(&self) -> &DeviceContext {
+            &self.ctx
+        }
+    }
+
+    fn test_tokenizer() -> Tokenizer {
+        let dir = tempfile::tempdir().expect("tempdir should create");
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"WhitespaceSplit"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"tok":1},"unk_token":"<unk>"}}"#,
+        )
+        .expect("tokenizer.json should write");
+        Tokenizer::from_file(
+            dir.path()
+                .to_str()
+                .expect("temp tokenizer path should be valid UTF-8"),
+        )
+        .expect("test tokenizer should load")
+    }
+
+    fn test_scheduler() -> Scheduler<FakeModel> {
+        let config = SchedulerConfig::runtime_defaults(16);
+        let (mut scheduler, _handle) = Scheduler::with_config(
+            FakeModel::new().expect("CUDA context should initialize"),
+            test_tokenizer(),
+            "fake-cuda-test",
+            0,
+            ServerMetrics::new("fake-cuda-test"),
+            config,
+            Some(256),
+            KVCacheDtype::BF16,
+            KVFormat::BF16,
+        )
+        .expect("scheduler should initialize");
+
+        let replacement_pool = PagedKVPool::with_format(
+            scheduler.model.device_context(),
+            1,
+            1,
+            1,
+            16,
+            64 * super::super::core::PREFIX_CACHE_BLOCK_SIZE * 4,
+            KVFormat::BF16,
+        )
+        .expect("replacement pool should initialize");
+        assert_eq!(
+            replacement_pool.page_size,
+            super::super::core::PREFIX_CACHE_BLOCK_SIZE
+        );
+        assert_eq!(replacement_pool.max_total_pages, 64);
+
+        scheduler.paged_kv_pool = replacement_pool;
+        scheduler.page_lifecycle = PageLifecycle::new(scheduler.paged_kv_pool.max_total_pages);
+        scheduler
+    }
 
     #[test]
     fn best_reusable_slot_prefers_deepest_free_owned_block() {
@@ -546,5 +832,48 @@ mod tests {
         let reusable =
             best_reusable_slot_for_radix_hit(&matched_blocks, &free_slots, &owners, &[0, 8], 16);
         assert_eq!(reusable, None);
+    }
+
+    #[test]
+    fn assign_slots_admission_gate_matches_sglang_model() {
+        init_test_logger();
+        let mut scheduler = test_scheduler();
+        TEST_LOGGER.reset();
+        let prompt = std::iter::repeat_n("tok", 128)
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert_eq!(scheduler.paged_kv_pool.free_count(), 1024);
+        assert_eq!(scheduler.prefix_cache.evictable_token_count(), 0);
+        assert_eq!(scheduler.admission_budget_tokens(), 1024);
+        assert_eq!(
+            128usize + 32 + super::super::core::PREFILL_PAGE_OVERHEAD_TOKENS,
+            176
+        );
+
+        for _ in 0..16 {
+            let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
+            scheduler.waiting.push_back(IncomingRequest {
+                prompt: prompt.clone(),
+                max_tokens: 32,
+                sampling: SamplingParams::default(),
+                stop: None,
+                priority: RequestPriority::default(),
+                session_id: None,
+                delta_tx,
+            });
+        }
+
+        scheduler.assign_slots();
+
+        assert_eq!(scheduler.active.len(), 5);
+        assert_eq!(scheduler.waiting.len(), 11);
+
+        let logs = TEST_LOGGER.snapshot();
+        assert!(logs.contains("held for pool"), "missing hold log: {logs}");
+        assert!(
+            !logs.contains("pool alloc for paged prefill failed"),
+            "unexpected alloc failure log: {logs}"
+        );
     }
 }

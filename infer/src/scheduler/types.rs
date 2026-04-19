@@ -40,6 +40,15 @@ pub struct SchedulerConfig {
     /// Fraction of total GPU memory for weights + KV cache (SGLang-compatible).
     /// The remaining (1 - fraction) is headroom. Default 0.88.
     pub mem_fraction_static: f64,
+    /// Upper clamp for per-request decode reservation in the admission gate.
+    /// Matches sglang's `SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION` env default.
+    /// Default 4096 tokens.
+    pub admission_clip_max_new_tokens: usize,
+    /// Statistical scaling factor applied to running-request remaining decode
+    /// budget in the admission gate. Matches sglang's
+    /// `SGLANG_INIT_NEW_TOKEN_RATIO` default. Below 1.0 because most running
+    /// requests stop well before their `max_tokens` budget. Default 0.7.
+    pub admission_new_token_ratio: f64,
     /// Minimum sequence length per slot when auto-sizing KV cache.
     pub min_seq_len: usize,
     /// Fallback KV pool budget (bytes) when GPU memory query fails.
@@ -93,6 +102,8 @@ impl Default for SchedulerConfig {
             preemption_mode: PreemptionMode::Recompute,
             decode_active_prefill_cap: 512,
             mem_fraction_static: 0.88,
+            admission_clip_max_new_tokens: 4096,
+            admission_new_token_ratio: 0.7,
             min_seq_len: 256,
             kv_pool_fallback_bytes: 4 * 1024 * 1024 * 1024,
             // Defaults match the M3b shipped constants in
@@ -127,6 +138,8 @@ impl SchedulerConfig {
         Self {
             max_slots,
             prefill_chunk_size: 4096,
+            admission_clip_max_new_tokens: 4096,
+            admission_new_token_ratio: 0.7,
             ..Self::default()
         }
     }
@@ -149,6 +162,12 @@ impl SchedulerConfig {
         }
         if !(0.0 < self.mem_fraction_static && self.mem_fraction_static <= 1.0) {
             anyhow::bail!("mem_fraction_static must be in (0, 1]");
+        }
+        if self.admission_clip_max_new_tokens == 0 {
+            anyhow::bail!("admission_clip_max_new_tokens must be ≥ 1");
+        }
+        if !(0.0 < self.admission_new_token_ratio && self.admission_new_token_ratio <= 1.0) {
+            anyhow::bail!("admission_new_token_ratio must be in (0, 1]");
         }
         if !(0.0 < self.prefix_cache_high_water && self.prefix_cache_high_water < 1.0) {
             anyhow::bail!("prefix_cache_high_water must be in (0, 1)");
@@ -350,6 +369,8 @@ mod tests {
         let cfg = SchedulerConfig::runtime_defaults(8);
         assert_eq!(cfg.max_slots, 8);
         assert_eq!(cfg.prefill_chunk_size, 4096);
+        assert_eq!(cfg.admission_clip_max_new_tokens, 4096);
+        assert_eq!(cfg.admission_new_token_ratio, 0.7);
         assert_eq!(cfg.prefix_cache_high_water, 0.75);
         assert_eq!(cfg.prefix_cache_low_water, 0.50);
         assert_eq!(cfg.prefix_cache_retain_hard_cap, 0.90);
@@ -380,6 +401,27 @@ mod tests {
     fn scheduler_config_rejects_zero_t1_keepalive() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.t1_host_pinned_keepalive_ticks = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_zero_admission_clip() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.admission_clip_max_new_tokens = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_non_positive_admission_ratio() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.admission_new_token_ratio = 0.0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_admission_ratio_above_one() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.admission_new_token_ratio = 1.1;
         assert!(cfg.validate().is_err());
     }
 
