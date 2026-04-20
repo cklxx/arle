@@ -90,6 +90,36 @@ impl<M: ModelForward> Scheduler<M> {
                     // a "ready but not yet owned by a slot" sentinel;
                     // `publish_to_prefix_cache` will overwrite it with a
                     // real slot once decode picks up the request.
+                    //
+                    // **Gap #5 C4 design gap (deferred to C4.5+):** when
+                    // a block's tier is `HostPinned` (was demoted via the
+                    // C3 hook), the bytes are not yet at T0 and need an
+                    // H→D copy. Doing that copy here is unsound — the
+                    // promoted pool pages have no slot owner, so the
+                    // next admission cold-prefills, and the cold-prefill
+                    // publish overwrites the radix node's `block_id` to
+                    // a freshly-allocated slot's pages, orphaning the
+                    // promote-back pages with refcount > 0 → permanent
+                    // HBM leak. Codex review caught this on the first
+                    // C4 attempt (2026-04-20).
+                    //
+                    // The correct integration is to do the H→D copy AND
+                    // graft the promoted pages onto the assigned slot's
+                    // page list inside `assign_slots` (before
+                    // `step_new`'s alloc_tokens), so the pages have an
+                    // owner before publish_to_prefix_cache runs. That
+                    // requires a new `PagedKVPool::attach_detached_pages_to_slot`
+                    // primitive and reordering of `assign_slots`'s
+                    // alloc/lookup phases — non-trivial enough that it
+                    // warrants its own commit (C4.5). Until then, this
+                    // arm only handles legacy T0-already-resident
+                    // blocks; HostPinned blocks fall through to the
+                    // metadata flip with no byte movement, which is a
+                    // correctness bug if C3 demote ever fires (today
+                    // gated by `t1_demote_min_hits=0` default).
+                    //
+                    // See `docs/plans/gap5-c2-byte-path-architecture.md`
+                    // §"C4 design gap" for the full analysis.
                     for &block_id in &staged.block_ids {
                         let _ = self.prefix_cache.update_block_metadata(
                             block_id,

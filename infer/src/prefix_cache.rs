@@ -349,6 +349,22 @@ impl RadixCache {
             .collect()
     }
 
+    /// Read the block's `tier_location` (T0/T1/T2/T3 stamp). O(1) via
+    /// `block_index`. Returns `None` if the block is unknown OR if
+    /// `tier_location` was never set.
+    ///
+    /// Used by Gap #5 C4's promote-back path in
+    /// `scheduler/cuda/runtime.rs::drain_coordinator_events` —
+    /// the scheduler reads each staged block's tier to decide whether
+    /// the bytes still need a real H→D copy (`HostPinned`, was demoted
+    /// via C3) or are already at T0 (legacy pre-Gap-#5 metadata-only
+    /// path that just flips the slot sentinel).
+    #[allow(dead_code)]
+    pub(crate) fn tier_location_of(&self, block: BlockId) -> Option<BlockLocation> {
+        let idx = *self.block_index.get(&block)?;
+        self.nodes.get(idx)?.tier_location.clone()
+    }
+
     // -------------------------------------------------------------------------
     // Lookup
     // -------------------------------------------------------------------------

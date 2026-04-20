@@ -157,3 +157,116 @@ poll + event record. Command shape and event shape don't change.
 
 Bench exempt (per CLAUDE.md §Benchmarks): structural plumbing only,
 no runtime behaviour change at c=16.
+
+## C4 design gap — promote-back at `StagingCompleted` is unsound
+
+**Date:** 2026-04-20 · **Caught by:** `codex review --uncommitted` on the
+first C4 attempt · **Decision:** revert C4 byte path; keep accessor only;
+defer slot-graft integration to **C4.5**.
+
+### Symptom
+
+Naive Option-A promote-back at the `StagingCompleted` event drain
+(`infer/src/scheduler/cuda/runtime.rs::drain_coordinator_events`)
+allocates fresh GPU pages via `alloc_detached_pages`, runs
+`copy_pages_from_host` from the T1 region, inserts into `block_to_pages`,
+calls `retain_pages` to bump refcount, releases the T1 region, then
+flips the radix node's `tier_location` to `Gpu{slot:u32::MAX}`. This
+compiles, passes unit tests, looks right.
+
+It is **not** right.
+
+### Root cause
+
+The promoted pages are inserted into `block_to_pages[bid]` but **never
+get a `block_owner_slots[bid]` entry** — they have no slot owner. The
+re-admission's next `assign_slots` call walks this path:
+
+1. `lookup_or_stage` matches the prefix → `bid` returns as `ReadyOnGpu`
+   (because we flipped `tier_location` to `Gpu`).
+2. `best_reusable_slot_for_radix_hit` (in `runtime.rs:6-30`) looks up
+   `block_owner_slots.get(&bid)`. **Returns `None`** — promote-back
+   never set it.
+3. `reusable = None` → `reusable_prefix_len = 0` → request cold-prefills
+   the entire prompt onto a fresh slot.
+4. Cold-prefill's `publish_to_prefix_cache` calls
+   `RadixCache::insert_with_fingerprints` with `new_bid` derived from
+   the fresh slot's first page. The radix node's `block_id` is
+   **overwritten** from `bid` (our promote-back BlockId) to `new_bid`,
+   `block_index.remove(&bid)` runs, but `block_to_pages[bid]` and the
+   pool's `page_ref_count` for our promoted pages are untouched.
+5. Our promoted pages are now: present in `block_to_pages`, refcount > 0
+   in the pool, **unreachable from the radix** (no `block_index` entry,
+   no `block_owner_slots` entry). They will never be released by the
+   eviction path (which iterates `block_index`-derived bids). They will
+   never be reused. **Permanent HBM leak**, scaling with promote-back
+   firing rate.
+
+### Why the obvious fix doesn't work
+
+Setting `block_owner_slots[bid] = some_slot` at promote-back time means
+picking a slot before we know which one the re-admission will get
+assigned. The slot might be needed for a different request, or
+`assign_slots` might pick a different free slot. Pre-binding to the
+wrong slot creates a different inconsistency.
+
+### The architecturally sound integration (C4.5)
+
+Move the promote-back from `StagingCompleted` (event-driven, slot-less)
+to **inside `assign_slots`** (slot-bound):
+
+1. `assign_slots` picks the request's slot via existing logic.
+2. `lookup_or_stage` returns `StagingFromHost` blocks.
+3. **New:** before `step_new` calls `alloc_tokens`, the scheduler
+   - reserves the prefix-portion of the slot's would-be page list,
+   - calls `paged_kv_pool.alloc_detached_pages` for those pages,
+   - copies bytes from T1 via `copy_pages_from_host`,
+   - calls a new `paged_kv_pool.attach_detached_pages_to_slot(slot_idx, prefix_pages)`
+     primitive that splices the promoted pages into the slot's
+     `page_indices` Vec at the prefix offset (NEW — does not exist),
+   - sets `block_owner_slots[bid] = slot_idx` and
+     `block_to_pages[bid] = prefix_pages`,
+   - flips `tier_location` to `Gpu{slot: slot_idx}`,
+   - releases the T1 region.
+4. Then `step_new` allocates only the **suffix** tokens (the unmatched
+   tail), starting from where the grafted prefix ended.
+5. The re-admission proceeds as if the prefix was always at T0 — no
+   round-trip through the staging event drain.
+
+This requires:
+
+- `PagedKVPool::attach_detached_pages_to_slot(slot_idx, pages)` —
+  splices pages into the slot's page list, advances `seq_len`, marks
+  pool refcount as already-bumped.
+- `Scheduler::assign_slots` reordering: pick slot → lookup → promote +
+  graft (if any HostPinned) → call `step_new` with a "skip-prefix-alloc"
+  hint.
+- `step_new` accepts a "first N tokens already alloc'd at slot offset 0"
+  parameter and skips the prefix alloc.
+
+Estimated scope: ~300–400 LoC across `paged_kv.rs`, `scheduler/cuda/core.rs`,
+`scheduler/cuda/runtime.rs`, `scheduler/cuda/decode.rs` (step_new entry).
+**Open as Gap #5 C4.5.**
+
+### What stays in C4 (the deliverable that ships)
+
+- `RadixCache::tier_location_of(bid)` accessor (read-only, dead-code-allowed).
+- This design-gap document.
+- Updated `docs/plans/gap5-kv-tier-demote-prefetch.md` plan (C4 deferred).
+
+What does NOT ship in C4: any byte-movement in the promote-back path.
+The `StagingCompleted` arm reverts to its pre-attempt behaviour
+(metadata-only flip — soundness preserved because today nothing
+actually demotes by default; `t1_demote_min_hits=0` default keeps C3's
+demote hook dormant).
+
+### Why this is the right call
+
+A) Codex caught the leak before bench → no regression shipped.
+B) The accessor + scaffolding lands cheap; C4.5 picks them up.
+C) The architectural fork (event-driven vs slot-bound) is non-obvious
+and deserves its own commit + bench, not a hot-fix patch on top of
+broken C4.
+D) Per CLAUDE.md "Architecture is never urgent" + "no half-states":
+shipping a known-leaky C4 with a "TODO fix later" would be a half-state.
+Revert + redesign is the cheaper path.

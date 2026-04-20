@@ -15,3 +15,5 @@ models/
 .context/
 /vendor/
 bench-output/
+.codex
+.codex/

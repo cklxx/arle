@@ -246,13 +246,40 @@ Each commit gated behind a feature flag or `SchedulerConfig` default so a regres
    - Unit tests: `t1_demote_min_hits_gates_demote`, `radix_cache_demote_then_match_returns_t1`.
    - Bench: guidellm with flag on and off; expect parity on both (demote happens but nothing reads T1 yet).
 
-4. **C4 — Real promote-back in `StagePlanner::stage` handler.** Coordinator's `Stage` command now allocates pool pages via `alloc_detached_pages` and runs H→D copy. `StagingCompleted` carries the new `BlockId → pages` map; scheduler installs into `block_to_pages` and flips tier_location back to `Gpu`.
-   - Files: `infer/src/kv_tier/coordinator.rs` (stage handler), `infer/src/scheduler/cuda/runtime.rs` (drain `StagingCompleted` + `publish_to_prefix_cache` via the promoted pages).
-   - New event: `StagingCompleted { ticket, promoted: Vec<(BlockId, Vec<u32>)> }` — extends existing shape.
-   - Failure handling: alloc-fails emits `StagingFailed{..}` → scheduler cold-requeues the admission.
-   - Unit tests: `promote_back_round_trip_bytes` (CUDA-gated).
-   - Integration test: `c=2 retract-then-readmit`.
-   - Bench: guidellm c=16 with `INFER_T1_DEMOTE_ENABLED=true`. Expected: modest TTFT p99 gain on repeat-prefix, flat on random mix.
+4. **C4 — Promote-back design + accessor only.** Initial attempt at
+   scheduler-owns-copy promote-back at the `StagingCompleted` event drain
+   leaked HBM (codex caught: pages inserted into `block_to_pages` without
+   a `block_owner_slots` entry → next cold-prefill rewrites radix node →
+   pages orphaned with refcount > 0). **Reverted byte path; shipped
+   accessor + design-gap analysis only.** See
+   `docs/plans/gap5-c2-byte-path-architecture.md` §"C4 design gap".
+   - Files actually shipped: `infer/src/prefix_cache.rs` (`tier_location_of`
+     accessor), `docs/plans/gap5-c2-byte-path-architecture.md` (gap doc),
+     this plan (status update).
+   - Bench: exempt — no runtime behaviour change (StagingCompleted arm
+     unchanged from pre-attempt state; `t1_demote_min_hits=0` default
+     keeps C3's demote hook dormant so the metadata-flip path is sound).
+
+4.5. **C4.5 — Slot-bound promote-back (the real C4).** Move the H→D copy
+   into `assign_slots` so promoted pages graft onto the request's slot
+   page list before `step_new`'s alloc — pages have an owner before
+   `publish_to_prefix_cache` rewrites the radix node, eliminating the
+   orphan path.
+   - New `PagedKVPool::attach_detached_pages_to_slot(slot_idx, pages)`
+     primitive — splices pages into the slot's page_indices Vec at offset 0,
+     advances `seq_len`, marks pool refcount as already-bumped.
+   - `Scheduler::assign_slots` reorder: pick slot → lookup_or_stage →
+     promote+graft if any HostPinned matched → call `step_new` with a
+     "skip-prefix-alloc" hint covering the just-grafted prefix.
+   - Files: `crates/cuda-kernels/src/paged_kv.rs` (new primitive),
+     `infer/src/scheduler/cuda/core.rs` (assign_slots reorder + graft),
+     `infer/src/scheduler/cuda/runtime.rs` (StagePlanner::stage shape may
+     change to return promoted-pages map), `infer/src/scheduler/cuda/decode.rs`
+     (step_new prefix-skip hint).
+   - Unit tests: `attach_detached_pages_to_slot_splices`, `promote_back_round_trip_bytes_with_slot_owner`.
+   - Integration: `c=2 retract-then-readmit` end-to-end.
+   - Bench: c=16 with `--t1-demote-min-hits 2`. Expected modest TTFT p99 gain on repeat-prefix.
+   - Estimated scope: ~300-400 LoC across 4 files.
 
 5. **C5 — Flip default, add `/v1/stats` counters, repeated-prefix bench.** Default `INFER_T1_DEMOTE_ENABLED=true`. Expose the 7 new counters in `ServerMetrics`. Land `scripts/bench_guidellm_repeated_prefix.sh` and the `wins/` entry comparing pre/post.
    - Files: `infer/src/metrics.rs`, `infer/src/http_server.rs` (stats render), `scripts/bench_guidellm_repeated_prefix.sh`.
