@@ -1,5 +1,13 @@
 # Multi-request mixed prefill v2 — K=2 cap=64, TTFT p50 −50% vs baseline
 
+> **Drift notice (added 2026-04-20):** absolute numbers in this entry
+> (128 tok/s, 3341 ms TTFT p50, 113 ms ITL p99) are valid in the
+> measurement environment at time of writing (pre-`guidellm 0.6.0`).
+> Today's env re-measures this same commit (`78e1f8a`) at ~98 tok/s —
+> drift is environmental, not code. See
+> [`errors/2026-04-20-bench-drift-environmental-not-code.md`](../errors/2026-04-20-bench-drift-environmental-not-code.md).
+> Structural findings below (K=2 beats K=4/K=1, trace breakdown) remain accurate.
+
 ## Goal
 
 Close the c=16 × 4096-prompt TTFT gap after attempt 1 (K=4, cap=512)

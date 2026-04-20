@@ -1,5 +1,11 @@
 # Retract victim ranking — sglang parity (ROI #3 from gap analysis)
 
+> **Drift notice (added 2026-04-20):** absolute tok/s numbers cited here
+> predate a `guidellm 0.6.0` env drift — today the same commits
+> re-measure at ~98 tok/s. See
+> [`errors/2026-04-20-bench-drift-environmental-not-code.md`](../errors/2026-04-20-bench-drift-environmental-not-code.md).
+> The Pareto-neutral finding below remains accurate.
+
 ## Goal
 
 Swap preemption victim ranking from single-key

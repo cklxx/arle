@@ -1,5 +1,11 @@
 # Paged mixed-batch fusion — c=16 ITL p99 beats sglang, throughput +23%
 
+> **Drift notice (added 2026-04-20):** absolute tok/s numbers cited here
+> predate a `guidellm 0.6.0` env drift — today the same commits
+> re-measure at ~98 tok/s. See
+> [`errors/2026-04-20-bench-drift-environmental-not-code.md`](../errors/2026-04-20-bench-drift-environmental-not-code.md).
+> The kernel/scheduler findings below remain accurate.
+
 ## Goal
 
 Close the ITL p99 +93% gap and narrow the throughput −27% gap vs sglang
