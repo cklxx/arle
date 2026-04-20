@@ -90,15 +90,16 @@ struct Args {
     mixed_prefill_max_reqs: usize,
 
     /// Minimum lookup-hit count a prefix block must reach before it's
-    /// demoted to the host-pinned T1 tier on GPU-pool eviction. Default
-    /// 2 — a block must have been re-matched at least once to be worth
-    /// keeping warm in T1. `0` disables demote (free outright on
-    /// eviction, pre-Gap-#5 behaviour) and skips the T1 pool alloc;
-    /// `1` always demotes (debug / repeated-prefix workloads). Maps
-    /// to sglang's `HiRadixCache.write_through_threshold` with clearer
-    /// naming. Reserved for Gap #5 C3 wiring; ignored in HEAD until
-    /// the demote hook lands.
-    #[arg(long, default_value_t = 2)]
+    /// demoted to the host-pinned T1 tier on GPU-pool eviction.
+    /// **Default 0 = demote disabled** (pre-Gap-#5 behaviour, every
+    /// eviction frees pages outright). Opt in via
+    /// `--t1-demote-min-hits=2` (sglang parity) or
+    /// `--t1-demote-min-hits=1` (debug: always demote). Default flip
+    /// to `2` gated on Gap #5 C5 (stats counters + bench wins entry).
+    /// `0` also skips the T1 pool alloc, so default carries no
+    /// memory cost. Maps to sglang's
+    /// `HiRadixCache.write_through_threshold` with clearer naming.
+    #[arg(long, default_value_t = 0)]
     t1_demote_min_hits: u32,
 
     /// Capacity (MB) of the host-pinned T1 KV tier. Allocated via

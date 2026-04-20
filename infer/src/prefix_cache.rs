@@ -302,16 +302,51 @@ impl RadixCache {
     /// `evict_prefix_cache_if_pressured` — only blocks that have been
     /// matched ≥ N times are demoted to T1 on eviction. Returns
     /// `None` if the block is unknown to the radix.
-    ///
-    /// `#[allow(dead_code)]` while the C3 evict hook lands across
-    /// multiple commits — CI runs `RUSTFLAGS="-D warnings"` (see
-    /// `.github/workflows/ci.yml`) so an unused `pub(crate)` accessor
-    /// is a build break, not a warning. Remove the attribute once
-    /// `evict_prefix_cache_if_pressured` calls into this.
     #[allow(dead_code)]
     pub(crate) fn hit_count_of(&self, block: BlockId) -> Option<u32> {
         let idx = *self.block_index.get(&block)?;
         self.nodes.get(idx).map(|node| node.hit_count)
+    }
+
+    /// Read the block's `byte_len` (total K+V payload bytes across
+    /// all layers). O(1) via `block_index`. Returns `None` if the
+    /// block is unknown OR if `byte_len` was never set (a block
+    /// published without `set_block_byte_len` reads as 0 and we
+    /// treat that as "unknown shape, can't safely demote").
+    ///
+    /// Single-block accessor; the eviction hot path uses
+    /// [`Self::block_metadata_snapshot`] instead because
+    /// `evict_with_policy` removes block_index entries before the
+    /// scheduler can read them per-bid.
+    #[allow(dead_code)]
+    pub(crate) fn byte_len_of(&self, block: BlockId) -> Option<u32> {
+        let idx = *self.block_index.get(&block)?;
+        let len = self.nodes.get(idx)?.byte_len;
+        if len == 0 { None } else { Some(len) }
+    }
+
+    /// Snapshot `(hit_count, byte_len)` for every block currently in
+    /// the radix. Used by Gap #5 C3 in
+    /// `evict_prefix_cache_if_pressured` because `evict_with_policy`
+    /// removes nodes from `block_index` before the caller can read
+    /// their metadata — we need the values *before* eviction to
+    /// decide T1 demote vs free-outright on a per-block basis.
+    /// O(N) over `block_index`; for c=16 with thousands of blocks
+    /// this is a few KB of HashMap scratch, negligible vs the PCIe
+    /// copy that follows.
+    ///
+    /// `#[allow(dead_code)]` for the no-cuda CI lane — the only
+    /// caller is `infer/src/scheduler/cuda/core.rs` which is gated
+    /// out under `--no-default-features --features no-cuda`.
+    #[allow(dead_code)]
+    pub(crate) fn block_metadata_snapshot(&self) -> std::collections::HashMap<BlockId, (u32, u32)> {
+        self.block_index
+            .iter()
+            .filter_map(|(&bid, &idx)| {
+                let node = self.nodes.get(idx)?;
+                Some((bid, (node.hit_count, node.byte_len)))
+            })
+            .collect()
     }
 
     // -------------------------------------------------------------------------

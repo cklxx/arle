@@ -150,11 +150,9 @@ pub struct Scheduler<M: ModelForward> {
     /// 0` (demote enabled); else `None`. Alloc failure at startup
     /// logs warn + leaves None; demote falls back to "free outright".
     /// Owned by the single-writer scheduler thread per the A5'
-    /// scheduler-owns-copy decision (`docs/plans/gap5-c2-byte-path-architecture.md`).
-    /// `#[allow(dead_code)]` until the C3 evict hook reads this; the
-    /// CI strict mode (`-D warnings`, see `.github/workflows/ci.yml`)
-    /// would otherwise treat the unused field as a build break.
-    #[allow(dead_code)]
+    /// scheduler-owns-copy decision
+    /// (`docs/plans/gap5-c2-byte-path-architecture.md`). Read by
+    /// `evict_prefix_cache_if_pressured`'s demote hook (Gap #5 C3).
     pub(super) host_pinned_pool: Option<crate::kv_tier::HostPinnedPool>,
     pub(super) stage_waiting: HashMap<crate::kv_tier::StageTicket, StagedAdmission>,
     pub(super) coordinator_unavailable: bool,
@@ -898,23 +896,133 @@ impl<M: ModelForward> Scheduler<M> {
         if blocks_to_evict == 0 {
             return 0;
         }
+        // Snapshot per-block metadata BEFORE evict_with_policy mutates
+        // `block_index` — Gap #5 C3 needs hit_count + byte_len to
+        // decide T1 demote vs free-outright per block, but eviction
+        // removes the radix entries before we get to read them.
+        let demote_threshold = self.config.t1_demote_min_hits;
+        let demote_enabled = demote_threshold > 0 && self.host_pinned_pool.is_some();
+        let metadata_snapshot = if demote_enabled {
+            self.prefix_cache.block_metadata_snapshot()
+        } else {
+            std::collections::HashMap::new()
+        };
+
         let evicted = self.prefix_cache.evict_with_policy(
             &SessionBiasedLru::default(),
             self.eviction_signals(),
             blocks_to_evict,
         );
         let mut reclaimed_pages: usize = 0;
+        let mut demoted_blocks: usize = 0;
+        let mut demoted_bytes: usize = 0;
+        let mut demote_pool_exhausted: usize = 0;
         let sentinel_ticket = crate::kv_tier::StageTicket(u64::MAX);
+        let stream_arc = self.model.device_context().stream.clone();
+
         for bid in evicted {
             if let Some(pages) = self.block_to_pages.remove(&bid) {
                 self.block_owner_slots.remove(&bid);
+
+                // Demote decision: enabled gate + hit-count gate + byte-len-known
+                // gate + T1 reserve success. Failure on any gate falls
+                // through to "free outright" (today's pre-Gap-#5 path).
+                // `Option<(target_location, bytes_moved)>` so the
+                // telemetry submit_demote call can report the actual
+                // payload size for /v1/stats.
+                let mut demoted_to: Option<(BlockLocation, usize)> = None;
+                if demote_enabled {
+                    let (hit_count, byte_len) =
+                        metadata_snapshot.get(&bid).copied().unwrap_or((0, 0));
+                    if hit_count >= demote_threshold && byte_len > 0 {
+                        let byte_len_usize = byte_len as usize;
+                        // T1 reserve. If exhausted, fall through.
+                        let pool = self
+                            .host_pinned_pool
+                            .as_mut()
+                            .expect("demote_enabled implies pool exists");
+                        if let Some(region) = pool.reserve(byte_len_usize) {
+                            // D→H copy (sync via compute stream — A5'
+                            // scheduler-owns-copy decision; ~7 μs/block at
+                            // 147 KiB over PCIe). On failure, return the
+                            // T1 region and fall through to free-outright.
+                            match self.paged_kv_pool.copy_pages_to_host(&pages, &stream_arc) {
+                                Ok(bytes) if bytes.len() == byte_len_usize => {
+                                    let dst_ptr = pool.host_ptr(region);
+                                    // SAFETY: `region` was just reserved
+                                    // from this pool (`reserve` returned
+                                    // `Some(region)`) and `dst_ptr` lives
+                                    // for the lifetime of the pool;
+                                    // `bytes.len() == byte_len_usize ==
+                                    // region.len`; non-overlapping (host
+                                    // Vec ↔ host pinned region from
+                                    // disjoint allocations).
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            bytes.as_ptr(),
+                                            dst_ptr as *mut u8,
+                                            byte_len_usize,
+                                        );
+                                    }
+                                    let to = BlockLocation::HostPinned {
+                                        offset: region.offset,
+                                    };
+                                    self.prefix_cache.set_block_location(bid, to.clone());
+                                    demoted_to = Some((to, byte_len_usize));
+                                    demoted_blocks += 1;
+                                    demoted_bytes += byte_len_usize;
+                                }
+                                Ok(bytes) => {
+                                    warn!(
+                                        "demote: copy_pages_to_host returned {} bytes for \
+                                         block {bid:?}, expected {byte_len_usize}; falling \
+                                         through to free-outright",
+                                        bytes.len(),
+                                    );
+                                    pool.release(region);
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        "demote: copy_pages_to_host failed for block \
+                                         {bid:?}: {err}; falling through to free-outright",
+                                    );
+                                    pool.release(region);
+                                }
+                            }
+                        } else {
+                            demote_pool_exhausted += 1;
+                        }
+                    }
+                }
+
+                // Telemetry to coordinator (best-effort; never blocks).
+                // The "from" Gpu slot is symbolic — we don't track which
+                // specific slot the radix block came from at this point;
+                // u32::MAX is the established "unbound" sentinel
+                // (matches `runtime.rs::drain_coordinator_events`
+                // StagingCompleted handling).
+                if let Some((to, bytes)) = demoted_to.as_ref() {
+                    let _ = self.coordinator_handle.submit_demote(
+                        bid,
+                        BlockLocation::Gpu { slot: u32::MAX },
+                        to.clone(),
+                        *bytes,
+                    );
+                }
+
                 for &page in &pages {
-                    // A5 stub: sentinel ticket represents "instant demote"
-                    // until coordinator transport lane is wired.
+                    // Page lifecycle — same dance as before. The
+                    // sentinel ticket represents "we're done with the
+                    // page lifecycle dance for this page in this tick"
+                    // (no async coordinator transport in v1 per A5').
+                    let lifecycle_target = demoted_to
+                        .as_ref()
+                        .map(|(loc, _)| loc.clone())
+                        .unwrap_or(BlockLocation::HostPinned { offset: 0 });
                     if let Err(err) = self.page_lifecycle.begin_demote(
                         page as usize,
                         sentinel_ticket,
-                        BlockLocation::HostPinned { offset: 0 },
+                        lifecycle_target,
                     ) {
                         log::debug!(
                             "page lifecycle begin_demote ignored for page {}: {}",
@@ -939,10 +1047,14 @@ impl<M: ModelForward> Scheduler<M> {
         if reclaimed_pages > 0 {
             info!(
                 "prefix cache eviction: released {} pool pages back to free list \
-                 ({} evicted blocks; retained now {})",
+                 ({} evicted blocks; retained now {}; demoted to T1: {} blocks / \
+                 {} bytes; t1_pool_exhausted: {})",
                 reclaimed_pages,
                 blocks_to_evict,
                 self.paged_kv_pool.retained_count(),
+                demoted_blocks,
+                demoted_bytes,
+                demote_pool_exhausted,
             );
         }
         reclaimed_pages
