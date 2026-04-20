@@ -192,13 +192,13 @@ impl ModelForward for Qwen35Model {
         state: &mut Self::State,
         pool: &TokenKVPool,
         slot: usize,
-        _new_token_indices: &cudarc::driver::CudaSlice<i32>,
     ) -> Result<()> {
         if tokens.len() == 1 {
             // Single-token: fall back to decode fast-path (CUDA Graph).
             // The decode path uses kv_cache, not the pool, so the caller must
             // have routed through batch decode for paged correctness. This
-            // mirrors Qwen3's behavior.
+            // mirrors Qwen3's behavior and keeps this trait path free of any
+            // scheduler-threaded pool descriptors.
             self.forward_decode(tokens[0], state)?;
             return Ok(());
         }

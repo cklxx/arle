@@ -6,6 +6,8 @@
 //! then FlashInfer's batch decode handles attention in a single launch.
 
 use anyhow::Result;
+use std::collections::HashMap;
+
 use cudarc::driver::safe::CudaGraph;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
@@ -33,15 +35,67 @@ pub(crate) const MIXED_PREFILL_CAP: usize = 64;
 /// `CudaSlice` slot per prefill req × `max_pages_per_slot`) and the
 /// `FlashInferDecodeMetadata.qo_indptr` sizing (`B + N + 1` entries).
 ///
-/// The **runtime cap** is `SchedulerConfig::mixed_prefill_max_reqs`,
-/// exposed as the `--mixed-prefill-max-reqs` CLI flag. Today the tested
-/// Pareto-optimal is 2 (the default). Raising it past
+/// The **runtime cap** is `SchedulerConfig::prefill_max_requests` when
+/// `enable_mixed_chunk=true`. Raising it past
 /// `MIXED_PREFILL_MAX_REQS_ALLOC_CAP` requires bumping this const (and
 /// rebuilding) to grow the static allocations. Keep the const ≥ any
 /// plausible CLI value; 8 comfortably covers K=4 stretch probes on the
 /// ROI#2 roadmap.
 #[allow(dead_code)]
 pub(crate) const MIXED_PREFILL_MAX_REQS_ALLOC_CAP: usize = 8;
+
+/// `num_tokens` buckets covered by the mixed CUDA-graph cache at
+/// `MIXED_PREFILL_CAP = 64`. The scheduler pads `Σc_i` up to the nearest
+/// bucket via real-token extension; ticks with `Σc_i` under 16 fall
+/// through to eager mixed (no bucket fits).
+///
+/// Keep ordered ascending — `round_up_to_bucket()` relies on the order.
+#[cfg(feature = "cuda")]
+#[allow(dead_code)]
+pub(crate) fn cuda_graph_mixed_num_tokens() -> &'static [usize] {
+    &[16, 32, 64]
+}
+
+/// Position of `nt` in `cuda_graph_mixed_num_tokens()`. Returns `None` when
+/// `nt` isn't a registered bucket value.
+#[cfg(feature = "cuda")]
+#[allow(dead_code)]
+pub(crate) fn mixed_nt_bucket_index(nt: usize) -> Option<usize> {
+    cuda_graph_mixed_num_tokens().iter().position(|&b| b == nt)
+}
+
+/// Mixed CUDA-graph dispatch mode controlled by `INFER_MIXED_CUDA_GRAPH`.
+///
+/// - `Auto` (default): capture-and-replay per exact mixed shape
+///   `(decode_batch_size, per-prefill chunk signature)`. The scheduler pads
+///   common `Σc_i` totals up to canonical buckets so hot shapes collapse,
+///   but correctness does not rely on the padding.
+/// - `Always`: identical to `Auto` (reserved — future knob for forcing
+///   replay even when the scheduler would prefer eager; no consumer yet).
+/// - `Never`: skip capture and fall through to eager every tick; restores
+///   the pre-ROI#2-C2 behavior cleanly. Mitigation handle for R3 (silent
+///   numeric corruption).
+#[cfg(feature = "cuda")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum MixedGraphMode {
+    Auto,
+    Always,
+    Never,
+}
+
+#[cfg(feature = "cuda")]
+#[allow(dead_code)]
+pub(crate) fn mixed_graph_mode() -> MixedGraphMode {
+    // Evaluated fresh each call so dev flips at runtime take effect without
+    // restart. Single source of truth for the env gate — keep all reads
+    // routed through this helper so the policy stays auditable.
+    match std::env::var("INFER_MIXED_CUDA_GRAPH").as_deref() {
+        Ok("never") | Ok("off") | Ok("0") => MixedGraphMode::Never,
+        Ok("always") | Ok("force") => MixedGraphMode::Always,
+        _ => MixedGraphMode::Auto,
+    }
+}
 
 /// Pre-allocated buffers for batched decode, reused across steps.
 /// Allocated once for `max_batch_size`; smaller batches set `seq_len` on HiddenStates.
@@ -91,8 +145,11 @@ pub struct BatchDecodeBuffers {
     /// Max batch size this buffer set was allocated for.
     max_batch_size: usize,
 
-    /// CUDA Graph cache: index = batch_size - 1. Vec avoids HashMap overhead.
-    graph_cache: Vec<Option<CudaGraph>>,
+    /// Decode-only CUDA Graph cache: index = batch_size - 1.
+    decode_graphs: Vec<Option<CudaGraph>>,
+    /// Mixed decode+prefill CUDA Graph cache keyed by
+    /// `(decode_batch_size, prefill_chunk_signature)`.
+    mixed_graphs: HashMap<(usize, Vec<usize>), CudaGraph>,
 
     /// Lazily allocated eager-only buffers for mixed decode + prefill steps.
     mixed: Option<MixedBatchBuffers>,
@@ -269,7 +326,8 @@ impl BatchDecodeBuffers {
                 .map_err(|e| anyhow::anyhow!("Alloc quantized_kv_meta failed: {e}"))?,
 
             max_batch_size,
-            graph_cache: (0..max_batch_size).map(|_| None).collect(),
+            decode_graphs: (0..max_batch_size).map(|_| None).collect(),
+            mixed_graphs: HashMap::new(),
             mixed: None,
         })
     }
@@ -359,9 +417,13 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
     }
 
     fn invalidate_graph_cache(&mut self, batch_size: usize) {
-        if batch_size >= 1 && batch_size <= self.graph_cache.len() {
-            self.graph_cache[batch_size - 1] = None;
+        if batch_size >= 1 && batch_size <= self.decode_graphs.len() {
+            self.decode_graphs[batch_size - 1] = None;
         }
+    }
+
+    fn clear_mixed_graph_cache(&mut self) {
+        self.mixed_graphs.clear();
     }
 
     fn logprobs_host(&self) -> &[f32] {
@@ -370,79 +432,20 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
 }
 
 impl Qwen3Model {
-    /// Mixed decode + multi-prefill forward: B decode rows + N prefill chunks
-    /// (total `Σc_i` rows) in one GPU dispatch.
-    ///
-    /// Preconditions (enforced by the scheduler before calling):
-    /// - Every `prefills[i].slot_idx` has `pool.seq_len(slot_idx) ==
-    ///   prefills[i].start_pos + prefills[i].token_count` — i.e. the scheduler
-    ///   has already `alloc_tokens`'d `c_i` tokens for each prefill slot.
-    /// - `prefills[i].page_table_host` reflects the slot's page table after
-    ///   that allocation (the kernel uses it to scatter K/V into the pool).
-    /// - `Σc_i ≤ MIXED_PREFILL_CAP` and `prefills.len() ≤ MIXED_PREFILL_MAX_REQS`.
-    #[allow(dead_code)]
-    pub(crate) fn decode_batch_with_prefills(
+    fn clear_all_graph_caches(&self, bufs: &mut BatchDecodeBuffers) {
+        for entry in &mut bufs.decode_graphs {
+            *entry = None;
+        }
+        bufs.mixed_graphs.clear();
+    }
+
+    fn decode_batch_with_prefills_graph_body(
         &self,
-        decode_tokens: &[u32],
         prefills: &[crate::model::PrefillSection<'_>],
-        states: &mut [Qwen3State],
-        decode_slot_indices: &[usize],
         paged_kv_pool: &mut PagedKVPool,
         bufs: &mut BatchDecodeBuffers,
-    ) -> Result<bool> {
-        let b = decode_tokens.len();
-        let n = prefills.len();
-        let prefill_token_total: usize = prefills.iter().map(|p| p.tokens.len()).sum();
-        if b == 0 || n == 0 || prefill_token_total == 0 {
-            return Ok(false);
-        }
-        // The fused mixed prefill+decode path does not apply LoRA adapters
-        // yet. Refuse it when LoRA is attached so the scheduler falls back
-        // to separate prefill and decode which do apply LoRA.
-        if self.lora.is_some() {
-            return Ok(false);
-        }
-        if paged_kv_pool.format != KVFormat::BF16
-            || prefill_token_total > MIXED_PREFILL_CAP
-            || n > MIXED_PREFILL_MAX_REQS_ALLOC_CAP
-        {
-            return Ok(false);
-        }
-        // Validate every prefill slot: seq_len must equal start_pos + c_i
-        // (scheduler already alloc'd c_i tokens for each slot before calling).
-        for p in prefills {
-            let expected_seq = p.start_pos + p.tokens.len();
-            if paged_kv_pool.seq_len(p.slot_idx) != expected_seq {
-                return Ok(false);
-            }
-        }
-
-        // Paged-only mixed path: K/V writes land directly in the page pool via
-        // `prefill_attention_paged_prep_cuda`. No contiguous `k_cache` headroom
-        // required — the `max_seq_len()` bound was a stale hold-over from the
-        // dual-write prep kernel.
-
-        if bufs.logits_batch.is_none() {
-            let vocab_size = self.output_projection().rows;
-            bufs.logits_batch = Some(HiddenStates::zeros(
-                &self.ctx,
-                vocab_size,
-                bufs.max_batch_size,
-            )?);
-        }
-        if bufs.mixed.is_none() {
-            bufs.mixed = Some(MixedBatchBuffers::new(
-                &self.ctx,
-                &self.config,
-                bufs.max_batch_size,
-                paged_kv_pool.max_total_pages,
-            )?);
-        }
-        // Disjoint-field borrow: the mixed path reuses `bufs.metadata` (the
-        // decode path's FlashInfer workspace) instead of owning its own —
-        // the two phases never overlap in a single scheduler tick, so we
-        // save the duplicate ~328 MiB of FlashInfer state. We split `bufs`
-        // here so that `metadata` and `mixed` can be mutated independently.
+        decode_batch_size: usize,
+    ) -> Result<()> {
         let BatchDecodeBuffers {
             mixed,
             metadata,
@@ -453,57 +456,6 @@ impl Qwen3Model {
         let logits_buf = logits_batch
             .as_mut()
             .expect("logits_batch initialized above");
-        let total_tokens = b + prefill_token_total;
-        if total_tokens > mixed.max_tokens {
-            return Ok(false);
-        }
-        mixed.set_seq_len(total_tokens);
-
-        // Reuse per-step host scratch instead of a fresh `Vec::with_capacity`
-        // per tick (one heap alloc per mixed step, observable at c=16).
-        mixed.token_ids_scratch.clear();
-        mixed
-            .token_ids_scratch
-            .extend(decode_tokens.iter().map(|&tok| tok as i32));
-        for p in prefills {
-            mixed
-                .token_ids_scratch
-                .extend(p.tokens.iter().map(|&tok| tok as i32));
-        }
-        self.ctx
-            .stream
-            .memcpy_htod(&mixed.token_ids_scratch, &mut mixed.token_ids_gpu)
-            .map_err(|e| anyhow::anyhow!("H2D mixed token_ids: {e}"))?;
-
-        // `update_mixed_multi` may reallocate `metadata.kv_indices` when the
-        // mixed page count exceeds what the decode path sized for; it flips
-        // `plan_dirty = true` internally. We do NOT invalidate the decode
-        // graph cache here because no decode graph has been captured with
-        // this `metadata` yet in this tick — the next regular decode step
-        // will re-plan via `plan_attention()` (which observes `plan_dirty`)
-        // and, if needed, re-capture its graph.
-        let prefill_slot_descs: Vec<cuda_kernels::flashinfer::PrefillSlot> = prefills
-            .iter()
-            .map(|p| cuda_kernels::flashinfer::PrefillSlot {
-                slot_idx: p.slot_idx,
-                start_pos: p.start_pos,
-                token_count: p.tokens.len(),
-            })
-            .collect();
-        let _ = metadata.update_mixed_multi(
-            &self.ctx,
-            paged_kv_pool,
-            decode_slot_indices,
-            &prefill_slot_descs,
-        )?;
-        metadata.tc_plan(
-            &self.ctx,
-            b + n,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
-            paged_kv_pool.page_size,
-            self.config.head_dim,
-        )?;
 
         ops::embedding_batch(
             &self.ctx,
@@ -511,30 +463,6 @@ impl Qwen3Model {
             &mixed.token_ids_gpu,
             &mut mixed.embedding_out,
         )?;
-
-        // H2D-upload each prefill slot's page table into its pre-allocated
-        // `MixedBatchBuffers::prefill_page_table_gpu` slot. Replaces the
-        // per-tick `memcpy_stod` (which allocated a fresh `CudaSlice` every
-        // mixed step — the single biggest per-tick alloc on the mixed path,
-        // and a CUDA-graph-capture blocker per
-        // `docs/plans/roi2-mixed-cuda-graph.md` §Allocation hoist audit #7).
-        for (i, p) in prefills.iter().enumerate() {
-            let src_len = p.page_table_host.len();
-            let slot_cap = mixed.prefill_page_table_gpu[i].len();
-            if src_len > slot_cap {
-                return Err(anyhow::anyhow!(
-                    "prefill[{}] page_table len {} exceeds pre-alloc slot cap {} (slot_idx {})",
-                    i,
-                    src_len,
-                    slot_cap,
-                    p.slot_idx,
-                ));
-            }
-            self.ctx
-                .stream
-                .memcpy_htod(p.page_table_host, &mut mixed.prefill_page_table_gpu[i])
-                .map_err(|e| anyhow::anyhow!("H2D prefill_page_table[slot {}]: {e}", p.slot_idx))?;
-        }
 
         let hidden_ptr = &raw mut mixed.embedding_out;
         let eps = self.config.rms_norm_eps;
@@ -545,6 +473,7 @@ impl Qwen3Model {
         let kv_dim = num_kv_heads * head_dim;
         let bf16_size = std::mem::size_of::<u16>();
         let page_size = paged_kv_pool.page_size;
+        let n = prefills.len();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let hidden = unsafe { &mut *hidden_ptr };
@@ -640,17 +569,14 @@ impl Qwen3Model {
                     num_kv_heads as i32,
                     page_size as i32,
                     (paged_kv_pool.kv_dim * page_size) as i32,
-                    b as i32,
+                    decode_batch_size as i32,
                     eps,
                     self.ctx.stream.cu_stream(),
                 )
                 .result()?;
             }
 
-            // One prep call per prefill section — offset the Q/K/V pointers by
-            // the sum of prior sections' token counts so each section writes
-            // into its own contiguous block of rows.
-            let mut running_offset = b;
+            let mut running_offset = decode_batch_size;
             for (i, p) in prefills.iter().enumerate() {
                 let c_i = p.tokens.len();
                 if c_i == 0 {
@@ -663,9 +589,6 @@ impl Qwen3Model {
                 let v_prefill_ptr =
                     (v_ptr as usize + running_offset * kv_dim * bf16_size) as *const ffi::Half;
 
-                // Paged-only prep: QK-norm + partial RoPE + page-table scatter
-                // of K/V into `k_pool`/`v_pool`. sglang's `--enable-mixed-chunk`
-                // equivalent — no contiguous write, no `max_seq_len()` cap.
                 unsafe {
                     ffi::prefill_attention_paged_prep_cuda(
                         q_prefill_ptr,
@@ -723,7 +646,7 @@ impl Qwen3Model {
                         lp_ptr as *const i32,
                         o_ptr as *mut ffi::Half,
                         lse_ptr as *mut f32,
-                        (b + n) as i32,
+                        (decode_batch_size + n) as i32,
                         num_heads as i32,
                         num_kv_heads as i32,
                         page_size as i32,
@@ -810,6 +733,244 @@ impl Qwen3Model {
             }
         }
 
+        let hidden = unsafe { &*hidden_ptr };
+        ops::rms_norm_batch_into(&self.ctx, hidden, &self.norm, eps, &mut mixed.normed);
+        ops::gemm_into(
+            &self.ctx,
+            self.output_projection(),
+            &mixed.normed,
+            &mut mixed.logits,
+        );
+
+        logits_buf.seq_len = decode_batch_size;
+        let src = mixed
+            .logits
+            .data
+            .slice(0..decode_batch_size * logits_buf.hidden_dim);
+        let mut dst = logits_buf
+            .data
+            .slice_mut(0..decode_batch_size * logits_buf.hidden_dim);
+        self.ctx
+            .stream
+            .memcpy_dtod(&src, &mut dst)
+            .map_err(|e| anyhow::anyhow!("D2D mixed decode logits: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Mixed decode + multi-prefill forward: B decode rows + N prefill chunks
+    /// (total `Σc_i` rows) in one GPU dispatch.
+    ///
+    /// Preconditions (enforced by the scheduler before calling):
+    /// - Every `prefills[i].slot_idx` has `pool.seq_len(slot_idx) ==
+    ///   prefills[i].start_pos + prefills[i].tokens.len()` — i.e. the scheduler
+    ///   has already `alloc_tokens`'d `c_i` tokens for each prefill slot.
+    /// - `Σc_i ≤ MIXED_PREFILL_CAP` and `prefills.len() ≤ MIXED_PREFILL_MAX_REQS`.
+    #[allow(dead_code)]
+    pub(crate) fn decode_batch_with_prefills(
+        &self,
+        decode_tokens: &[u32],
+        prefills: &[crate::model::PrefillSection<'_>],
+        states: &mut [Qwen3State],
+        decode_slot_indices: &[usize],
+        paged_kv_pool: &mut PagedKVPool,
+        bufs: &mut BatchDecodeBuffers,
+    ) -> Result<bool> {
+        let b = decode_tokens.len();
+        let n = prefills.len();
+        let prefill_token_total: usize = prefills.iter().map(|p| p.tokens.len()).sum();
+        if b == 0 || n == 0 || prefill_token_total == 0 {
+            return Ok(false);
+        }
+        // The fused mixed prefill+decode path does not apply LoRA adapters
+        // yet. Refuse it when LoRA is attached so the scheduler falls back
+        // to separate prefill and decode which do apply LoRA.
+        if self.lora.is_some() {
+            return Ok(false);
+        }
+        if paged_kv_pool.format != KVFormat::BF16
+            || prefill_token_total > MIXED_PREFILL_CAP
+            || n > MIXED_PREFILL_MAX_REQS_ALLOC_CAP
+        {
+            return Ok(false);
+        }
+        // Validate every prefill slot: seq_len must equal start_pos + c_i
+        // (scheduler already alloc'd c_i tokens for each slot before calling).
+        for p in prefills {
+            let expected_seq = p.start_pos + p.tokens.len();
+            if paged_kv_pool.seq_len(p.slot_idx) != expected_seq {
+                return Ok(false);
+            }
+        }
+
+        // Paged-only mixed path: K/V writes land directly in the page pool via
+        // `prefill_attention_paged_prep_cuda`. No contiguous `k_cache` headroom
+        // required — the `max_seq_len()` bound was a stale hold-over from the
+        // dual-write prep kernel.
+
+        if bufs.logits_batch.is_none() {
+            let vocab_size = self.output_projection().rows;
+            bufs.logits_batch = Some(HiddenStates::zeros(
+                &self.ctx,
+                vocab_size,
+                bufs.max_batch_size,
+            )?);
+        }
+        if bufs.mixed.is_none() {
+            bufs.mixed = Some(MixedBatchBuffers::new(
+                &self.ctx,
+                &self.config,
+                bufs.max_batch_size,
+                paged_kv_pool.max_total_pages,
+            )?);
+        }
+        let total_tokens = b + prefill_token_total;
+        if total_tokens
+            > bufs
+                .mixed
+                .as_ref()
+                .expect("mixed buffers initialized above")
+                .max_tokens
+        {
+            return Ok(false);
+        }
+        bufs.mixed
+            .as_mut()
+            .expect("mixed buffers initialized above")
+            .set_seq_len(total_tokens);
+        let mixed_graph_key = (
+            b,
+            prefills.iter().map(|p| p.tokens.len()).collect::<Vec<_>>(),
+        );
+        let graphs_enabled = self.supports_cuda_graph_decode();
+        let use_mixed_graph =
+            graphs_enabled && !matches!(mixed_graph_mode(), MixedGraphMode::Never);
+
+        // Reuse per-step host scratch instead of a fresh `Vec::with_capacity`
+        // per tick (one heap alloc per mixed step, observable at c=16).
+        let mixed = bufs
+            .mixed
+            .as_mut()
+            .expect("mixed buffers initialized above");
+        mixed.token_ids_scratch.clear();
+        mixed
+            .token_ids_scratch
+            .extend(decode_tokens.iter().map(|&tok| tok as i32));
+        for p in prefills {
+            mixed
+                .token_ids_scratch
+                .extend(p.tokens.iter().map(|&tok| tok as i32));
+        }
+        self.ctx
+            .stream
+            .memcpy_htod(&mixed.token_ids_scratch, &mut mixed.token_ids_gpu)
+            .map_err(|e| anyhow::anyhow!("H2D mixed token_ids: {e}"))?;
+
+        // `update_mixed_multi` may reallocate `metadata.kv_indices` when the
+        // mixed page count exceeds what the decode path sized for; it flips
+        // `plan_dirty = true` internally. We do NOT invalidate the decode
+        // graph cache here because no decode graph has been captured with
+        // this `metadata` yet in this tick — the next regular decode step
+        // will re-plan via `plan_attention()` (which observes `plan_dirty`)
+        // and, if needed, re-capture its graph.
+        let prefill_slot_descs: Vec<cuda_kernels::flashinfer::PrefillSlot> = prefills
+            .iter()
+            .map(|p| cuda_kernels::flashinfer::PrefillSlot {
+                slot_idx: p.slot_idx,
+                start_pos: p.start_pos,
+                token_count: p.tokens.len(),
+            })
+            .collect();
+        if bufs.metadata.update_mixed_multi(
+            &self.ctx,
+            paged_kv_pool,
+            decode_slot_indices,
+            &prefill_slot_descs,
+        )? {
+            self.clear_all_graph_caches(bufs);
+        }
+        bufs.metadata.tc_plan(
+            &self.ctx,
+            b + n,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            paged_kv_pool.page_size,
+            self.config.head_dim,
+        )?;
+
+        // H2D-upload each prefill slot's page table into its pre-allocated
+        // `MixedBatchBuffers::prefill_page_table_gpu` slot. This keeps the
+        // mixed-graph buffer hoisting intact while making the model the sole
+        // owner of pool-derived paged metadata.
+        let mixed = bufs
+            .mixed
+            .as_mut()
+            .expect("mixed buffers initialized above");
+        for (i, p) in prefills.iter().enumerate() {
+            let page_indices = paged_kv_pool.page_indices(p.slot_idx);
+            let src_len = page_indices.len();
+            let slot_cap = mixed.prefill_page_table_gpu[i].len();
+            if src_len > slot_cap {
+                return Err(anyhow::anyhow!(
+                    "prefill[{}] page_table len {} exceeds pre-alloc slot cap {} (slot_idx {})",
+                    i,
+                    src_len,
+                    slot_cap,
+                    p.slot_idx,
+                ));
+            }
+            let scratch = &mut mixed.prefill_page_table_scratch[i];
+            scratch.clear();
+            scratch.extend(page_indices.iter().map(|&page| page as i32));
+            self.ctx
+                .stream
+                .memcpy_htod(scratch, &mut mixed.prefill_page_table_gpu[i])
+                .map_err(|e| anyhow::anyhow!("H2D prefill_page_table[slot {}]: {e}", p.slot_idx))?;
+        }
+        if use_mixed_graph {
+            if let Some(graph) = bufs.mixed_graphs.get(&mixed_graph_key) {
+                graph.launch().map_err(|e| {
+                    anyhow::anyhow!(
+                        "Mixed CUDA Graph replay (B={}, shape={:?}): {e}",
+                        b,
+                        mixed_graph_key.1
+                    )
+                })?;
+            } else {
+                info!(
+                    "Capturing mixed CUDA Graph for B={} shape={:?}...",
+                    b, mixed_graph_key.1
+                );
+                self.ctx
+                    .stream
+                    .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                    .map_err(|e| anyhow::anyhow!("begin_capture mixed: {e}"))?;
+
+                self.decode_batch_with_prefills_graph_body(prefills, paged_kv_pool, bufs, b)?;
+
+                let graph_opt = self
+                    .ctx
+                    .stream
+                    .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+                    .map_err(|e| anyhow::anyhow!("end_capture mixed: {e}"))?;
+
+                if let Some(graph) = graph_opt {
+                    graph.launch().map_err(|e| {
+                        anyhow::anyhow!(
+                            "Mixed CUDA Graph first launch (B={}, shape={:?}): {e}",
+                            b,
+                            mixed_graph_key.1
+                        )
+                    })?;
+                    bufs.mixed_graphs.insert(mixed_graph_key.clone(), graph);
+                } else {
+                    self.decode_batch_with_prefills_graph_body(prefills, paged_kv_pool, bufs, b)?;
+                }
+            }
+        } else {
+            self.decode_batch_with_prefills_graph_body(prefills, paged_kv_pool, bufs, b)?;
+        }
+
         // Advance every prefill slot's contiguous-state seq_len by its chunk
         // count; the scheduler already advanced the pool's seq_len via
         // `alloc_tokens` before dispatch.
@@ -820,30 +981,15 @@ impl Qwen3Model {
                 .advance_seq_len(p.tokens.len());
         }
 
-        let hidden = unsafe { &*hidden_ptr };
-        ops::rms_norm_batch_into(&self.ctx, hidden, &self.norm, eps, &mut mixed.normed);
-        ops::gemm_into(
-            &self.ctx,
-            self.output_projection(),
-            &mixed.normed,
-            &mut mixed.logits,
-        );
-
-        {
-            logits_buf.seq_len = b;
-            let src = mixed.logits.data.slice(0..b * logits_buf.hidden_dim);
-            let mut dst = logits_buf.data.slice_mut(0..b * logits_buf.hidden_dim);
-            self.ctx
-                .stream
-                .memcpy_dtod(&src, &mut dst)
-                .map_err(|e| anyhow::anyhow!("D2D mixed decode logits: {e}"))?;
-        }
-
         // Per-prefill logit extraction: each prefill section's last row lands
         // in its own state's `prefill_logits` DeviceVec so the scheduler's
         // `select_token` call sees the right logits. Row index of section i's
         // last token = b + Σ_{j≤i} c_j - 1.
         let mut running_offset = b;
+        let mixed = bufs
+            .mixed
+            .as_mut()
+            .expect("mixed buffers initialized above");
         for p in prefills {
             let c_i = p.tokens.len();
             running_offset += c_i;
@@ -960,11 +1106,17 @@ impl Qwen3Model {
             )?);
         }
 
+        let graphs_enabled = self.supports_cuda_graph_decode();
+        if !graphs_enabled {
+            self.decode_batch_graph_body(bufs, paged_kv_pool, batch_size)?;
+            return Ok(());
+        }
+
         // ── CUDA Graph: capture on first call per batch_size, replay on subsequent ──
         // plan() was called by the scheduler before this method (updates
         // int_workspace). graph_body only does kernel launches — no allocs, no
         // H2D, no CPU memcpy.
-        if let Some(ref graph) = bufs.graph_cache[batch_size - 1] {
+        if let Some(ref graph) = bufs.decode_graphs[batch_size - 1] {
             graph
                 .launch()
                 .map_err(|e| anyhow::anyhow!("CUDA Graph replay (B={}): {e}", batch_size))?;
@@ -991,7 +1143,7 @@ impl Qwen3Model {
                     .launch()
                     .map_err(|e| anyhow::anyhow!("Graph first launch (B={}): {e}", batch_size))?;
                 info!("CUDA Graph captured for batched decode B={}", batch_size);
-                bufs.graph_cache[batch_size - 1] = Some(graph);
+                bufs.decode_graphs[batch_size - 1] = Some(graph);
             } else {
                 // Fallback: capture returned None (shouldn't happen)
                 self.decode_batch_graph_body(bufs, paged_kv_pool, batch_size)?;

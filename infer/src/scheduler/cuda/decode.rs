@@ -4,32 +4,21 @@ use super::{
 };
 use crate::model::PrefillSection;
 use crate::model::kv_cache::KVFormat;
-use crate::scheduler::cuda::core::{PendingDecode, PendingPrefillChunk};
+use crate::model::qwen3::{
+    MIXED_PREFILL_CAP as MODEL_MIXED_PREFILL_CAP, cuda_graph_mixed_num_tokens,
+};
+use crate::scheduler::cuda::core::{
+    PendingDecode, PendingPrefillChunk, PlannedDecodeBatch, PlannedDecodeLaunch,
+    PlannedMixedDecodeBatch, PlannedMixedPrefillChunk,
+};
 
-/// Total mixed-prefill tokens per tick, summed across fused prefill reqs.
-/// Total mixed-prefill tokens per tick, summed across fused prefill reqs.
-/// Held at 64 (= f21d15e baseline's single-req cap) so total qo rows of the
-/// fused kernel don't grow; what changes is how those 64 tokens are
-/// distributed across the queue. K=2 splits 32 tokens per req → 2 reqs
-/// advance per tick instead of 1.
-const MIXED_PREFILL_CAP: usize = 64;
-
-/// Per-req chunk fused into the current mixed tick. Owns the host-side
-/// token slice + page-table scratch so the model-facing
-/// `PrefillSection<'a>` can borrow from it for the duration of the
-/// forward call.
-struct PrefillChunk {
-    req_idx: usize,
-    slot_idx: usize,
-    start_pos: usize,
-    tokens: Vec<u32>,
-    page_table_host: Vec<i32>,
-    completes: bool,
-    /// Number of logical pool tokens this chunk allocated — used to roll
-    /// back via `free_tokens_from_tail` if a later chunk in the same tick
-    /// fails to allocate.
-    alloc_count: usize,
-}
+/// Compile-time ceiling for mixed-path prefill tokens.
+///
+/// The runtime scheduler budget comes from `SchedulerConfig.max_prefill_tokens`;
+/// this constant only guards the model/kernel allocation limit.
+const MIXED_PREFILL_TOKENS_ALLOC_CAP: usize = 64;
+const _: () = assert!(MIXED_PREFILL_TOKENS_ALLOC_CAP == MODEL_MIXED_PREFILL_CAP);
+const MIXED_PREFILL_TOKEN_ALIGN: usize = 16;
 
 /// Per-req chunk plan built before allocation commits. Local to
 /// `step_decode_launch_mixed`; lifted above the function body so the
@@ -42,16 +31,31 @@ struct CandidatePlan {
     tokens: Vec<u32>,
 }
 
-impl<M: ModelForward> Scheduler<M> {
-    pub(super) fn step_decode_launch_mixed(&mut self, prefill_indices: &[usize]) {
-        let decode_indices: Vec<usize> = self
-            .active
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| matches!(r.phase, Phase::Decoding) && !r.delta_tx.is_closed())
-            .map(|(i, _)| i)
-            .collect();
+fn round_up_to_bucket(nt: usize) -> Option<usize> {
+    cuda_graph_mixed_num_tokens()
+        .iter()
+        .copied()
+        .find(|&bucket| bucket >= nt)
+}
 
+fn align_mixed_prefill_chunk_len(requested: usize, available: usize) -> usize {
+    if available == 0 {
+        return 0;
+    }
+    if available < MIXED_PREFILL_TOKEN_ALIGN {
+        return available;
+    }
+    let target = requested.max(MIXED_PREFILL_TOKEN_ALIGN).min(available);
+    let aligned = target - (target % MIXED_PREFILL_TOKEN_ALIGN);
+    if aligned == 0 {
+        MIXED_PREFILL_TOKEN_ALIGN.min(available)
+    } else {
+        aligned
+    }
+}
+
+impl<M: ModelForward> Scheduler<M> {
+    fn finish_closed_decode_requests(&mut self) {
         for i in 0..self.active.len() {
             if matches!(self.active[i].phase, Phase::Decoding)
                 && self.active[i].delta_tx.is_closed()
@@ -59,17 +63,18 @@ impl<M: ModelForward> Scheduler<M> {
                 self.active[i].phase = Phase::Finished;
             }
         }
+    }
 
-        // Zero-decode edge (spec: "mixed path always requires B ≥ 1"): fall
-        // through to the regular decode/prefill path. Same for non-supporting
-        // backends.
-        if decode_indices.is_empty()
-            || !self.model.supports_mixed_batch()
-            || self.paged_kv_pool.format != KVFormat::BF16
-            || prefill_indices.is_empty()
-        {
-            self.step_decode_launch();
-            return;
+    fn collect_decode_batch_inputs(&mut self) -> Option<(Vec<usize>, Vec<u32>)> {
+        let decode_indices: Vec<usize> = self
+            .active
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r.phase, Phase::Decoding) && !r.delta_tx.is_closed())
+            .map(|(i, _)| i)
+            .collect();
+        if decode_indices.is_empty() {
+            return None;
         }
 
         let mut token_ids: Vec<u32> = Vec::with_capacity(decode_indices.len());
@@ -86,539 +91,394 @@ impl<M: ModelForward> Scheduler<M> {
                 self.active[i].phase = Phase::Finished;
             }
         }
-        let mut decode_indices = valid_decode_indices;
-        if decode_indices.is_empty() {
+        if valid_decode_indices.is_empty() {
+            None
+        } else {
+            Some((valid_decode_indices, token_ids))
+        }
+    }
+
+    fn preempt_decode_victim(
+        &mut self,
+        decode_indices: &mut Vec<usize>,
+        token_ids: &mut Vec<u32>,
+        reason: &str,
+    ) -> bool {
+        let Some(victim_pos) = decode_indices
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, i)| {
+                let r = &self.active[**i];
+                (
+                    r.generated_tokens.len() as i64,
+                    -(r.prompt_tokens.len() as i64),
+                )
+            })
+            .map(|(pos, _)| pos)
+        else {
+            return false;
+        };
+        let victim_idx = decode_indices[victim_pos];
+        let victim = &mut self.active[victim_idx];
+        let victim_slot = victim.slot_idx;
+        warn!(
+            "Request {}: preempting (recompute) {} — {} generated tokens, pool free={}",
+            victim.id,
+            reason,
+            victim.generated_tokens.len(),
+            self.paged_kv_pool.free_count()
+        );
+
+        self.paged_kv_pool.free_slot(victim_slot);
+        if let Err(e) = self.states[victim_slot].reset() {
+            error!(
+                "Request {}: slot reset after preempt failed: {}",
+                victim.id, e
+            );
+        }
+        self.slot_materialized_prompt_lens[victim_slot] = 0;
+
+        let requeue = IncomingRequest {
+            prompt: std::mem::take(&mut victim.prompt),
+            max_tokens: victim.max_tokens,
+            sampling: victim.sampling.clone(),
+            stop: victim.stop.take(),
+            priority: RequestPriority::Normal,
+            session_id: victim.session_id.clone(),
+            delta_tx: victim.delta_tx.clone(),
+        };
+        victim.phase = Phase::Finished;
+        let _ = victim;
+        self.clear_slot_prefix_ownership(victim_slot);
+
+        decode_indices.remove(victim_pos);
+        token_ids.remove(victim_pos);
+        self.waiting.push_front(requeue);
+        true
+    }
+
+    fn build_plain_decode_plan(&mut self) -> Option<PlannedDecodeBatch> {
+        self.finish_closed_decode_requests();
+        let (mut decode_indices, mut token_ids) = self.collect_decode_batch_inputs()?;
+
+        while !decode_indices.is_empty() {
+            let decode_slot_indices: Vec<usize> = decode_indices
+                .iter()
+                .map(|&i| self.active[i].slot_idx)
+                .collect();
+            let decode_appends: Vec<(usize, usize)> = decode_slot_indices
+                .iter()
+                .map(|&slot| (slot, 1usize))
+                .collect();
+            let (required_tokens, required_pages) = self.pool_append_requirements(&decode_appends);
+            while self.paged_kv_pool.is_active()
+                && (self.paged_kv_pool.free_count() < required_tokens
+                    || self.paged_kv_pool.free_page_count() < required_pages)
+                && decode_indices.len() > 1
+            {
+                if !self.preempt_decode_victim(
+                    &mut decode_indices,
+                    &mut token_ids,
+                    "for decode batch",
+                ) {
+                    break;
+                }
+            }
+            if decode_indices.is_empty() {
+                return None;
+            }
+
+            let slot_indices = decode_slot_indices;
+            match self.plan_pool_capacity(required_tokens, required_pages, &slot_indices) {
+                Ok(pool_plan) => {
+                    let sampling_params_greedy = decode_indices
+                        .iter()
+                        .map(|&i| {
+                            let p = &self.active[i].sampling;
+                            p.is_greedy() && !p.has_penalties()
+                        })
+                        .collect();
+                    return Some(PlannedDecodeBatch {
+                        decode_indices,
+                        token_ids,
+                        slot_indices,
+                        sampling_params_greedy,
+                        pool_plan,
+                    });
+                }
+                Err(e) if decode_indices.len() > 1 => {
+                    warn!(
+                        "Decode plan: trimming one decode after pool planning failed: {}",
+                        e
+                    );
+                    self.preempt_decode_victim(
+                        &mut decode_indices,
+                        &mut token_ids,
+                        "for decode plan",
+                    );
+                }
+                Err(e) => {
+                    warn!("Decode plan deferred this tick: {}", e);
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    fn pad_mixed_candidates_to_bucket(&self, candidates: &mut [CandidatePlan]) {
+        let current_total: usize = candidates.iter().map(|cand| cand.tokens.len()).sum();
+        let Some(target_total) = round_up_to_bucket(current_total) else {
+            return;
+        };
+        if target_total <= current_total {
             return;
         }
 
-        // --- Build PrefillChunks ---
-        //
-        // Per-req budget: max(16, (MIXED_PREFILL_CAP / K)) rounded down to a
-        // multiple of 16, clipped to remaining. Only reqs that are actually in
-        // `Phase::Prefilling` with remaining work are folded in. If none of
-        // the candidate prefill reqs have remaining work, fall through to the
-        // plain decode path.
-        let k = prefill_indices
-            .len()
-            .clamp(1, self.config.mixed_prefill_max_reqs);
-        let base_per_req = (MIXED_PREFILL_CAP / k).max(16);
-        let base_per_req = base_per_req - (base_per_req % 16).min(base_per_req); // round down to 16
-        let base_per_req = if base_per_req == 0 { 16 } else { base_per_req };
-
-        let mut candidates: Vec<CandidatePlan> = Vec::with_capacity(prefill_indices.len());
-        let mut chunks_budget_used: usize = 0;
-        for &pi in prefill_indices {
-            if chunks_budget_used >= MIXED_PREFILL_CAP {
+        let mut remaining = target_total - current_total;
+        for cand in candidates.iter_mut().rev() {
+            let Phase::Prefilling {
+                effective_tokens, ..
+            } = &self.active[cand.req_idx].phase
+            else {
+                continue;
+            };
+            let current_end = cand.start_pos + cand.tokens.len();
+            if current_end >= effective_tokens.len() {
+                continue;
+            }
+            let extend_by = remaining.min(effective_tokens.len() - current_end);
+            cand.tokens
+                .extend_from_slice(&effective_tokens[current_end..current_end + extend_by]);
+            remaining -= extend_by;
+            if remaining == 0 {
                 break;
             }
-            let slot_idx = self.active[pi].slot_idx;
-            let (total, progress, effective_len) = match &self.active[pi].phase {
-                Phase::Prefilling {
-                    effective_tokens,
-                    progress,
-                } if !self.active[pi].delta_tx.is_closed() => {
-                    let pool_seq = self.paged_kv_pool.seq_len(slot_idx);
-                    if *progress >= effective_tokens.len() || pool_seq != *progress {
-                        continue;
+        }
+    }
+
+    fn mixed_prefill_budget_tokens(&self) -> usize {
+        self.config
+            .max_prefill_tokens
+            .min(MIXED_PREFILL_TOKENS_ALLOC_CAP)
+    }
+
+    fn build_mixed_prefill_candidates(&self, prefill_indices: &[usize]) -> Vec<CandidatePlan> {
+        let mut candidates = Vec::with_capacity(prefill_indices.len());
+        let mut remaining_budget = self.mixed_prefill_budget_tokens();
+        let eligible: Vec<(usize, usize, usize, usize)> = prefill_indices
+            .iter()
+            .copied()
+            .filter_map(|req_idx| {
+                let slot_idx = self.active[req_idx].slot_idx;
+                match &self.active[req_idx].phase {
+                    Phase::Prefilling {
+                        effective_tokens,
+                        progress,
+                    } if !self.active[req_idx].delta_tx.is_closed() => {
+                        let pool_seq = self.paged_kv_pool.seq_len(slot_idx);
+                        if *progress >= effective_tokens.len() || pool_seq != *progress {
+                            return None;
+                        }
+                        Some((req_idx, slot_idx, *progress, effective_tokens.len()))
                     }
-                    (effective_tokens.len(), *progress, effective_tokens.len())
+                    _ => None,
                 }
-                _ => continue,
-            };
+            })
+            .take(self.config.prefill_max_requests)
+            .collect();
+
+        for (ordinal, &(req_idx, slot_idx, progress, total)) in eligible.iter().enumerate() {
+            if remaining_budget == 0 {
+                break;
+            }
             let remaining = total.saturating_sub(progress);
             if remaining == 0 {
                 continue;
             }
-            let per_req_cap = base_per_req.min(MIXED_PREFILL_CAP - chunks_budget_used);
-            let chunk_count = per_req_cap.min(remaining).max(1);
-            let end = progress + chunk_count;
-            let tokens = match &self.active[pi].phase {
+
+            let candidates_left = eligible.len().saturating_sub(ordinal).max(1);
+            let fair_share = remaining_budget / candidates_left;
+            let chunk_len =
+                align_mixed_prefill_chunk_len(fair_share.max(1), remaining.min(remaining_budget));
+            if chunk_len == 0 {
+                continue;
+            }
+
+            let tokens = match &self.active[req_idx].phase {
                 Phase::Prefilling {
                     effective_tokens, ..
-                } => effective_tokens[progress..end.min(effective_len)].to_vec(),
+                } => effective_tokens[progress..progress + chunk_len].to_vec(),
                 _ => continue,
             };
             if tokens.is_empty() {
                 continue;
             }
-            chunks_budget_used += tokens.len();
+
+            remaining_budget = remaining_budget.saturating_sub(tokens.len());
             candidates.push(CandidatePlan {
-                req_idx: pi,
+                req_idx,
                 slot_idx,
                 start_pos: progress,
                 total,
                 tokens,
             });
-            if candidates.len() >= self.config.mixed_prefill_max_reqs {
-                break;
-            }
         }
-        if candidates.is_empty() {
-            self.step_decode_launch();
-            return;
-        }
+        candidates
+    }
 
-        // Preempt long-running decoders if pool can't fit the mixed batch.
-        let prefill_token_total: usize = candidates.iter().map(|c| c.tokens.len()).sum();
-        while self.paged_kv_pool.is_active()
-            && self.paged_kv_pool.free_count() < decode_indices.len() + prefill_token_total
-            && decode_indices.len() > 1
+    pub(super) fn step_decode_launch_mixed(&mut self, prefill_indices: &[usize]) {
+        let plan = self.build_mixed_decode_plan(prefill_indices);
+        match plan {
+            Some(PlannedDecodeLaunch::Plain(plan)) => self.execute_plain_decode_launch(plan),
+            Some(PlannedDecodeLaunch::Mixed(plan)) => self.execute_mixed_decode_launch(plan),
+            None => {}
+        }
+    }
+
+    fn build_mixed_decode_plan(
+        &mut self,
+        prefill_indices: &[usize],
+    ) -> Option<PlannedDecodeLaunch> {
+        self.finish_closed_decode_requests();
+        let Some((decode_indices, token_ids)) = self.collect_decode_batch_inputs() else {
+            return None;
+        };
+
+        // Zero-decode edge (spec: "mixed path always requires B ≥ 1"): fall
+        // through to the regular decode/prefill path. Same for non-supporting
+        // backends.
+        if !self.config.enable_mixed_chunk
+            || !self.model.supports_mixed_batch()
+            || self.paged_kv_pool.format != KVFormat::BF16
+            || prefill_indices.is_empty()
         {
-            // sglang-parity victim ranking (`ScheduleBatch.retract_decode`):
-            // prefer the request with the most OUTPUT tokens AND the shortest
-            // INPUT tokens — i.e. the cheapest to re-prefill. Previous
-            // single-key ranking only considered output length, so we kept
-            // preempting the 4 k-prompt reqs that cost 4 k tokens of re-prefill
-            // each cycle under memory pressure.
-            let victim_pos = decode_indices
+            return self
+                .build_plain_decode_plan()
+                .map(PlannedDecodeLaunch::Plain);
+        }
+
+        // Decode-first mixed scheduling: decode rows are always planned first,
+        // and prefills only consume the residual mixed-token budget for this tick.
+        let mut candidates = self.build_mixed_prefill_candidates(prefill_indices);
+        if candidates.is_empty() {
+            return self
+                .build_plain_decode_plan()
+                .map(PlannedDecodeLaunch::Plain);
+        }
+        // Pad toward the canonical mixed graph buckets using real prompt
+        // tokens. If a request cannot absorb the extra rows this tick we keep
+        // the exact shape and let the model cache it separately.
+        self.pad_mixed_candidates_to_bucket(&mut candidates);
+
+        loop {
+            let decode_slot_indices: Vec<usize> = decode_indices
                 .iter()
-                .enumerate()
-                .max_by_key(|(_, i)| {
-                    let r = &self.active[**i];
-                    (
-                        r.generated_tokens.len() as i64,
-                        -(r.prompt_tokens.len() as i64),
-                    )
-                })
-                .map(|(pos, _)| pos)
-                .unwrap();
-            let victim_idx = decode_indices[victim_pos];
-            let victim = &mut self.active[victim_idx];
-            let victim_slot = victim.slot_idx;
-            warn!(
-                "Request {}: preempting (recompute) for mixed batch — {} generated tokens, pool free={}",
-                victim.id,
-                victim.generated_tokens.len(),
-                self.paged_kv_pool.free_count()
+                .map(|&i| self.active[i].slot_idx)
+                .collect();
+            let mut mixed_appends: Vec<(usize, usize)> = decode_slot_indices
+                .iter()
+                .map(|&slot| (slot, 1usize))
+                .collect();
+            mixed_appends.extend(
+                candidates
+                    .iter()
+                    .map(|cand| (cand.slot_idx, cand.tokens.len())),
             );
-
-            self.paged_kv_pool.free_slot(victim_slot);
-            if let Err(e) = self.states[victim_slot].reset() {
-                error!(
-                    "Request {}: slot reset after preempt failed: {}",
-                    victim.id, e
-                );
+            let (required_tokens, required_pages) = self.pool_append_requirements(&mixed_appends);
+            if candidates.is_empty() {
+                return self
+                    .build_plain_decode_plan()
+                    .map(PlannedDecodeLaunch::Plain);
             }
-            self.slot_materialized_prompt_lens[victim_slot] = 0;
 
-            let requeue = IncomingRequest {
-                prompt: std::mem::take(&mut victim.prompt),
-                max_tokens: victim.max_tokens,
-                sampling: victim.sampling.clone(),
-                stop: victim.stop.take(),
-                priority: RequestPriority::Normal,
-                session_id: victim.session_id.clone(),
-                delta_tx: victim.delta_tx.clone(),
-            };
-            victim.phase = Phase::Finished;
-            let _ = victim;
-            self.clear_slot_prefix_ownership(victim_slot);
-
-            decode_indices.remove(victim_pos);
-            token_ids.remove(victim_pos);
-            self.waiting.push_front(requeue);
-        }
-
-        // Allocate one pool token per remaining decode request.
-        let mut alloc_ok_indices: Vec<usize> = Vec::with_capacity(decode_indices.len());
-        let mut alloc_ok_tokens: Vec<u32> = Vec::with_capacity(decode_indices.len());
-        for (j, &i) in decode_indices.iter().enumerate() {
-            // L1 retract regression guard (codex review 2026-04-19): if
-            // `alloc_pool_tokens_with_retry` retracted this slot (or a
-            // sibling we were about to decode) to free pool pages, its
-            // phase has flipped to Finished. Skip it so the decode
-            // dispatch doesn't sample a token for a just-retracted slot;
-            // cleanup() will reap it next tick.
-            if matches!(self.active[i].phase, Phase::Finished) {
-                continue;
-            }
-            let slot = self.active[i].slot_idx;
-            if let Err(e) = self.alloc_pool_tokens_with_retry(slot, 1) {
-                error!(
-                    "Request {}: KV pool exhausted after preemption (slot {}): {} — finishing",
-                    self.active[i].id, slot, e
-                );
-                self.active[i].finish(FinishReason::Length, &self.tokenizer);
-                continue;
-            }
-            if matches!(self.active[i].phase, Phase::Finished) {
-                continue;
-            }
-            alloc_ok_indices.push(i);
-            alloc_ok_tokens.push(token_ids[j]);
-        }
-        let decode_indices = alloc_ok_indices;
-        let token_ids = alloc_ok_tokens;
-        if decode_indices.is_empty() {
-            // Roll back any in-flight prefill allocations (none yet at this
-            // point — we haven't alloc'd for prefill — just bail).
-            return;
-        }
-
-        // --- Allocate each prefill chunk's pool tokens, rolling back on OOM ---
-        //
-        // Spec: "Per-prefill `alloc_tokens` may OOM after earlier ones succeed
-        // → ROLLBACK: `free_tokens_from_tail` on each already-allocated, drop
-        // just that req from this tick, log warn, continue."
-        let mut chunks: Vec<PrefillChunk> = Vec::with_capacity(candidates.len());
-        for cand in candidates {
-            match self
-                .paged_kv_pool
-                .alloc_tokens(cand.slot_idx, cand.tokens.len())
-            {
-                Ok(_pages) => {
-                    let page_table_host: Vec<i32> = self
-                        .paged_kv_pool
-                        .page_indices(cand.slot_idx)
+            let mut protected_slots = decode_slot_indices.clone();
+            protected_slots.extend(candidates.iter().map(|cand| cand.slot_idx));
+            match self.plan_pool_capacity_without_retract(
+                required_tokens,
+                required_pages,
+                &protected_slots,
+            ) {
+                Ok(pool_plan) => {
+                    let sampling_params_greedy = decode_indices
                         .iter()
-                        .map(|&idx| idx as i32)
+                        .map(|&i| {
+                            let p = &self.active[i].sampling;
+                            p.is_greedy() && !p.has_penalties()
+                        })
                         .collect();
-                    let completes = cand.start_pos + cand.tokens.len() >= cand.total;
-                    chunks.push(PrefillChunk {
-                        req_idx: cand.req_idx,
-                        slot_idx: cand.slot_idx,
-                        start_pos: cand.start_pos,
-                        tokens: cand.tokens,
-                        page_table_host,
-                        completes,
-                        alloc_count: 0, // set below once committed
-                    });
-                    // Stamp alloc_count now that the push succeeded.
-                    let last = chunks.last_mut().unwrap();
-                    last.alloc_count = last.tokens.len();
+                    let prefills = candidates
+                        .into_iter()
+                        .map(|cand| PlannedMixedPrefillChunk {
+                            req_idx: cand.req_idx,
+                            slot_idx: cand.slot_idx,
+                            start_pos: cand.start_pos,
+                            completes: cand.start_pos + cand.tokens.len() >= cand.total,
+                            tokens: cand.tokens,
+                        })
+                        .collect();
+                    return Some(PlannedDecodeLaunch::Mixed(PlannedMixedDecodeBatch {
+                        decode: PlannedDecodeBatch {
+                            decode_indices,
+                            token_ids,
+                            slot_indices: decode_slot_indices,
+                            sampling_params_greedy,
+                            pool_plan,
+                        },
+                        prefill_chunks: prefills,
+                    }));
+                }
+                Err(e) if candidates.len() > 1 => {
+                    let dropped = candidates.pop().expect("checked len > 1");
+                    warn!(
+                        "Mixed decode plan: dropping req {} from this tick after non-retract pool planning failed: {}",
+                        self.active[dropped.req_idx].id, e
+                    );
                 }
                 Err(e) => {
                     warn!(
-                        "Mixed prefill: dropping req {} this tick (slot {}, alloc_tokens({}) failed: {})",
-                        self.active[cand.req_idx].id,
-                        cand.slot_idx,
-                        cand.tokens.len(),
+                        "Mixed decode plan falling back to plain decode after non-retract pool planning failed: {}",
                         e
                     );
-                    // The failing req is simply skipped — its start_pos
-                    // advances 0 this tick, scheduler retries next tick.
-                    // Already-allocated earlier chunks stay allocated
-                    // since they will participate in this tick's forward.
+                    return self
+                        .build_plain_decode_plan()
+                        .map(PlannedDecodeLaunch::Plain);
                 }
             }
         }
-        if chunks.is_empty() {
-            // Every prefill candidate failed alloc; fall back to plain decode.
-            self.step_decode_launch();
-            return;
-        }
-
-        let slot_indices: Vec<usize> = decode_indices
-            .iter()
-            .map(|&i| self.active[i].slot_idx)
-            .collect();
-        let sampling_params_greedy: Vec<bool> = decode_indices
-            .iter()
-            .map(|&i| {
-                let p = &self.active[i].sampling;
-                p.is_greedy() && !p.has_penalties()
-            })
-            .collect();
-        let all_greedy = sampling_params_greedy.iter().all(|&g| g);
-
-        if self.decode_bufs.is_none() {
-            match self
-                .model
-                .create_decode_context(self.states.len(), &self.paged_kv_pool)
-            {
-                Ok(ctx) => self.decode_bufs = Some(ctx),
-                Err(e) => {
-                    error!("Failed to create decode context: {}", e);
-                    for &i in &decode_indices {
-                        self.active[i].phase = Phase::Finished;
-                    }
-                    // Roll back prefill allocations made above.
-                    for chunk in &chunks {
-                        self.paged_kv_pool
-                            .free_tokens_from_tail(chunk.slot_idx, chunk.alloc_count);
-                    }
-                    return;
-                }
-            }
-        }
-        let decode_ctx = self.decode_bufs.as_mut().unwrap();
-
-        // Build borrowed PrefillSections for the model API.
-        let prefill_sections: Vec<PrefillSection<'_>> = chunks
-            .iter()
-            .map(|c| PrefillSection {
-                slot_idx: c.slot_idx,
-                start_pos: c.start_pos,
-                tokens: c.tokens.as_slice(),
-                page_table_host: c.page_table_host.as_slice(),
-            })
-            .collect();
-
-        let forward_result = self.model.forward_mixed_batch(
-            &token_ids,
-            &prefill_sections,
-            &mut self.states,
-            &slot_indices,
-            Some(&mut self.paged_kv_pool),
-            decode_ctx,
-        );
-        drop(prefill_sections);
-
-        let mixed_ok = match forward_result {
-            Ok(true) => {
-                info!(
-                    "Mixed batch: B={} decode + N={} prefill (Σc={})",
-                    token_ids.len(),
-                    chunks.len(),
-                    chunks.iter().map(|c| c.tokens.len()).sum::<usize>(),
-                );
-                true
-            }
-            Ok(false) => {
-                info!("Mixed batch: fallback (Ok(false))");
-                // Roll back prefill allocations so next tick sees a clean pool.
-                for chunk in &chunks {
-                    self.paged_kv_pool
-                        .free_tokens_from_tail(chunk.slot_idx, chunk.alloc_count);
-                }
-                self.step_decode_launch();
-                return;
-            }
-            Err(e) => {
-                error!("Mixed batched decode failed, falling back: {}", e);
-                for chunk in &chunks {
-                    self.paged_kv_pool
-                        .free_tokens_from_tail(chunk.slot_idx, chunk.alloc_count);
-                }
-                self.step_decode_launch();
-                return;
-            }
-        };
-        debug_assert!(mixed_ok);
-
-        let greedy_launched = if all_greedy {
-            match self
-                .model
-                .sample_batch_greedy_launch(&slot_indices, decode_ctx)
-            {
-                Ok(true) => true,
-                Ok(false) => {
-                    if let Err(e) = self.model.prepare_batch_sampling_fallback(
-                        &mut self.states,
-                        &slot_indices,
-                        decode_ctx,
-                    ) {
-                        error!("Preparing batched sampling fallback failed: {}", e);
-                        for &req_idx in &decode_indices {
-                            self.active[req_idx].phase = Phase::Finished;
-                        }
-                        return;
-                    }
-                    false
-                }
-                Err(e) => {
-                    error!("Batched greedy sampling launch failed: {}", e);
-                    for &req_idx in &decode_indices {
-                        self.active[req_idx].phase = Phase::Finished;
-                    }
-                    return;
-                }
-            }
-        } else {
-            false
-        };
-
-        // Advance scheduler-side prefill progress and build the PendingPrefillChunk
-        // list. `logit_row` matches the model's per-prefill extraction:
-        // row = b + Σ_{j≤i} c_j - 1.
-        let b = decode_indices.len();
-        let mut running = b;
-        let mut mixed_prefill_chunks: Vec<PendingPrefillChunk> = Vec::with_capacity(chunks.len());
-        let mut fused_req_idxs: Vec<usize> = Vec::with_capacity(chunks.len());
-        for chunk in &chunks {
-            let c_i = chunk.tokens.len();
-            running += c_i;
-            let logit_row = running - 1;
-            let new_progress = chunk.start_pos + c_i;
-            if let Phase::Prefilling { progress, .. } = &mut self.active[chunk.req_idx].phase {
-                *progress = new_progress;
-            }
-            mixed_prefill_chunks.push(PendingPrefillChunk {
-                req_idx: chunk.req_idx,
-                completes: chunk.completes,
-                logit_row,
-            });
-            fused_req_idxs.push(chunk.req_idx);
-        }
-
-        self.pending_mixed_prefill_idxs = fused_req_idxs;
-        self.pending_decode = Some(PendingDecode {
-            decode_indices,
-            slot_indices,
-            greedy_launched,
-            sampling_params_greedy,
-            mixed_prefill_chunks,
-        });
     }
 
     /// Batch all decode requests into a single GPU forward pass.
     pub(super) fn step_decode_launch(&mut self) {
-        let decode_indices: Vec<usize> = self
-            .active
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| matches!(r.phase, Phase::Decoding) && !r.delta_tx.is_closed())
-            .map(|(i, _)| i)
-            .collect();
-
-        for i in 0..self.active.len() {
-            if matches!(self.active[i].phase, Phase::Decoding)
-                && self.active[i].delta_tx.is_closed()
-            {
-                self.active[i].phase = Phase::Finished;
-            }
-        }
-
-        if decode_indices.is_empty() {
+        let Some(plan) = self.build_plain_decode_plan() else {
             return;
-        }
+        };
+        self.execute_plain_decode_launch(plan);
+    }
 
-        let mut token_ids: Vec<u32> = Vec::with_capacity(decode_indices.len());
-        let mut valid_decode_indices: Vec<usize> = Vec::with_capacity(decode_indices.len());
-        for &i in &decode_indices {
-            if let Some(&tok) = self.active[i].generated_tokens.last() {
-                token_ids.push(tok);
-                valid_decode_indices.push(i);
-            } else {
+    fn execute_plain_decode_launch(&mut self, plan: PlannedDecodeBatch) {
+        let PlannedDecodeBatch {
+            decode_indices,
+            token_ids,
+            slot_indices,
+            sampling_params_greedy,
+            pool_plan,
+        } = plan;
+        let mut allocated_decode_slots = Vec::with_capacity(slot_indices.len());
+        for &slot in &slot_indices {
+            if let Err(e) = self.paged_kv_pool.alloc_tokens(slot, 1) {
+                for &allocated_slot in &allocated_decode_slots {
+                    self.paged_kv_pool.free_tokens_from_tail(allocated_slot, 1);
+                }
                 error!(
-                    "Request {}: Decoding state with no generated tokens - dropping",
-                    self.active[i].id
+                    "Decode plan allocation drifted after planning (slot {}, need_tokens={}, need_pages={}): {}",
+                    slot, pool_plan.required_tokens, pool_plan.required_pages, e
                 );
-                self.active[i].phase = Phase::Finished;
+                return;
             }
+            allocated_decode_slots.push(slot);
         }
-        let mut decode_indices = valid_decode_indices;
-        if decode_indices.is_empty() {
-            return;
-        }
-        // Preemption: if pool can't fit all decode requests, preempt the
-        // request with the most generated tokens (highest KV cost, preserves
-        // shorter conversations that are closer to completion).
-        // Recompute mode: preempted request is re-queued and re-prefilled
-        // when GPU memory frees up.
-        while self.paged_kv_pool.is_active()
-            && self.paged_kv_pool.free_count() < decode_indices.len()
-            && decode_indices.len() > 1
-        {
-            // Pick victim: sglang-parity `retract_decode` ranking. Prefer the
-            // request with the most output tokens AND the shortest input
-            // tokens — cheapest to re-prefill when it resumes. Previous
-            // single-key ranking only considered output length, repeatedly
-            // preempting the 4 k-prompt reqs and paying 4 k of re-prefill on
-            // each cycle under pool pressure.
-            let victim_pos = decode_indices
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, i)| {
-                    let r = &self.active[**i];
-                    (
-                        r.generated_tokens.len() as i64,
-                        -(r.prompt_tokens.len() as i64),
-                    )
-                })
-                .map(|(pos, _)| pos)
-                .unwrap();
-            let victim_idx = decode_indices[victim_pos];
-            let victim = &mut self.active[victim_idx];
-            let victim_slot = victim.slot_idx;
-            warn!(
-                "Request {}: preempting (recompute) — {} generated tokens, pool free={}",
-                victim.id,
-                victim.generated_tokens.len(),
-                self.paged_kv_pool.free_count()
-            );
-
-            // Free victim's paged pool tokens and reset slot state
-            self.paged_kv_pool.free_slot(victim_slot);
-            if let Err(e) = self.states[victim_slot].reset() {
-                error!(
-                    "Request {}: slot reset after preempt failed: {}",
-                    victim.id, e
-                );
-            }
-            self.slot_materialized_prompt_lens[victim_slot] = 0;
-
-            // Re-queue as waiting (will be re-prefilled when re-admitted).
-            // NOTE: preempted request loses generated tokens (recompute mode).
-            // The prompt is re-tokenized on re-admission via assign_slots().
-            let requeue = IncomingRequest {
-                prompt: std::mem::take(&mut victim.prompt),
-                max_tokens: victim.max_tokens,
-                sampling: victim.sampling.clone(),
-                stop: victim.stop.take(),
-                priority: RequestPriority::Normal,
-                session_id: victim.session_id.clone(),
-                delta_tx: victim.delta_tx.clone(),
-            };
-            victim.phase = Phase::Finished;
-            let _ = victim;
-            self.clear_slot_prefix_ownership(victim_slot);
-
-            // Remove from decode batch
-            decode_indices.remove(victim_pos);
-            token_ids.remove(victim_pos);
-
-            // Push to front of waiting queue (priority re-admission)
-            self.waiting.push_front(requeue);
-        }
-
-        // Allocate one pool token per remaining decode request.
-        let mut alloc_ok_indices: Vec<usize> = Vec::with_capacity(decode_indices.len());
-        let mut alloc_ok_tokens: Vec<u32> = Vec::with_capacity(decode_indices.len());
-        for (j, &i) in decode_indices.iter().enumerate() {
-            // L1 retract regression guard (codex review 2026-04-19): if
-            // `alloc_pool_tokens_with_retry` retracted this slot (or a
-            // sibling we were about to decode) to free pool pages, its
-            // phase has flipped to Finished. Skip it so the decode
-            // dispatch doesn't sample a token for a just-retracted slot;
-            // cleanup() will reap it next tick.
-            if matches!(self.active[i].phase, Phase::Finished) {
-                continue;
-            }
-            let slot = self.active[i].slot_idx;
-            if let Err(e) = self.alloc_pool_tokens_with_retry(slot, 1) {
-                error!(
-                    "Request {}: KV pool exhausted after preemption (slot {}): {} — finishing",
-                    self.active[i].id, slot, e
-                );
-                self.active[i].finish(FinishReason::Length, &self.tokenizer);
-                continue;
-            }
-            if matches!(self.active[i].phase, Phase::Finished) {
-                // Retry succeeded but this index was retracted as the
-                // victim to satisfy its own request's shortfall.
-                continue;
-            }
-            alloc_ok_indices.push(i);
-            alloc_ok_tokens.push(token_ids[j]);
-        }
-        let decode_indices = alloc_ok_indices;
-        let token_ids = alloc_ok_tokens;
-        if decode_indices.is_empty() {
-            return;
-        }
-        let slot_indices: Vec<usize> = decode_indices
-            .iter()
-            .map(|&i| self.active[i].slot_idx)
-            .collect();
-
-        let sampling_params: Vec<&crate::sampler::SamplingParams> = decode_indices
-            .iter()
-            .map(|&i| &self.active[i].sampling)
-            .collect();
-        let all_greedy = sampling_params
-            .iter()
-            .all(|p| p.is_greedy() && !p.has_penalties());
+        let all_greedy = sampling_params_greedy.iter().all(|&g| g);
 
         // Lazy-init decode context on first batched decode.
         if self.decode_bufs.is_none() {
@@ -629,6 +489,9 @@ impl<M: ModelForward> Scheduler<M> {
                 Ok(ctx) => self.decode_bufs = Some(ctx),
                 Err(e) => {
                     error!("Failed to create decode context: {}", e);
+                    for &slot in &allocated_decode_slots {
+                        self.paged_kv_pool.free_tokens_from_tail(slot, 1);
+                    }
                     for &i in &decode_indices {
                         self.active[i].phase = Phase::Finished;
                     }
@@ -647,6 +510,9 @@ impl<M: ModelForward> Scheduler<M> {
             decode_ctx.set_batch_size(token_ids.len());
             if let Err(e) = decode_ctx.upload_token_ids(ctx, &token_ids) {
                 error!("Pre-decode upload_token_ids failed: {}", e);
+                for &slot in &allocated_decode_slots {
+                    self.paged_kv_pool.free_tokens_from_tail(slot, 1);
+                }
                 for &i in &decode_indices {
                     self.active[i].phase = Phase::Finished;
                 }
@@ -660,6 +526,9 @@ impl<M: ModelForward> Scheduler<M> {
                 }
                 Err(e) => {
                     error!("Pre-decode update_metadata failed: {}", e);
+                    for &slot in &allocated_decode_slots {
+                        self.paged_kv_pool.free_tokens_from_tail(slot, 1);
+                    }
                     for &i in &decode_indices {
                         self.active[i].phase = Phase::Finished;
                     }
@@ -676,6 +545,9 @@ impl<M: ModelForward> Scheduler<M> {
                 self.paged_kv_pool.format,
             ) {
                 error!("Pre-decode plan_attention failed: {}", e);
+                for &slot in &allocated_decode_slots {
+                    self.paged_kv_pool.free_tokens_from_tail(slot, 1);
+                }
                 for &i in &decode_indices {
                     self.active[i].phase = Phase::Finished;
                 }
@@ -683,10 +555,8 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
 
-        // TODO(mixed-batch): probe `forward_mixed_batch(...)` here once a model
-        // implementation overrides the default `Ok(false)` path with a validated
-        // eager mixed decode+prefill forward. Keep the existing decode-only path
-        // unchanged until the model-side paged prefill prep is wired safely.
+        // Plain decode-only launch. Mixed decode+prefill has its own
+        // planning/execution path in `execute_mixed_decode_launch()`.
         let forward_result = self.model.forward_decode_batch(
             &token_ids,
             &mut self.states,
@@ -740,11 +610,218 @@ impl<M: ModelForward> Scheduler<M> {
             decode_indices,
             slot_indices,
             greedy_launched,
-            sampling_params_greedy: sampling_params
-                .iter()
-                .map(|p| p.is_greedy() && !p.has_penalties())
-                .collect(),
+            sampling_params_greedy,
             mixed_prefill_chunks: Vec::new(),
+        });
+    }
+
+    fn execute_mixed_decode_launch(&mut self, plan: PlannedMixedDecodeBatch) {
+        let PlannedMixedDecodeBatch {
+            decode,
+            prefill_chunks,
+        } = plan;
+        let PlannedDecodeBatch {
+            decode_indices,
+            token_ids,
+            slot_indices,
+            sampling_params_greedy,
+            pool_plan,
+        } = decode;
+        let all_greedy = sampling_params_greedy.iter().all(|&g| g);
+
+        let mut allocated_decode_slots = Vec::with_capacity(slot_indices.len());
+        for &slot in &slot_indices {
+            if let Err(e) = self.paged_kv_pool.alloc_tokens(slot, 1) {
+                for &allocated_slot in &allocated_decode_slots {
+                    self.paged_kv_pool.free_tokens_from_tail(allocated_slot, 1);
+                }
+                error!(
+                    "Mixed decode plan allocation drifted after planning (decode slot {}, need_tokens={}, need_pages={}): {}",
+                    slot, pool_plan.required_tokens, pool_plan.required_pages, e
+                );
+                return;
+            }
+            allocated_decode_slots.push(slot);
+        }
+
+        let mut allocated_prefills: Vec<(usize, usize)> = Vec::with_capacity(prefill_chunks.len());
+        for chunk in &prefill_chunks {
+            if let Err(e) = self
+                .paged_kv_pool
+                .alloc_tokens(chunk.slot_idx, chunk.tokens.len())
+            {
+                for &(slot, count) in allocated_prefills.iter().rev() {
+                    self.paged_kv_pool.free_tokens_from_tail(slot, count);
+                }
+                for &slot in &allocated_decode_slots {
+                    self.paged_kv_pool.free_tokens_from_tail(slot, 1);
+                }
+                error!(
+                    "Mixed decode prefill allocation drifted after planning (slot {}, len={}, need_tokens={}, need_pages={}): {}",
+                    chunk.slot_idx,
+                    chunk.tokens.len(),
+                    pool_plan.required_tokens,
+                    pool_plan.required_pages,
+                    e
+                );
+                return;
+            }
+            allocated_prefills.push((chunk.slot_idx, chunk.tokens.len()));
+        }
+
+        if self.decode_bufs.is_none() {
+            match self
+                .model
+                .create_decode_context(self.states.len(), &self.paged_kv_pool)
+            {
+                Ok(ctx) => self.decode_bufs = Some(ctx),
+                Err(e) => {
+                    error!("Failed to create decode context: {}", e);
+                    for &(slot, count) in allocated_prefills.iter().rev() {
+                        self.paged_kv_pool.free_tokens_from_tail(slot, count);
+                    }
+                    for &slot in &allocated_decode_slots {
+                        self.paged_kv_pool.free_tokens_from_tail(slot, 1);
+                    }
+                    for &i in &decode_indices {
+                        self.active[i].phase = Phase::Finished;
+                    }
+                    return;
+                }
+            }
+        }
+        let decode_ctx = self.decode_bufs.as_mut().unwrap();
+
+        let prefill_sections: Vec<PrefillSection<'_>> = prefill_chunks
+            .iter()
+            .map(|chunk| PrefillSection {
+                slot_idx: chunk.slot_idx,
+                start_pos: chunk.start_pos,
+                tokens: chunk.tokens.as_slice(),
+            })
+            .collect();
+
+        let forward_result = self.model.forward_mixed_batch(
+            &token_ids,
+            &prefill_sections,
+            &mut self.states,
+            &slot_indices,
+            Some(&mut self.paged_kv_pool),
+            decode_ctx,
+        );
+        drop(prefill_sections);
+
+        let mixed_ok = match forward_result {
+            Ok(true) => {
+                info!(
+                    "Mixed batch: B={} decode + N={} prefill (Σc={})",
+                    token_ids.len(),
+                    prefill_chunks.len(),
+                    prefill_chunks
+                        .iter()
+                        .map(|chunk| chunk.tokens.len())
+                        .sum::<usize>(),
+                );
+                true
+            }
+            Ok(false) => {
+                info!("Mixed batch: fallback (Ok(false))");
+                for &(slot, count) in allocated_prefills.iter().rev() {
+                    self.paged_kv_pool.free_tokens_from_tail(slot, count);
+                }
+                for &slot in &allocated_decode_slots {
+                    self.paged_kv_pool.free_tokens_from_tail(slot, 1);
+                }
+                self.execute_plain_decode_launch(PlannedDecodeBatch {
+                    decode_indices,
+                    token_ids,
+                    slot_indices,
+                    sampling_params_greedy,
+                    pool_plan,
+                });
+                return;
+            }
+            Err(e) => {
+                error!("Mixed batched decode failed, falling back: {}", e);
+                for &(slot, count) in allocated_prefills.iter().rev() {
+                    self.paged_kv_pool.free_tokens_from_tail(slot, count);
+                }
+                for &slot in &allocated_decode_slots {
+                    self.paged_kv_pool.free_tokens_from_tail(slot, 1);
+                }
+                self.execute_plain_decode_launch(PlannedDecodeBatch {
+                    decode_indices,
+                    token_ids,
+                    slot_indices,
+                    sampling_params_greedy,
+                    pool_plan,
+                });
+                return;
+            }
+        };
+        debug_assert!(mixed_ok);
+
+        let greedy_launched = if all_greedy {
+            match self
+                .model
+                .sample_batch_greedy_launch(&slot_indices, decode_ctx)
+            {
+                Ok(true) => true,
+                Ok(false) => {
+                    if let Err(e) = self.model.prepare_batch_sampling_fallback(
+                        &mut self.states,
+                        &slot_indices,
+                        decode_ctx,
+                    ) {
+                        error!("Preparing batched sampling fallback failed: {}", e);
+                        for &req_idx in &decode_indices {
+                            self.active[req_idx].phase = Phase::Finished;
+                        }
+                        return;
+                    }
+                    false
+                }
+                Err(e) => {
+                    error!("Batched greedy sampling launch failed: {}", e);
+                    for &req_idx in &decode_indices {
+                        self.active[req_idx].phase = Phase::Finished;
+                    }
+                    return;
+                }
+            }
+        } else {
+            false
+        };
+
+        let b = decode_indices.len();
+        let mut running = b;
+        let mut mixed_prefill_chunks: Vec<PendingPrefillChunk> =
+            Vec::with_capacity(prefill_chunks.len());
+        let mut fused_req_idxs: Vec<usize> = Vec::with_capacity(prefill_chunks.len());
+        for chunk in &prefill_chunks {
+            let c_i = chunk.tokens.len();
+            running += c_i;
+            let logit_row = running - 1;
+            let new_progress = chunk.start_pos + c_i;
+            if let Phase::Prefilling { progress, .. } = &mut self.active[chunk.req_idx].phase {
+                *progress = new_progress;
+            }
+            mixed_prefill_chunks.push(PendingPrefillChunk {
+                req_idx: chunk.req_idx,
+                token_count: c_i,
+                completes: chunk.completes,
+                logit_row,
+            });
+            fused_req_idxs.push(chunk.req_idx);
+        }
+
+        self.pending_mixed_prefill_idxs = fused_req_idxs;
+        self.pending_decode = Some(PendingDecode {
+            decode_indices,
+            slot_indices,
+            greedy_launched,
+            sampling_params_greedy,
+            mixed_prefill_chunks,
         });
     }
 

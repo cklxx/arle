@@ -1,6 +1,32 @@
 use super::{ModelForward, Phase, Scheduler, info};
 
 impl<M: ModelForward> Scheduler<M> {
+    fn pending_mixed_prefill_tokens(&self) -> usize {
+        self.pending_decode
+            .as_ref()
+            .map(|pending| {
+                pending
+                    .mixed_prefill_chunks
+                    .iter()
+                    .map(|chunk| chunk.token_count)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    fn standalone_prefill_candidates(&self, already_mixed: &[usize]) -> Vec<usize> {
+        let n_active = self.active.len();
+        if n_active == 0 {
+            return Vec::new();
+        }
+        let start = self.last_prefill_cursor % n_active;
+        (0..n_active)
+            .map(|k| (start + k) % n_active)
+            .filter(|&i| matches!(self.active[i].phase, Phase::New | Phase::Prefilling { .. }))
+            .filter(|&i| !already_mixed.contains(&i))
+            .collect()
+    }
+
     pub(super) fn step(&mut self) {
         let num = self.active.len();
         if num == 0 {
@@ -32,13 +58,13 @@ impl<M: ModelForward> Scheduler<M> {
         self.pending_mixed_prefill_idxs.clear();
         let decode_launch_us = if has_decode {
             let t = std::time::Instant::now();
-            // Round-robin selection of up to config.mixed_prefill_max_reqs prefill
+            // Round-robin selection of up to config.prefill_max_requests prefill
             // requests to fuse with the decode batch. Starts at
             // `last_mixed_prefill_cursor` so a busy request doesn't starve
             // a late-admitted one; cursor advances by the number actually
             // fused (not the number attempted).
             let n_active = self.active.len();
-            let mixed_prefill_idxs: Vec<usize> = if n_active == 0 {
+            let mixed_prefill_idxs: Vec<usize> = if !self.config.enable_mixed_chunk || n_active == 0 {
                 Vec::new()
             } else {
                 let start = self.last_mixed_prefill_cursor % n_active;
@@ -48,7 +74,7 @@ impl<M: ModelForward> Scheduler<M> {
                         matches!(self.active[i].phase, Phase::Prefilling { .. })
                             && !self.active[i].delta_tx.is_closed()
                     })
-                    .take(self.config.mixed_prefill_max_reqs)
+                    .take(self.config.prefill_max_requests)
                     .collect()
             };
             if mixed_prefill_idxs.is_empty() {
@@ -98,64 +124,73 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let emit_us = emit_t.elapsed().as_micros();
 
-        // Phase 2b: Accept new requests (CPU-only, no GPU)
-        let new_t = std::time::Instant::now();
-        loop {
-            let new_idx =
-                (0..self.active.len()).find(|&i| matches!(self.active[i].phase, Phase::New));
-            match new_idx {
-                Some(idx) => {
-                    if trace_on {
-                        let t = std::time::Instant::now();
-                        self.step_new(idx);
-                        let elapsed_us = t.elapsed().as_micros() as u64;
-                        if let Some(req) = self.active.get_mut(idx) {
-                            req.t_new_us = req.t_new_us.saturating_add(elapsed_us);
-                        }
-                    } else {
-                        self.step_new(idx);
-                    }
-                }
-                None => break,
-            }
-        }
-        let new_us = new_t.elapsed().as_micros();
+        // Phase 2b: New requests are materialized lazily in Phase 2c when
+        // they actually receive prefill budget. This keeps admission,
+        // transition-to-prefill, and chunk launch on one path.
+        let new_us = 0;
 
-        // Phase 2c: Prefill chunks — queued on GPU stream while decode is in flight.
-        // Adaptive rate based on decode batch size.
+        // Phase 2c: Prefill chunks — queued on the same GPU stream.
+        //
+        // Decode-first rule:
+        // - when decode is active, mixed launch gets first claim on the
+        //   per-tick prefill budget;
+        // - standalone prefill can only consume the residual token budget.
+        // This keeps execution aligned with the launch-time planner instead
+        // of letting Phase 2c independently inject extra prefill work.
         let prefill_t = std::time::Instant::now();
-        let decode_count = self
-            .active
-            .iter()
-            .filter(|r| matches!(r.phase, Phase::Decoding))
-            .count();
-        let max_prefills = if !has_decode {
-            8 // No decode: drain prefill queue fast
-        } else if decode_count <= 4 {
-            4 // Ramp-up: GPU has headroom, reduce TTFT
-        } else if decode_count <= 16 {
-            2 // Moderate load: balance TTFT vs ITL
-        } else {
-            1 // High concurrency: protect decode latency
-        };
         let already_mixed: Vec<usize> = std::mem::take(&mut self.pending_mixed_prefill_idxs);
-        let prefill_indices: Vec<usize> = (0..self.active.len())
-            .filter(|&i| matches!(self.active[i].phase, Phase::Prefilling { .. }))
-            .filter(|&i| !already_mixed.contains(&i))
-            .take(max_prefills)
-            .collect();
+        let per_req_cap = self.prefill_chunk_size();
+        let prefill_indices = self.standalone_prefill_candidates(&already_mixed);
+        let mut remaining_prefill_budget = if has_decode && self.config.enable_mixed_chunk {
+            self.config
+                .max_prefill_tokens
+                .saturating_sub(self.pending_mixed_prefill_tokens())
+        } else {
+            self.config.max_prefill_tokens
+        };
+        let mut remaining_prefill_requests = if has_decode && self.config.enable_mixed_chunk {
+            self.config
+                .prefill_max_requests
+                .saturating_sub(already_mixed.len())
+        } else {
+            self.config.prefill_max_requests
+        };
         for idx in prefill_indices {
-            if matches!(self.active[idx].phase, Phase::Prefilling { .. }) {
+            if remaining_prefill_budget == 0 || remaining_prefill_requests == 0 {
+                break;
+            }
+            if matches!(self.active[idx].phase, Phase::New) {
                 if trace_on {
                     let t = std::time::Instant::now();
-                    self.step_prefill_chunk(idx);
+                    self.step_new(idx);
                     let elapsed_us = t.elapsed().as_micros() as u64;
                     if let Some(req) = self.active.get_mut(idx) {
-                        req.t_prefill_us = req.t_prefill_us.saturating_add(elapsed_us);
+                        req.t_new_us = req.t_new_us.saturating_add(elapsed_us);
                     }
                 } else {
-                    self.step_prefill_chunk(idx);
+                    self.step_new(idx);
                 }
+            }
+            if !matches!(self.active[idx].phase, Phase::Prefilling { .. }) {
+                self.last_prefill_cursor = (idx + 1) % self.active.len().max(1);
+                continue;
+            }
+            let chunk_cap = remaining_prefill_budget.min(per_req_cap);
+            let advanced = if trace_on {
+                let t = std::time::Instant::now();
+                let advanced = self.step_prefill_chunk_with_limit(idx, chunk_cap);
+                let elapsed_us = t.elapsed().as_micros() as u64;
+                if let Some(req) = self.active.get_mut(idx) {
+                    req.t_prefill_us = req.t_prefill_us.saturating_add(elapsed_us);
+                }
+                advanced
+            } else {
+                self.step_prefill_chunk_with_limit(idx, chunk_cap)
+            };
+            if advanced > 0 {
+                remaining_prefill_budget = remaining_prefill_budget.saturating_sub(advanced);
+                remaining_prefill_requests = remaining_prefill_requests.saturating_sub(1);
+                self.last_prefill_cursor = (idx + 1) % self.active.len().max(1);
             }
         }
         let prefill_us = prefill_t.elapsed().as_micros();

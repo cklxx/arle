@@ -9,9 +9,9 @@ use crate::kv_tier::BlockLocation;
 use crate::kv_tier::transport::DiskStore;
 use crate::prefix_cache::{BlockId, BlockMetadataUpdate, RadixCache};
 use crate::scheduler::policy::{
-    ChunkingPolicy, DecodeAwareChunking, SchedulerSignals, SessionBiasedLru,
+    SchedulerSignals, SessionBiasedLru,
 };
-use crate::types::{BlockFingerprint, InferenceMode, KvContentContext};
+use crate::types::{BlockFingerprint, KvContentContext};
 
 /// Block size (in tokens) for the global `RadixCache` prefix observer.
 /// Chosen to match the M0.3 target paged-pool page size so that when
@@ -70,6 +70,7 @@ pub(super) struct StagedAdmission {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PendingPrefillChunk {
     pub req_idx: usize,
+    pub token_count: usize,
     pub completes: bool,
     #[allow(dead_code)]
     pub logit_row: usize,
@@ -85,6 +86,56 @@ pub(super) struct PendingDecode {
     /// Prefill chunks fused into the current tick. Empty when no mixed
     /// prefill ran (plain decode path).
     pub mixed_prefill_chunks: Vec<PendingPrefillChunk>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PoolReservationPlan {
+    pub required_tokens: usize,
+    pub required_pages: usize,
+    pub reclaimed_prefix_tokens: usize,
+    pub retracted_tokens: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PlannedDecodeBatch {
+    pub decode_indices: Vec<usize>,
+    pub token_ids: Vec<u32>,
+    pub slot_indices: Vec<usize>,
+    pub sampling_params_greedy: Vec<bool>,
+    pub pool_plan: PoolReservationPlan,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PlannedMixedPrefillChunk {
+    pub req_idx: usize,
+    pub slot_idx: usize,
+    pub start_pos: usize,
+    pub tokens: Vec<u32>,
+    pub completes: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PlannedMixedDecodeBatch {
+    pub decode: PlannedDecodeBatch,
+    pub prefill_chunks: Vec<PlannedMixedPrefillChunk>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum PlannedDecodeLaunch {
+    Plain(PlannedDecodeBatch),
+    Mixed(PlannedMixedDecodeBatch),
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PlannedPrefillChunk {
+    pub req_idx: usize,
+    pub slot_idx: usize,
+    pub progress: usize,
+    pub total: usize,
+    pub tokens: Vec<u32>,
+    pub uses_paged_pool: bool,
+    pub chunk_pool_plan: Option<PoolReservationPlan>,
+    pub migration_pool_plan: Option<PoolReservationPlan>,
 }
 
 /// CUDA-backed scheduler state and initialization.
@@ -191,8 +242,13 @@ pub struct Scheduler<M: ModelForward> {
     /// Round-robin cursor into `active` for fair mixed-prefill selection.
     /// Advances by the number of prefills actually fused each tick.
     pub(super) last_mixed_prefill_cursor: usize,
-    /// Requests retracted by `retract_longest_decode` to free pool pages for
-    /// another slot's admission. Populated when we mark a victim
+    /// Round-robin cursor into `active` for standalone prefill chunking.
+    /// Mixed-prefill selection and standalone chunking are tracked
+    /// separately so decode-first mixed work does not starve the rest of the
+    /// prefill queue.
+    pub(super) last_prefill_cursor: usize,
+    /// Requests retracted by `retract_pool_pressure_victims` to free pool
+    /// pages for another slot's admission. Populated when we mark a victim
     /// `Phase::Finished`, consumed by `cleanup()` so the re-queued
     /// `IncomingRequest` in `waiting` isn't counted as a completion and its
     /// stale cached-prompt isn't republished to the prefix cache.
@@ -200,6 +256,24 @@ pub struct Scheduler<M: ModelForward> {
 }
 
 impl<M: ModelForward> Scheduler<M> {
+    fn warmup_mixed_graphs_enabled() -> bool {
+        matches!(
+            std::env::var("INFER_WARMUP_MIXED_CUDA_GRAPH").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        )
+    }
+
+    fn prepare_warmup_decode_slots(&mut self, slot_count: usize) -> Result<usize> {
+        let mut prepared = 0;
+        for slot in 0..slot_count {
+            self.paged_kv_pool.free_slot(slot);
+            let _ = self.states[slot].reset();
+            self.paged_kv_pool.alloc_tokens(slot, 1)?;
+            prepared = slot + 1;
+        }
+        Ok(prepared)
+    }
+
     fn eviction_signals(&self) -> SchedulerSignals {
         SchedulerSignals::queue_state(
             self.waiting.len(),
@@ -208,36 +282,6 @@ impl<M: ModelForward> Scheduler<M> {
                 .filter(|req| matches!(req.phase, Phase::Decoding))
                 .count(),
         )
-    }
-
-    pub(super) fn admission_budget_tokens(&self) -> usize {
-        let available = self.paged_kv_pool.free_count();
-        let evictable = self.prefix_cache.evictable_token_count();
-        let clip = self.config.admission_clip_max_new_tokens;
-        let ratio = self.config.admission_new_token_ratio;
-        // Decode-only running offset (sglang PrefillAdder
-        // `_get_running_request_total_token_offset` parity —
-        // `schedule_policy.py:447-454`). The prior commit (ff8228e)
-        // also charged `prefill_remaining` for Phase::New/Prefilling,
-        // which double-counted for one tick (the incoming-admit cost
-        // already burned `extend_input + clipped_max_new + page_overhead`
-        // from `tick_budget_tokens` in the same `assign_slots` loop)
-        // and dropped c=16 throughput from 114 → 74 out tok/s. The
-        // pool's own `free_count()` shrinks monotonically as chunks
-        // alloc, so the next tick's budget naturally reflects pages
-        // already claimed. Mid-tick reservation gaps are absorbed by
-        // the `retract_longest_decode` backstop in
-        // `alloc_pool_tokens_with_retry`.
-        let running_offset: f64 = self
-            .active
-            .iter()
-            .map(|r| {
-                let decode_remaining = r.max_tokens.saturating_sub(r.generated_tokens.len());
-                let clipped_decode = decode_remaining.min(clip);
-                (clipped_decode as f64) * ratio
-            })
-            .sum();
-        (available + evictable).saturating_sub(running_offset.ceil() as usize)
     }
 
     fn prefix_cache_watermarks_pages(&self) -> (usize, usize) {
@@ -464,13 +508,16 @@ impl<M: ModelForward> Scheduler<M> {
         };
 
         info!(
-            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, prefill_chunk_size={}",
+            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_prefill_tokens={}, prefill_max_requests={}, enable_mixed_chunk={}",
             model_id,
             config.max_slots,
             seed,
             effective_max_seq_len.map_or_else(|| "32768 (default)".to_string(), |n| n.to_string()),
             config.max_waiting_requests,
-            config.prefill_chunk_size,
+            config.chunked_prefill_size,
+            config.max_prefill_tokens,
+            config.prefill_max_requests,
+            config.enable_mixed_chunk,
         );
 
         let waiting_count = Arc::new(AtomicUsize::new(0));
@@ -556,6 +603,7 @@ impl<M: ModelForward> Scheduler<M> {
             pending_decode: None,
             pending_mixed_prefill_idxs: Vec::new(),
             last_mixed_prefill_cursor: 0,
+            last_prefill_cursor: 0,
             retracted_request_ids: std::collections::HashSet::new(),
         };
 
@@ -1132,36 +1180,171 @@ impl<M: ModelForward> Scheduler<M> {
         match self.paged_kv_pool.alloc_tokens(slot, count) {
             Ok(indices) => Ok(indices),
             Err(first_err) => {
-                let reclaimed_evict = self.evict_prefix_cache_for_allocation(count);
-                if reclaimed_evict > 0 {
-                    if let Ok(indices) = self.paged_kv_pool.alloc_tokens(slot, count) {
-                        return Ok(indices);
-                    }
-                }
-                // Tier 3: retract the longest-running decoder.
-                let retract_target_tokens = count.saturating_sub(self.paged_kv_pool.free_count());
-                let retracted_tokens = self.retract_longest_decode(retract_target_tokens, slot);
-                if retracted_tokens == 0 && reclaimed_evict == 0 {
-                    return Err(first_err);
-                }
-                self.paged_kv_pool
-                    .alloc_tokens(slot, count)
-                    .map_err(|retry_err| {
+                let (required_tokens, required_pages) =
+                    self.pool_append_requirements(&[(slot, count)]);
+                let plan = self
+                    .plan_pool_capacity(required_tokens, required_pages, &[slot])
+                    .map_err(|plan_err| {
                         anyhow::anyhow!(
-                            "TokenKVPool alloc retry failed after reclaiming {reclaimed_evict} \
-                         prefix pages and retracting {retracted_tokens} decode tokens: \
-                         first error: {first_err}; retry error: {retry_err}"
+                            "TokenKVPool alloc retry failed while planning retry for slot {slot} \
+                         count {count}: first error: {first_err}; planning error: {plan_err}"
                         )
-                    })
+                    })?;
+                self.paged_kv_pool.alloc_tokens(slot, count).map_err(|retry_err| {
+                    anyhow::anyhow!(
+                        "TokenKVPool alloc retry failed after reclaiming {} prefix pages and \
+                         retracting {} tokens for slot {} count {} (need_tokens={}, need_pages={}): first error: {}; retry error: {}",
+                        plan.reclaimed_prefix_tokens,
+                        plan.retracted_tokens,
+                        slot,
+                        count,
+                        plan.required_tokens,
+                        plan.required_pages,
+                        first_err,
+                        retry_err
+                    )
+                })
             }
         }
     }
 
-    /// Retract decoders to free at least `required_tokens` worth of pool pages.
-    /// Picks the longest-running (most generated tokens) decoders first, mirroring
-    /// sglang's `retract_longest_running_req` selection. The protected slot
-    /// (the caller's slot) is never retracted — that would invalidate the caller's
-    /// in-flight forward.
+    pub(super) fn pool_append_requirements(&self, appends: &[(usize, usize)]) -> (usize, usize) {
+        if !self.paged_kv_pool.is_active() || appends.is_empty() {
+            return (0, 0);
+        }
+        let page_size = self.paged_kv_pool.page_size;
+        let mut required_tokens = 0usize;
+        let mut required_pages = 0usize;
+
+        for &(slot, count) in appends {
+            if count == 0 {
+                continue;
+            }
+            let used_in_last_page = self.paged_kv_pool.seq_len(slot) % page_size;
+            let available_in_last_page = if used_in_last_page == 0 {
+                0
+            } else {
+                page_size - used_in_last_page
+            };
+            let tail_tokens = count.min(available_in_last_page);
+            let remaining_after_fill = count.saturating_sub(available_in_last_page);
+            let new_page_count = remaining_after_fill.div_ceil(page_size);
+            required_tokens = required_tokens
+                .saturating_add(tail_tokens)
+                .saturating_add(new_page_count * page_size);
+            required_pages = required_pages.saturating_add(new_page_count);
+        }
+
+        (required_tokens, required_pages)
+    }
+
+    fn plan_pool_capacity_internal(
+        &mut self,
+        required_tokens: usize,
+        required_pages: usize,
+        protected_slots: &[usize],
+        allow_retract: bool,
+    ) -> Result<PoolReservationPlan> {
+        if (required_tokens == 0 && required_pages == 0) || !self.paged_kv_pool.is_active() {
+            return Ok(PoolReservationPlan {
+                required_tokens,
+                required_pages,
+                reclaimed_prefix_tokens: 0,
+                retracted_tokens: 0,
+            });
+        }
+        if self.paged_kv_pool.free_count() >= required_tokens
+            && self.paged_kv_pool.free_page_count() >= required_pages
+        {
+            return Ok(PoolReservationPlan {
+                required_tokens,
+                required_pages,
+                reclaimed_prefix_tokens: 0,
+                retracted_tokens: 0,
+            });
+        }
+
+        let reclaimed_prefix_tokens = self.evict_prefix_cache_for_allocation(required_tokens);
+        if self.paged_kv_pool.free_count() >= required_tokens
+            && self.paged_kv_pool.free_page_count() >= required_pages
+        {
+            return Ok(PoolReservationPlan {
+                required_tokens,
+                required_pages,
+                reclaimed_prefix_tokens,
+                retracted_tokens: 0,
+            });
+        }
+        if !allow_retract {
+            return Err(anyhow::anyhow!(
+                "pool plan deferred without retract: need_tokens={} need_pages={} free_tokens={} free_pages={} reclaimed_prefix={} protected_slots={:?}",
+                required_tokens,
+                required_pages,
+                self.paged_kv_pool.free_count(),
+                self.paged_kv_pool.free_page_count(),
+                reclaimed_prefix_tokens,
+                protected_slots
+            ));
+        }
+
+        let retract_target_tokens = required_tokens.saturating_sub(self.paged_kv_pool.free_count());
+        let retracted_tokens =
+            self.retract_pool_pressure_victims_excluding(retract_target_tokens, protected_slots);
+        if self.paged_kv_pool.free_count() >= required_tokens
+            && self.paged_kv_pool.free_page_count() >= required_pages
+        {
+            return Ok(PoolReservationPlan {
+                required_tokens,
+                required_pages,
+                reclaimed_prefix_tokens,
+                retracted_tokens,
+            });
+        }
+
+        Err(anyhow::anyhow!(
+            "pool plan failed: need_tokens={} need_pages={} free_tokens={} free_pages={} reclaimed_prefix={} retracted={} protected_slots={:?}",
+            required_tokens,
+            required_pages,
+            self.paged_kv_pool.free_count(),
+            self.paged_kv_pool.free_page_count(),
+            reclaimed_prefix_tokens,
+            retracted_tokens,
+            protected_slots
+        ))
+    }
+
+    pub(super) fn plan_pool_capacity(
+        &mut self,
+        required_tokens: usize,
+        required_pages: usize,
+        protected_slots: &[usize],
+    ) -> Result<PoolReservationPlan> {
+        self.plan_pool_capacity_internal(required_tokens, required_pages, protected_slots, true)
+    }
+
+    pub(super) fn plan_pool_capacity_without_retract(
+        &mut self,
+        required_tokens: usize,
+        required_pages: usize,
+        protected_slots: &[usize],
+    ) -> Result<PoolReservationPlan> {
+        self.plan_pool_capacity_internal(required_tokens, required_pages, protected_slots, false)
+    }
+
+    /// Retract running requests to free at least `required_tokens` worth of
+    /// pool pages.
+    ///
+    /// Victim order:
+    /// 1. Decoding requests, mirroring sglang's
+    ///    `retract_longest_running_req` selection (most generated tokens first,
+    ///    then shortest prompt as a recompute tie-breaker).
+    /// 2. Prefilling requests when no decode victim exists or decode victims
+    ///    still cannot cover the shortfall. Prefill victims are ranked by
+    ///    current pool footprint first (most materialized KV to reclaim), then
+    ///    shortest prompt as a recompute tie-breaker.
+    ///
+    /// The protected slot (the caller's slot) is never retracted — that would
+    /// invalidate the caller's in-flight forward or allocation.
     ///
     /// For each victim:
     /// - Clone the request's incoming fields (prompt, max_tokens, sampling,
@@ -1178,27 +1361,66 @@ impl<M: ModelForward> Scheduler<M> {
     ///   request back to the FRONT so it gets preference next tick.
     ///
     /// Returns the total tokens freed back to the pool.
-    pub(super) fn retract_longest_decode(
+    pub(super) fn retract_pool_pressure_victims_excluding(
         &mut self,
         required_tokens: usize,
-        protected_slot: usize,
+        protected_slots: &[usize],
     ) -> usize {
         if required_tokens == 0 {
             return 0;
         }
-        let mut candidates: Vec<(u64, usize)> = self
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum VictimPhase {
+            Decode,
+            Prefill,
+        }
+
+        let mut candidates: Vec<(VictimPhase, u64, usize, usize, i64)> = self
             .active
             .iter()
-            .filter(|req| matches!(req.phase, Phase::Decoding) && req.slot_idx != protected_slot)
-            .map(|req| (req.id, req.generated_tokens.len()))
+            .filter(|req| {
+                !protected_slots.contains(&req.slot_idx)
+                    && matches!(req.phase, Phase::Decoding | Phase::Prefilling { .. })
+            })
+            .map(|req| {
+                let live_tokens = self.paged_kv_pool.seq_len(req.slot_idx);
+                let tie_break_prompt = -(req.prompt_tokens.len() as i64);
+                match req.phase {
+                    Phase::Decoding => (
+                        VictimPhase::Decode,
+                        req.id,
+                        req.generated_tokens.len(),
+                        live_tokens,
+                        tie_break_prompt,
+                    ),
+                    Phase::Prefilling { .. } => (
+                        VictimPhase::Prefill,
+                        req.id,
+                        live_tokens,
+                        live_tokens,
+                        tie_break_prompt,
+                    ),
+                    Phase::New | Phase::Finished => unreachable!("filtered above"),
+                }
+            })
             .collect();
         if candidates.is_empty() {
             return 0;
         }
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by(|a, b| {
+            let phase_rank = |phase| match phase {
+                VictimPhase::Decode => 0,
+                VictimPhase::Prefill => 1,
+            };
+            phase_rank(a.0)
+                .cmp(&phase_rank(b.0))
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| b.3.cmp(&a.3))
+                .then_with(|| b.4.cmp(&a.4))
+        });
 
         let mut freed_total = 0usize;
-        for (victim_id, decoded_len) in candidates {
+        for (victim_phase, victim_id, phase_metric, _, _) in candidates {
             if freed_total >= required_tokens {
                 break;
             }
@@ -1208,11 +1430,18 @@ impl<M: ModelForward> Scheduler<M> {
             let victim_slot = self.active[victim_pos].slot_idx;
             let free_before = self.paged_kv_pool.free_count();
 
-            warn!(
-                "Request {}: retracting decode for pool OOM (decoded={} tok, \
-                 free_before={}, target={} tok)",
-                victim_id, decoded_len, free_before, required_tokens
-            );
+            match victim_phase {
+                VictimPhase::Decode => warn!(
+                    "Request {}: retracting decode for pool OOM (decoded={} tok, \
+                     free_before={}, target={} tok)",
+                    victim_id, phase_metric, free_before, required_tokens
+                ),
+                VictimPhase::Prefill => warn!(
+                    "Request {}: retracting prefill for pool OOM (materialized={} tok, \
+                     free_before={}, target={} tok)",
+                    victim_id, phase_metric, free_before, required_tokens
+                ),
+            }
 
             let requeue = {
                 let v = &mut self.active[victim_pos];
@@ -1243,45 +1472,29 @@ impl<M: ModelForward> Scheduler<M> {
             let freed_now = self.paged_kv_pool.free_count().saturating_sub(free_before);
             freed_total = freed_total.saturating_add(freed_now);
             info!(
-                "Request {}: re-queued after retract (freed={} tok, \
+                "Request {}: re-queued after {:?} retract (freed={} tok, \
                  running_total_freed={}, target={})",
-                victim_id, freed_now, freed_total, required_tokens
+                victim_id, victim_phase, freed_now, freed_total, required_tokens
             );
         }
         freed_total
     }
 
     pub(super) fn prefill_chunk_size(&self) -> usize {
-        let signals = SchedulerSignals::queue_state(
-            self.waiting.len(),
-            self.active
-                .iter()
-                .filter(|req| matches!(req.phase, Phase::Decoding))
-                .count(),
-        );
         // When the model writes prefill K/V directly to the paged pool, there
         // is no per-slot contiguous scratch to size the chunk against, so the
         // `CONTIGUOUS_KV_TOKENS` cap does not apply and the configured
-        // `prefill_chunk_size` (default 4096) is the only upper bound.
+        // `chunked_prefill_size` is the only upper bound.
         let contiguous_cap = if self.model.prefill_uses_paged_pool() {
             usize::MAX
         } else {
             CONTIGUOUS_KV_TOKENS
         };
-        let policy_chunk = DecodeAwareChunking {
-            decode_active_chunk: self.config.decode_active_prefill_cap,
-            idle_chunk: self.config.prefill_chunk_size,
-        }
-        .next_chunk_size(InferenceMode::Prefill, signals);
-        let out = policy_chunk
-            .max(1)
-            .min(self.config.prefill_chunk_size)
-            .min(contiguous_cap);
+        let out = self.config.chunked_prefill_size.min(contiguous_cap).max(1);
         log::debug!(
-            "prefill_chunk_size: policy={policy_chunk} cap={contiguous_cap} cfg={} paged={} active_decodes={} => {out}",
-            self.config.prefill_chunk_size,
+            "chunked_prefill_size: cap={contiguous_cap} cfg={} paged={} => {out}",
+            self.config.chunked_prefill_size,
             self.model.prefill_uses_paged_pool(),
-            signals.active_decodes,
         );
         out
     }
@@ -1308,6 +1521,9 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let graph_capture_enabled = self.model.supports_cuda_graph_decode();
+        let warmup_mixed_graphs = graph_capture_enabled
+            && self.model.supports_mixed_batch()
+            && Self::warmup_mixed_graphs_enabled();
         let max_bs = num_slots.min(256);
         let warmup_sizes = Self::cuda_graph_batch_sizes(max_bs);
 
@@ -1327,26 +1543,21 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let t0 = std::time::Instant::now();
 
-        // Track how many slots we actually allocated so any early exit below
-        // still frees them in the cleanup loop. Previously, a failing
-        // `alloc_tokens` or `create_decode_context` would `return` with slots
-        // still holding warmup tokens — `free_slots()` would then consider
-        // them free while the pool still had dirty state, and the first real
-        // request could inherit stale paged-KV entries.
         let mut allocated: usize = 0;
         let mut warmed: usize = 0;
+        let mut warmed_mixed: usize = 0;
         debug_assert!(
             self.paged_kv_pool.page_size > 0,
             "paged KV pool page size must be non-zero"
         );
 
         'warmup: {
-            for slot in 0..max_bs {
-                if let Err(e) = self.paged_kv_pool.alloc_tokens(slot, 1) {
-                    error!("Warmup: pool alloc for slot {} failed: {}", slot, e);
+            match self.prepare_warmup_decode_slots(max_bs) {
+                Ok(prepared) => allocated = prepared,
+                Err(e) => {
+                    error!("Warmup: failed to prepare decode slots: {}", e);
                     break 'warmup;
                 }
-                allocated = slot + 1;
             }
 
             // Lazy-init decode context before warmup.
@@ -1364,18 +1575,30 @@ impl<M: ModelForward> Scheduler<M> {
             }
 
             let dummy_tokens: Vec<u32> = vec![0; max_bs];
+            let dummy_prefill_tokens: Vec<u32> = vec![0; crate::model::qwen3::MIXED_PREFILL_CAP];
             let slot_indices: Vec<usize> = (0..max_bs).collect();
 
             // Pass 1: drive forward for each warmup batch size. Populates the
             // cublasLt heuristic algo cache for all GEMM shapes used by decode.
             // In graph-capture mode, also captures a graph per batch size.
             warmed = self.warmup_graphs_pass(&warmup_sizes, &dummy_tokens, &slot_indices);
+            if warmup_mixed_graphs {
+                warmed_mixed = self.warmup_mixed_graphs_pass(
+                    &warmup_sizes,
+                    &dummy_tokens,
+                    &dummy_prefill_tokens,
+                    max_bs,
+                );
+            }
 
             // Autotune: benchmark all heuristic candidates, replace with measured best.
             // Runs regardless of graph mode so eager LoRA decode lands on the same
             // tuned algorithms as graph-mode decode.
-            if warmed > 0 {
-                info!("Autotuning cublasLt GEMM algorithms ({} shapes)...", warmed);
+            if warmed > 0 || warmed_mixed > 0 {
+                info!(
+                    "Autotuning cublasLt GEMM algorithms ({} decode + {} mixed shapes)...",
+                    warmed, warmed_mixed
+                );
                 let t_at = std::time::Instant::now();
                 unsafe {
                     cuda_kernels::ffi::autotune_all_cached_gemms_cuda(
@@ -1398,14 +1621,32 @@ impl<M: ModelForward> Scheduler<M> {
                         for &bs in &warmup_sizes[..warmed] {
                             decode_ctx.invalidate_graph_cache(bs);
                         }
+                        decode_ctx.clear_mixed_graph_cache();
                     }
 
                     // Pass 2: re-capture with autotuned algorithms.
+                    match self.prepare_warmup_decode_slots(max_bs) {
+                        Ok(prepared) => allocated = prepared,
+                        Err(e) => {
+                            error!("Warmup: failed to re-prepare decode slots: {}", e);
+                            break 'warmup;
+                        }
+                    }
                     let recaptured =
                         self.warmup_graphs_pass(&warmup_sizes, &dummy_tokens, &slot_indices);
+                    let recaptured_mixed = if warmup_mixed_graphs {
+                        self.warmup_mixed_graphs_pass(
+                            &warmup_sizes,
+                            &dummy_tokens,
+                            &dummy_prefill_tokens,
+                            max_bs,
+                        )
+                    } else {
+                        0
+                    };
                     info!(
-                        "Re-captured {} graphs with autotuned GEMM algorithms",
-                        recaptured,
+                        "Re-captured {} decode graphs and {} mixed graphs with autotuned GEMM algorithms",
+                        recaptured, recaptured_mixed,
                     );
                 }
             }
@@ -1424,10 +1665,11 @@ impl<M: ModelForward> Scheduler<M> {
             "Eager warmup + cublasLt autotune"
         };
         info!(
-            "{} done in {:.0}ms ({} batch sizes, max {})",
+            "{} done in {:.0}ms ({} decode batch sizes, {} mixed shapes, max {})",
             mode,
             t0.elapsed().as_secs_f64() * 1e3,
             warmed,
+            warmed_mixed,
             warmup_sizes.last().copied().unwrap_or(0),
         );
     }
@@ -1507,6 +1749,127 @@ impl<M: ModelForward> Scheduler<M> {
             }
             let _ = self.model.device_context().sync();
             captured += 1;
+        }
+        captured
+    }
+
+    fn canonical_mixed_signature(total_tokens: usize, prefill_count: usize) -> Option<Vec<usize>> {
+        if prefill_count == 0 || total_tokens == 0 || prefill_count * 16 > total_tokens {
+            return None;
+        }
+        let mut base = total_tokens / prefill_count;
+        base -= base % 16;
+        if base == 0 {
+            return None;
+        }
+        let mut signature = vec![base; prefill_count];
+        let used = base * prefill_count;
+        let extra = total_tokens.saturating_sub(used);
+        if extra % 16 != 0 {
+            return None;
+        }
+        *signature.last_mut().expect("prefill_count > 0") += extra;
+        Some(signature)
+    }
+
+    fn warmup_mixed_graphs_pass(
+        &mut self,
+        warmup_sizes: &[usize],
+        dummy_tokens: &[u32],
+        dummy_prefill_tokens: &[u32],
+        max_slots: usize,
+    ) -> usize {
+        let max_prefills = self
+            .config
+            .prefill_max_requests
+            .min(crate::model::qwen3::MIXED_PREFILL_MAX_REQS_ALLOC_CAP);
+        if !self.config.enable_mixed_chunk || max_prefills == 0 {
+            return 0;
+        }
+
+        let mut captured = 0;
+        for &bs in warmup_sizes {
+            let decode_slot_indices: Vec<usize> = (0..bs).collect();
+            let decode_tokens = &dummy_tokens[..bs];
+            for prefill_count in 1..=max_prefills {
+                if bs + prefill_count > max_slots {
+                    continue;
+                }
+                for &total_tokens in crate::model::qwen3::cuda_graph_mixed_num_tokens() {
+                    let Some(signature) =
+                        Self::canonical_mixed_signature(total_tokens, prefill_count)
+                    else {
+                        continue;
+                    };
+
+                    for slot in 0..(bs + prefill_count) {
+                        self.paged_kv_pool.free_slot(slot);
+                        let _ = self.states[slot].reset();
+                    }
+                    let mut configured = true;
+                    for slot in 0..bs {
+                        if let Err(e) = self.paged_kv_pool.alloc_tokens(slot, 1) {
+                            info!(
+                                "Warmup: mixed decode-slot alloc for B={} failed ({}), stopping",
+                                bs, e
+                            );
+                            configured = false;
+                            break;
+                        }
+                    }
+                    if !configured {
+                        return captured;
+                    }
+
+                    for (idx, &chunk_tokens) in signature.iter().enumerate() {
+                        let slot = bs + idx;
+                        if let Err(e) = self.paged_kv_pool.alloc_tokens(slot, chunk_tokens) {
+                            info!(
+                                "Warmup: mixed prefill alloc for B={} shape {:?} failed ({}), stopping",
+                                bs, signature, e
+                            );
+                            configured = false;
+                            break;
+                        }
+                    }
+                    if !configured {
+                        return captured;
+                    }
+
+                    let prefills: Vec<crate::model::PrefillSection<'_>> = signature
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, &chunk_tokens)| crate::model::PrefillSection {
+                            slot_idx: bs + idx,
+                            start_pos: 0,
+                            tokens: &dummy_prefill_tokens[..chunk_tokens],
+                        })
+                        .collect();
+
+                    let decode_ctx = self
+                        .decode_bufs
+                        .as_mut()
+                        .expect("invariant: decode_bufs initialized in warmup block above");
+                    match self.model.forward_mixed_batch(
+                        decode_tokens,
+                        &prefills,
+                        &mut self.states,
+                        &decode_slot_indices,
+                        Some(&mut self.paged_kv_pool),
+                        decode_ctx,
+                    ) {
+                        Ok(true) => captured += 1,
+                        Ok(false) => return captured,
+                        Err(e) => {
+                            info!(
+                                "Warmup: mixed graph capture for B={} shape {:?} failed ({}), skipping larger mixed sizes",
+                                bs, signature, e
+                            );
+                            return captured;
+                        }
+                    }
+                }
+            }
         }
         captured
     }

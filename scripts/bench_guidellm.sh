@@ -90,12 +90,14 @@ Canonical run (produces a wins entry):
   --processor PATH       tokenizer path / HF id (default: local $PROCESSOR_DEFAULT)
 
 Exploration mode (faster, no wins entry):
-  --quick                 ~4-min preset: profile=concurrent rate=1,2,4,8
-                          data=512-in/128-out max-seconds=60 warmup=5
-  --concurrencies LIST    e.g. "1,2,4,8" (switches profile to concurrent)
-  --profile TYPE          sweep|concurrent|synchronous|throughput|…
-  --max-seconds N         override per-benchmark duration
-  --warmup N              seconds (int >= 1) or fraction (0 < f < 1)
+  --fast                 short c=16 preset: profile=concurrent, rate=16,
+                         data=4096-in/256-out, max-seconds=30
+  --quick                ~4-min preset: profile=concurrent rate=1,2,4,8
+                         data=512-in/128-out max-seconds=60 warmup=5
+  --concurrencies LIST   e.g. "1,2,4,8" (switches profile to concurrent)
+  --profile TYPE         sweep|concurrent|synchronous|throughput|…
+  --max-seconds N        override per-benchmark duration
+  --warmup N             seconds (int >= 1) or fraction (0 < f < 1)
 
 See docs/plans/guidellm-integration.md for the canonical parameters and
 why this wrapper exists.
@@ -111,6 +113,12 @@ while [[ $# -gt 0 ]]; do
         --model)
             [[ $# -ge 2 ]] || { echo "error: --model requires a value" >&2; exit 2; }
             MODEL="$2"; shift 2 ;;
+        --fast)
+            EXPLORATION_MODE=true
+            PROFILE="concurrent"
+            RATE_OVERRIDE="16"
+            MAX_SECONDS=30
+            shift ;;
         --processor)
             [[ $# -ge 2 ]] || { echo "error: --processor requires a value" >&2; exit 2; }
             PROCESSOR="$2"; shift 2 ;;
@@ -222,12 +230,12 @@ echo "    target : $TARGET"
 echo "    model  : $MODEL"
 echo "    label  : $LABEL"
 echo "    profile: $PROFILE"
-echo "    data   : $DATA"
-echo "    seconds: $MAX_SECONDS"
-echo "    seed   : $RANDOM_SEED"
 if [[ -n "$RATE_OVERRIDE" ]]; then
     echo "    rate   : $RATE_OVERRIDE"
 fi
+echo "    data   : $DATA"
+echo "    seconds: $MAX_SECONDS"
+echo "    seed   : $RANDOM_SEED"
 if [[ -n "$WARMUP_OVERRIDE" ]]; then
     echo "    warmup : $WARMUP_OVERRIDE"
 fi

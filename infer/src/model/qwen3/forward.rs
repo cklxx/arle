@@ -174,11 +174,11 @@ impl ModelForward for Qwen3Model {
         state: &mut Self::State,
         pool: &TokenKVPool,
         slot: usize,
-        _new_token_indices: &cudarc::driver::CudaSlice<i32>,
     ) -> Result<()> {
         // Paged prefill. The scheduler has already allocated pool pages for
-        // these tokens (pool.seq_len(slot) already includes them), so
-        // start_pos is the logical position of the first new token.
+        // these tokens (pool.seq_len(slot) already includes them). Derive the
+        // logical start directly from the pool instead of relying on any
+        // scheduler-threaded per-call descriptor.
         let start_pos = paged_prefill_start_pos(pool.seq_len(slot), tokens.len())?;
 
         let hidden = self.get_embeddings_batch(tokens)?;
@@ -442,7 +442,8 @@ impl ModelForward for Qwen3Model {
     fn supports_cuda_graph_decode(&self) -> bool {
         // LoRA decode allocates per-call temp DeviceVecs inside
         // `apply_lora_{gemv,gemm}_add`; CUDA stream capture rejects those.
-        // The LoRA-aware batched decode runs eagerly, so skip warmup.
+        // The LoRA-aware decode paths run eagerly, so skip both scheduler
+        // warmup and the model-owned batched/mixed graph caches.
         // Also honour the `--cuda-graph=false` CLI flag — otherwise
         // warmup captures graphs (wasting ~1-2 GB VRAM) even when the
         // user opted out, shrinking the paged KV pool at c=16 × 4096.

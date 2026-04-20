@@ -77,6 +77,13 @@ pub trait DecodeContextOps {
     /// Called by the scheduler when metadata reallocation invalidates captured pointers.
     fn invalidate_graph_cache(&mut self, batch_size: usize);
 
+    /// Drop any cached mixed decode+prefill CUDA graphs.
+    ///
+    /// Mixed replay is shape-sensitive (decode batch + per-prefill chunk
+    /// signature). Scheduler warmup/autotune uses this to force a clean
+    /// re-capture after GEMM algorithm selection changes.
+    fn clear_mixed_graph_cache(&mut self) {}
+
     /// Access per-request logprobs computed by the last `sample_batch_greedy` call.
     fn logprobs_host(&self) -> &[f32] {
         &[]
@@ -246,7 +253,7 @@ pub trait ModelForward: Send {
         Ok(tokens)
     }
 
-    /// Optional future prefill fast path that scatter-writes K/V to the token pool.
+    /// Optional paged-prefill fast path that scatter-writes K/V to the token pool.
     ///
     /// When `prefill_uses_paged_pool()` returns true, the scheduler pre-allocates
     /// pool pages for the chunk BEFORE the forward call and routes prefill through
@@ -255,17 +262,16 @@ pub trait ModelForward: Send {
     /// KV cache is touched and the scheduler skips `migrate_kv_range_to_paged`
     /// afterward.
     ///
-    /// `new_token_indices` are the physical pool indices (on GPU) allocated for
-    /// this chunk's tokens. The slice has length `tokens.len()`. Implementations
-    /// that don't need per-token indices (e.g. paged-prefill variants that read
-    /// the page table from the pool itself) may ignore it.
+    /// The scheduler has already allocated pool pages for this chunk before the
+    /// call. Implementations that use paged prefill should read the slot's
+    /// page-table metadata from `pool` directly instead of relying on a
+    /// scheduler-built per-call descriptor.
     fn forward_prefill_with_pool(
         &self,
         tokens: &[u32],
         state: &mut Self::State,
         _pool: &TokenKVPool,
         _slot: usize,
-        _new_token_indices: &cudarc::driver::CudaSlice<i32>,
     ) -> Result<()> {
         // Default: just call forward_prefill() (no pool write)
         self.forward_prefill(tokens, state)
@@ -368,6 +374,11 @@ pub trait ModelForward: Send {
     /// CUDA Graph. Returns `false` when the model forces an eager decode
     /// path (e.g. LoRA adapters allocate per-call temps which stream
     /// capture rejects). Scheduler skips warmup/autotune in that case.
+    ///
+    /// This is the model-owned graph gate. Implementations that keep their
+    /// own batched or mixed CUDA-graph caches must route capture/replay
+    /// decisions through the same predicate so `--cuda-graph=false` disables
+    /// both warmup-time and runtime model graph usage.
     fn supports_cuda_graph_decode(&self) -> bool {
         true
     }
@@ -377,7 +388,8 @@ pub trait ModelForward: Send {
     ///
     /// The scheduler supplies one [`PrefillSection`] per prefill request
     /// fused into this tick. The model implementation processes all of them
-    /// alongside the B decode rows on a single GPU dispatch.
+    /// alongside the B decode rows on a single GPU dispatch, deriving any
+    /// paged-KV metadata it needs from the live pool state.
     ///
     /// Returns `Ok(true)` if mixed forward was performed, `Ok(false)` if
     /// not supported (scheduler falls back to plain decode + separate
@@ -397,9 +409,8 @@ pub trait ModelForward: Send {
 
 /// One prefill request fused into a mixed decode+prefill tick.
 ///
-/// Borrowed fields keep the scheduler in charge of `tokens` / `page_table_host`
-/// lifetimes — the model consumes this in a single forward call and does
-/// not persist the reference.
+/// Borrowed fields keep the scheduler in charge of token lifetimes. Paged
+/// execution metadata is derived inside the model from the live pool state.
 #[derive(Clone, Copy, Debug)]
 pub struct PrefillSection<'a> {
     pub slot_idx: usize,
@@ -407,8 +418,4 @@ pub struct PrefillSection<'a> {
     /// Prefill chunk tokens to process this tick (already clipped by the
     /// scheduler to the per-req chunk size).
     pub tokens: &'a [u32],
-    /// Full host-side page table for this slot (as `i32`), ready to H2D.
-    /// Length is the slot's current page count; the mixed-batch prep
-    /// kernel uses it to scatter K/V into the paged pool.
-    pub page_table_host: &'a [i32],
 }

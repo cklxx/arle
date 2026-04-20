@@ -35,7 +35,7 @@ fn scheduler_config_zero_slots_invalid() {
 #[test]
 fn scheduler_config_zero_chunk_invalid() {
     let cfg = SchedulerConfig {
-        prefill_chunk_size: 0,
+        chunked_prefill_size: 0,
         ..Default::default()
     };
     assert!(cfg.validate().is_err());

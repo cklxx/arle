@@ -26,8 +26,9 @@ pub use weights::{ModelRuntimeConfig, Qwen3Model};
 /// Compile-time upper bound on prefill-request fusion per mixed tick —
 /// drives static allocation sizes in `MixedBatchBuffers` and
 /// `FlashInferDecodeMetadata`. The runtime value lives on
-/// `SchedulerConfig::mixed_prefill_max_reqs` (CLI flag
-/// `--mixed-prefill-max-reqs`); this is the hard cap it validates
-/// against.
+/// `SchedulerConfig::prefill_max_requests`; this is the hard cap the
+/// mixed path validates against when `enable_mixed_chunk=true`.
 #[cfg(feature = "cuda")]
-pub(crate) use batch_decode::MIXED_PREFILL_MAX_REQS_ALLOC_CAP;
+pub(crate) use batch_decode::{
+    MIXED_PREFILL_CAP, MIXED_PREFILL_MAX_REQS_ALLOC_CAP, cuda_graph_mixed_num_tokens,
+};

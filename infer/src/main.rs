@@ -45,10 +45,21 @@ struct Args {
     #[arg(long)]
     max_seq_len: Option<usize>,
 
-    /// Prefill chunk cap (tokens) when decode requests are active.
-    /// Lower values reduce decode latency at the cost of prefill throughput.
-    #[arg(long, default_value_t = 512)]
-    decode_prefill_cap: usize,
+    /// Maximum number of tokens in one prefill chunk.
+    #[arg(long, default_value_t = 2048)]
+    chunked_prefill_size: usize,
+
+    /// Maximum total number of prefill tokens the scheduler may queue in one step.
+    #[arg(long, default_value_t = 4096)]
+    max_prefill_tokens: usize,
+
+    /// Maximum number of prefill requests the scheduler may advance in one step.
+    #[arg(long, default_value_t = 2)]
+    prefill_max_requests: usize,
+
+    /// Enable mixing prefill and decode work in one scheduler step.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    enable_mixed_chunk: bool,
 
     /// Fraction of total GPU memory for weights + KV cache (SGLang-compatible).
     /// The remaining (1 - fraction) is headroom for activations, CUDA graphs,
@@ -56,16 +67,6 @@ struct Args {
     /// Increase to 0.92 on dedicated inference boxes; decrease to 0.80 if sharing GPU.
     #[arg(long, default_value_t = 0.88)]
     mem_fraction_static: f64,
-
-    /// Admission gate: upper clamp for per-request decode reservation (tokens).
-    /// Matches sglang's `SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION`. Default 4096.
-    #[arg(long, default_value_t = 4096)]
-    admission_clip_max_new_tokens: usize,
-
-    /// Admission gate: decode reservation scaling for running requests.
-    /// Matches sglang's `SGLANG_INIT_NEW_TOKEN_RATIO`. Default 0.7.
-    #[arg(long, default_value_t = 0.7)]
-    admission_new_token_ratio: f64,
 
     /// Minimum sequence length per slot when auto-sizing KV cache.
     #[arg(long, default_value_t = 256)]
@@ -80,14 +81,6 @@ struct Args {
     /// cache in BF16 and quantize when migrating into the paged token pool.
     #[arg(long, default_value = "bf16")]
     kv_cache_dtype: String,
-
-    /// Maximum number of prefill requests fused into one mixed
-    /// decode+prefill tick (CUDA path, Qwen3). Default 2 — the tested
-    /// Pareto-optimal at today's kernel shape. Compile-time upper bound
-    /// is 8. Use this to A/B test K=1 / K=3 / K=4 probes without a
-    /// rebuild. See `docs/research/2026-04-19-sglang-gap-analysis.md`.
-    #[arg(long, default_value_t = 2)]
-    mixed_prefill_max_reqs: usize,
 
     /// Minimum lookup-hit count a prefix block must reach before it's
     /// demoted to the host-pinned T1 tier on GPU-pool eviction.
@@ -168,13 +161,13 @@ async fn main() {
             enable_cuda_graph: args.cuda_graph,
         },
         scheduler: SchedulerConfig {
-            decode_active_prefill_cap: args.decode_prefill_cap,
+            chunked_prefill_size: args.chunked_prefill_size,
+            max_prefill_tokens: args.max_prefill_tokens,
+            prefill_max_requests: args.prefill_max_requests,
+            enable_mixed_chunk: args.enable_mixed_chunk,
             mem_fraction_static: args.mem_fraction_static,
-            admission_clip_max_new_tokens: args.admission_clip_max_new_tokens,
-            admission_new_token_ratio: args.admission_new_token_ratio,
             min_seq_len: args.min_seq_len,
             kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
-            mixed_prefill_max_reqs: args.mixed_prefill_max_reqs,
             t1_demote_min_hits: args.t1_demote_min_hits,
             t1_host_pinned_bytes: args.t1_host_pinned_mb.saturating_mul(1024 * 1024),
             ..SchedulerConfig::runtime_defaults(num_slots)

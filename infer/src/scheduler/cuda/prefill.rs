@@ -1,4 +1,5 @@
 use super::{FinishReason, GenerationState, ModelForward, Phase, Scheduler, error, info, warn};
+use crate::scheduler::cuda::core::PlannedPrefillChunk;
 
 fn is_full_prompt_reuse_hit(prompt_len: usize, prefix_len: usize) -> bool {
     prefix_len > 0 && prefix_len == prompt_len
@@ -230,13 +231,26 @@ impl<M: ModelForward> Scheduler<M> {
         };
     }
 
-    /// Process one chunk of a prefill. When all chunks are done, sample the
-    /// first token and transition to Decoding.
-    pub(super) fn step_prefill_chunk(&mut self, idx: usize) {
-        let chunk_size = self.prefill_chunk_size();
+    pub(super) fn step_prefill_chunk_with_limit(
+        &mut self,
+        idx: usize,
+        chunk_limit: usize,
+    ) -> usize {
+        let Some(plan) = self.plan_prefill_chunk(idx, chunk_limit) else {
+            return 0;
+        };
+        self.execute_prefill_chunk(plan)
+    }
+
+    fn plan_prefill_chunk(
+        &mut self,
+        idx: usize,
+        chunk_limit: usize,
+    ) -> Option<PlannedPrefillChunk> {
+        let chunk_size = self.prefill_chunk_size().min(chunk_limit.max(1));
         if self.active[idx].delta_tx.is_closed() {
             self.active[idx].phase = Phase::Finished;
-            return;
+            return None;
         }
 
         let slot_idx = self.active[idx].slot_idx;
@@ -255,42 +269,107 @@ impl<M: ModelForward> Scheduler<M> {
                     total,
                 )
             }
-            _ => return,
+            _ => return None,
         };
         let chunk_len = chunk_tokens.len();
         let chunk_end = progress_val + chunk_len;
 
         let uses_paged = self.model.prefill_uses_paged_pool() && self.paged_kv_pool.is_active();
+        let chunk_pool_plan = if uses_paged {
+            let (required_tokens, required_pages) =
+                self.pool_append_requirements(&[(slot_idx, chunk_len)]);
+            match self.plan_pool_capacity_without_retract(
+                required_tokens,
+                required_pages,
+                &[slot_idx],
+            ) {
+                Ok(plan) => Some(plan),
+                Err(e) => {
+                    let req_id = self.active[idx].id;
+                    warn!(
+                        "Request {}: deferring paged prefill chunk this tick without decode retract (slot {}, len={}): {}",
+                        req_id, slot_idx, chunk_len, e
+                    );
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        let migration_pool_plan = if !uses_paged
+            && self.paged_kv_pool.is_active()
+            && chunk_end >= total
+        {
+            let (required_tokens, required_pages) =
+                self.pool_append_requirements(&[(slot_idx, total)]);
+            match self.plan_pool_capacity_without_retract(
+                required_tokens,
+                required_pages,
+                &[slot_idx],
+            ) {
+                Ok(plan) => Some(plan),
+                Err(e) => {
+                    let req_id = self.active[idx].id;
+                    warn!(
+                        "Request {}: deferring final prefill chunk before migration without decode retract (slot {}, total={}): {}",
+                        req_id, slot_idx, total, e
+                    );
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
+        Some(PlannedPrefillChunk {
+            req_idx: idx,
+            slot_idx,
+            progress: progress_val,
+            total,
+            tokens: chunk_tokens,
+            uses_paged_pool: uses_paged,
+            chunk_pool_plan,
+            migration_pool_plan,
+        })
+    }
+
+    fn execute_prefill_chunk(&mut self, plan: PlannedPrefillChunk) -> usize {
+        let PlannedPrefillChunk {
+            req_idx: idx,
+            slot_idx,
+            progress,
+            total,
+            tokens: chunk_tokens,
+            uses_paged_pool: uses_paged,
+            chunk_pool_plan,
+            migration_pool_plan,
+        } = plan;
+        let chunk_len = chunk_tokens.len();
+        let chunk_end = progress + chunk_len;
 
         let forward_result = if uses_paged {
             // Paged prefill: pre-allocate pool pages for this chunk so the
-            // forward can write K/V directly through the page table. We pass a
-            // dummy CudaSlice for `new_token_indices` — Qwen3's paged
-            // implementation reads the page table from the pool itself.
-            match self.alloc_pool_tokens_with_retry(slot_idx, chunk_len) {
-                Err(e) => {
-                    let req_id = self.active[idx].id;
-                    error!(
-                        "Request {}: pool alloc for paged prefill failed: {}",
-                        req_id, e
-                    );
-                    self.active[idx].phase = Phase::Finished;
-                    return;
-                }
-                Ok(_new_pages) => {
-                    let ctx = self.model.device_context();
-                    match ctx.stream.clone_htod(&[0i32]) {
-                        Ok(dummy_indices) => self.model.forward_prefill_with_pool(
-                            &chunk_tokens,
-                            &mut self.states[slot_idx],
-                            &self.paged_kv_pool,
-                            slot_idx,
-                            &dummy_indices,
-                        ),
-                        Err(e) => Err(anyhow::anyhow!("dummy indices H2D failed: {e}")),
-                    }
-                }
+            // forward can write K/V directly through the page table derived
+            // from the live pool state.
+            let chunk_pool_plan = chunk_pool_plan.expect("paged plan must carry chunk pool plan");
+            if let Err(e) = self.paged_kv_pool.alloc_tokens(slot_idx, chunk_len) {
+                error!(
+                    "Request {}: paged prefill plan drifted after planning (slot {}, len={}, need_tokens={}, need_pages={}): {}",
+                    self.active[idx].id,
+                    slot_idx,
+                    chunk_len,
+                    chunk_pool_plan.required_tokens,
+                    chunk_pool_plan.required_pages,
+                    e
+                );
+                return 0;
             }
+            self.model.forward_prefill_with_pool(
+                &chunk_tokens,
+                &mut self.states[slot_idx],
+                &self.paged_kv_pool,
+                slot_idx,
+            )
         } else {
             self.model
                 .forward_prefill(&chunk_tokens, &mut self.states[slot_idx])
@@ -300,7 +379,7 @@ impl<M: ModelForward> Scheduler<M> {
             let req_id = self.active[idx].id;
             error!("Request {}: prefill chunk failed: {}", req_id, e);
             self.active[idx].phase = Phase::Finished;
-            return;
+            return 0;
         }
 
         let new_progress = chunk_end;
@@ -312,21 +391,25 @@ impl<M: ModelForward> Scheduler<M> {
                 "Request {}: prefill chunk {}/{} tokens",
                 self.active[idx].id, new_progress, total
             );
-            return;
+            return chunk_len;
         }
 
         // Post-forward KV migration (only when contiguous-KV prefill was used).
         // Paged prefill already wrote K/V into the pool; nothing to migrate.
         if !uses_paged && self.paged_kv_pool.is_active() {
             let pool_start = self.paged_kv_pool.seq_len(slot_idx);
-            match self.alloc_pool_tokens_with_retry(slot_idx, total) {
-                Err(e) => {
+            if let Some(migration_pool_plan) = migration_pool_plan {
+                if let Err(e) = self.paged_kv_pool.alloc_tokens(slot_idx, total) {
                     error!(
-                        "Request {}: pool alloc for migration failed: {}",
-                        self.active[idx].id, e
+                        "Request {}: migration plan drifted after planning (slot {}, total={}, need_tokens={}, need_pages={}): {}",
+                        self.active[idx].id,
+                        slot_idx,
+                        total,
+                        migration_pool_plan.required_tokens,
+                        migration_pool_plan.required_pages,
+                        e
                     );
-                }
-                Ok(_new_pages) => {
+                } else {
                     let ctx = self.model.device_context();
                     if let Err(e) = self.states[slot_idx].migrate_kv_range_to_paged(
                         ctx,
@@ -364,13 +447,13 @@ impl<M: ModelForward> Scheduler<M> {
             Ok(token) => {
                 if !self.active[idx].sampling.ignore_eos && self.model.is_stop_token(token) {
                     self.active[idx].finish(FinishReason::Stop, &self.tokenizer);
-                    return;
+                    return chunk_len;
                 }
                 self.active[idx].generated_tokens.push(token);
                 self.active[idx].emit_delta(&self.tokenizer);
 
                 if matches!(self.active[idx].phase, Phase::Finished) {
-                    return;
+                    return chunk_len;
                 }
                 if self.active[idx].generated_tokens.len() >= self.active[idx].max_tokens {
                     self.active[idx].finish(FinishReason::Length, &self.tokenizer);
@@ -389,6 +472,7 @@ impl<M: ModelForward> Scheduler<M> {
                 self.active[idx].phase = Phase::Finished;
             }
         }
+        chunk_len
     }
 }
 

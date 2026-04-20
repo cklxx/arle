@@ -27,28 +27,35 @@ pub enum PreemptionMode {
 pub struct SchedulerConfig {
     /// Maximum number of concurrently active request slots.
     pub max_slots: usize,
-    /// Chunked prefill chunk size (tokens per prefill step).
-    pub prefill_chunk_size: usize,
+    /// Maximum number of tokens in one prefill chunk.
+    ///
+    /// Mirrors SGLang's `chunked_prefill_size`: one request can advance at
+    /// most this many prompt tokens in a single prefill launch.
+    pub chunked_prefill_size: usize,
+    /// Maximum total number of prefill tokens the scheduler may queue in one
+    /// step across all prefill requests.
+    ///
+    /// Mirrors SGLang's `max_prefill_tokens`. This is the scheduler's sole
+    /// prefill-token budget knob; per-path fanout heuristics must derive from
+    /// this field instead of hard-coded multipliers.
+    pub max_prefill_tokens: usize,
+    /// Maximum number of prefill requests the scheduler may advance in one
+    /// step, across mixed and standalone prefill work.
+    ///
+    /// Mirrors SGLang's `prefill_max_requests`.
+    pub prefill_max_requests: usize,
+    /// Whether decode and prefill may be fused into one mixed batch.
+    ///
+    /// Mirrors SGLang's `enable_mixed_chunk`.
+    pub enable_mixed_chunk: bool,
     /// Maximum requests allowed in the waiting queue.
     /// `submit()` returns `Err(SchedulerFull)` when the queue is at capacity.
     pub max_waiting_requests: usize,
     /// Strategy to use when a running request must be preempted.
     pub preemption_mode: PreemptionMode,
-    /// Prefill chunk size cap when decode requests are active.
-    /// Smaller values reduce decode latency at the cost of prefill throughput.
-    pub decode_active_prefill_cap: usize,
     /// Fraction of total GPU memory for weights + KV cache (SGLang-compatible).
     /// The remaining (1 - fraction) is headroom. Default 0.88.
     pub mem_fraction_static: f64,
-    /// Upper clamp for per-request decode reservation in the admission gate.
-    /// Matches sglang's `SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION` env default.
-    /// Default 4096 tokens.
-    pub admission_clip_max_new_tokens: usize,
-    /// Statistical scaling factor applied to running-request remaining decode
-    /// budget in the admission gate. Matches sglang's
-    /// `SGLANG_INIT_NEW_TOKEN_RATIO` default. Below 1.0 because most running
-    /// requests stop well before their `max_tokens` budget. Default 0.7.
-    pub admission_new_token_ratio: f64,
     /// Minimum sequence length per slot when auto-sizing KV cache.
     pub min_seq_len: usize,
     /// Fallback KV pool budget (bytes) when GPU memory query fails.
@@ -91,17 +98,6 @@ pub struct SchedulerConfig {
     pub t1_host_pinned_keepalive_ticks: u64,
     /// Root directory used by the session snapshot disk store.
     pub disk_store_root: PathBuf,
-    /// Maximum number of prefill requests fused into a single mixed
-    /// decode+prefill tick (CUDA path, Qwen3). Default 2 — the
-    /// tested Pareto-optimal at today's kernel shape per
-    /// `docs/research/2026-04-19-sglang-gap-analysis.md`. The
-    /// compile-time upper bound is
-    /// `model::qwen3::MIXED_PREFILL_MAX_REQS_ALLOC_CAP` (buffer
-    /// sizing); the CLI flag `--mixed-prefill-max-reqs` writes this.
-    /// Raising past the alloc cap requires a rebuild. Use this to
-    /// A/B test K=1 / K=3 / K=4 probes without re-benching the
-    /// alloc sizes.
-    pub mixed_prefill_max_reqs: usize,
     /// Minimum lookup-hit count a prefix block must have before it
     /// gets demoted to the host-pinned T1 tier on eviction. One-hit
     /// wonders fall straight off the GPU (free pages outright) so
@@ -143,13 +139,13 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             max_slots: 4,
-            prefill_chunk_size: 512,
+            chunked_prefill_size: 512,
+            max_prefill_tokens: 512,
+            prefill_max_requests: 1,
+            enable_mixed_chunk: true,
             max_waiting_requests: 256,
             preemption_mode: PreemptionMode::Recompute,
-            decode_active_prefill_cap: 512,
             mem_fraction_static: 0.88,
-            admission_clip_max_new_tokens: 4096,
-            admission_new_token_ratio: 0.7,
             min_seq_len: 256,
             kv_pool_fallback_bytes: 4 * 1024 * 1024 * 1024,
             // Defaults match the M3b shipped constants in
@@ -168,7 +164,6 @@ impl Default for SchedulerConfig {
             t1_host_pinned_low_water: 0.70,
             t1_host_pinned_keepalive_ticks: 128,
             disk_store_root: std::env::temp_dir().join("infer-kv"),
-            mixed_prefill_max_reqs: 2,
             // Default 0 = demote disabled (pre-Gap-#5 behaviour). Flip
             // to 2 (sglang parity) once Gap #5 C5 ships stats counters
             // + a repeated-prefix bench win.
@@ -189,10 +184,13 @@ impl SchedulerConfig {
     pub fn runtime_defaults(max_slots: usize) -> Self {
         Self {
             max_slots,
-            // temp: chunk=2048 for diagnosis
-            prefill_chunk_size: 2048,
-            admission_clip_max_new_tokens: 4096,
-            admission_new_token_ratio: 0.7,
+            // SGLang-style serving defaults for c=16 investigations on L4:
+            // 2048-token chunks, 4096 prefill tokens per step, and up to 2
+            // requests advanced per step.
+            chunked_prefill_size: 2048,
+            max_prefill_tokens: 4096,
+            prefill_max_requests: 2,
+            enable_mixed_chunk: true,
             ..Self::default()
         }
     }
@@ -201,11 +199,17 @@ impl SchedulerConfig {
         if self.max_slots == 0 {
             anyhow::bail!("max_slots must be ≥ 1");
         }
-        if self.prefill_chunk_size == 0 {
-            anyhow::bail!("prefill_chunk_size must be ≥ 1");
+        if self.chunked_prefill_size == 0 {
+            anyhow::bail!("chunked_prefill_size must be ≥ 1");
         }
-        if self.decode_active_prefill_cap == 0 {
-            anyhow::bail!("decode_active_prefill_cap must be ≥ 1");
+        if self.max_prefill_tokens == 0 {
+            anyhow::bail!("max_prefill_tokens must be ≥ 1");
+        }
+        if self.prefill_max_requests == 0 {
+            anyhow::bail!("prefill_max_requests must be ≥ 1");
+        }
+        if self.max_prefill_tokens < self.chunked_prefill_size {
+            anyhow::bail!("max_prefill_tokens must be ≥ chunked_prefill_size");
         }
         if self.min_seq_len == 0 {
             anyhow::bail!("min_seq_len must be ≥ 1");
@@ -216,25 +220,13 @@ impl SchedulerConfig {
         if !(0.0 < self.mem_fraction_static && self.mem_fraction_static <= 1.0) {
             anyhow::bail!("mem_fraction_static must be in (0, 1]");
         }
-        if self.admission_clip_max_new_tokens == 0 {
-            anyhow::bail!("admission_clip_max_new_tokens must be ≥ 1");
-        }
-        if !(0.0 < self.admission_new_token_ratio && self.admission_new_token_ratio <= 1.0) {
-            anyhow::bail!("admission_new_token_ratio must be in (0, 1]");
-        }
         #[cfg(feature = "cuda")]
         {
             let alloc_cap = crate::model::qwen3::MIXED_PREFILL_MAX_REQS_ALLOC_CAP;
-            if self.mixed_prefill_max_reqs == 0 || self.mixed_prefill_max_reqs > alloc_cap {
+            if self.enable_mixed_chunk && self.prefill_max_requests > alloc_cap {
                 anyhow::bail!(
-                    "mixed_prefill_max_reqs must be in 1..={alloc_cap} (compile-time alloc cap)",
+                    "prefill_max_requests must be in 1..={alloc_cap} when enable_mixed_chunk=true (compile-time mixed alloc cap)",
                 );
-            }
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            if self.mixed_prefill_max_reqs == 0 {
-                anyhow::bail!("mixed_prefill_max_reqs must be ≥ 1");
             }
         }
         if !(0.0 < self.prefix_cache_high_water && self.prefix_cache_high_water < 1.0) {
@@ -436,9 +428,10 @@ mod tests {
     fn runtime_defaults_match_documented_defaults() {
         let cfg = SchedulerConfig::runtime_defaults(8);
         assert_eq!(cfg.max_slots, 8);
-        assert_eq!(cfg.prefill_chunk_size, 2048);
-        assert_eq!(cfg.admission_clip_max_new_tokens, 4096);
-        assert_eq!(cfg.admission_new_token_ratio, 0.7);
+        assert_eq!(cfg.chunked_prefill_size, 2048);
+        assert_eq!(cfg.max_prefill_tokens, 4096);
+        assert_eq!(cfg.prefill_max_requests, 2);
+        assert!(cfg.enable_mixed_chunk);
         assert_eq!(cfg.prefix_cache_high_water, 0.75);
         assert_eq!(cfg.prefix_cache_low_water, 0.50);
         assert_eq!(cfg.prefix_cache_retain_hard_cap, 0.90);
@@ -469,27 +462,6 @@ mod tests {
     fn scheduler_config_rejects_zero_t1_keepalive() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.t1_host_pinned_keepalive_ticks = 0;
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn scheduler_config_rejects_zero_admission_clip() {
-        let mut cfg = SchedulerConfig::runtime_defaults(4);
-        cfg.admission_clip_max_new_tokens = 0;
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn scheduler_config_rejects_non_positive_admission_ratio() {
-        let mut cfg = SchedulerConfig::runtime_defaults(4);
-        cfg.admission_new_token_ratio = 0.0;
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn scheduler_config_rejects_admission_ratio_above_one() {
-        let mut cfg = SchedulerConfig::runtime_defaults(4);
-        cfg.admission_new_token_ratio = 1.1;
         assert!(cfg.validate().is_err());
     }
 

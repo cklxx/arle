@@ -170,20 +170,30 @@ impl ModelForward for GLM4Model {
         tokens: &[u32],
         state: &mut Self::State,
         pool: &TokenKVPool,
-        _slot: usize,
-        new_token_indices: &cudarc::driver::CudaSlice<i32>,
+        slot: usize,
     ) -> Result<()> {
         if tokens.len() == 1 {
             self.forward_decode(tokens[0], state)?;
         } else {
             let start_pos = state.base.kv_cache.len();
+            let paged_start = pool.seq_len(slot).saturating_sub(tokens.len());
+            // GLM4's paged layer path still consumes explicit token-row
+            // indices. Derive them from the pool here instead of threading
+            // scheduler-owned descriptors through the trait boundary.
+            let token_rows = pool.token_rows_for_range(slot, paged_start, tokens.len());
+            let token_row_indices: Vec<i32> = token_rows.iter().map(|&idx| idx as i32).collect();
+            let token_rows_gpu = self
+                .ctx
+                .stream
+                .clone_htod(&token_row_indices)
+                .map_err(|e| anyhow::anyhow!("GLM4 paged prefill token_rows H2D failed: {e}"))?;
             let hidden = self.get_embeddings_batch(tokens)?;
             let hidden = self.process_all_layers_batch_with_pool(
                 hidden,
                 start_pos,
                 &mut state.base.kv_cache,
                 pool,
-                new_token_indices,
+                &token_rows_gpu,
             )?;
             let logits = self.compute_logits_batch(&hidden)?;
             state.base.prefill_logits = Some(logits);

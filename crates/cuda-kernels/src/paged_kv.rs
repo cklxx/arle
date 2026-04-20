@@ -832,6 +832,13 @@ impl TokenKVPool {
         self.free_pages.len() * self.page_size + partial_capacity
     }
 
+    /// Number of completely free physical pages available for new page
+    /// allocations. Unlike `free_count()`, this excludes per-slot tail room,
+    /// which is not transferable across slots.
+    pub fn free_page_count(&self) -> usize {
+        self.free_pages.len()
+    }
+
     fn page_span_for_token_range(
         &self,
         slot: usize,
