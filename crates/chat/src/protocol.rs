@@ -1,7 +1,9 @@
 //! Shared chat/tool-call protocol helpers used by both the `infer` HTTP layer
 //! and the root agent loop.
 
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
+use std::ops::Range;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 
@@ -61,6 +63,93 @@ struct PromptRenderer<'a> {
     prompt: String,
     tool_block: &'a str,
     system_injected: bool,
+}
+
+/// Borrowed ChatML message used by callers that only need raw role/content
+/// rendering without tool or default-system handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatMlMessage<'a> {
+    pub role: &'a str,
+    pub content: &'a str,
+}
+
+/// Byte spans for a rendered ChatML turn.
+///
+/// `turn` covers the full `<|im_start|>role\ncontent<|im_end|>\n` slice.
+/// `supervised` covers the slice that should receive labels. Different
+/// renderers may choose slightly different supervision boundaries, but the
+/// span always excludes the trailing newline after `<|im_end|>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMlSpan {
+    pub turn: Range<usize>,
+    pub supervised: Range<usize>,
+}
+
+/// Fully rendered ChatML prompt plus per-turn byte spans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedChatMl {
+    pub prompt: String,
+    pub spans: Vec<ChatMlSpan>,
+}
+
+fn append_chatml_message_with_span(prompt: &mut String, role: &str, content: &str) -> ChatMlSpan {
+    let turn_start = prompt.len();
+    prompt.push_str("<|im_start|>");
+    prompt.push_str(role);
+    prompt.push('\n');
+
+    let supervised_start = prompt.len();
+    prompt.push_str(content);
+    prompt.push_str("<|im_end|>");
+    let supervised_end = prompt.len();
+    prompt.push('\n');
+
+    ChatMlSpan {
+        turn: turn_start..prompt.len(),
+        supervised: supervised_start..supervised_end,
+    }
+}
+
+fn append_structured_chatml_message_with_span(
+    prompt: &mut String,
+    message: &ChatMessage,
+) -> ChatMlSpan {
+    let turn_start = prompt.len();
+    prompt.push_str("<|im_start|>");
+    prompt.push_str(message.role.as_str());
+    prompt.push('\n');
+
+    let supervised_start = prompt.len();
+    match &message.role {
+        ChatRole::System | ChatRole::User | ChatRole::Other(_) => {
+            prompt.push_str(&message.content);
+        }
+        ChatRole::Assistant => {
+            prompt.push_str(&message.content);
+            for tool_call in &message.tool_calls {
+                prompt.push_str("\n<tool_call>\n");
+                prompt.push_str(&tool_call.prompt_payload());
+                prompt.push_str("\n</tool_call>");
+            }
+        }
+        ChatRole::Tool => {
+            prompt.push_str("<tool_response>\n");
+            prompt.push_str(&message.content);
+            prompt.push_str("\n</tool_response>");
+        }
+    }
+
+    prompt.push_str("<|im_end|>\n");
+    let supervised_end = if matches!(&message.role, ChatRole::Assistant) {
+        prompt.len() - 1
+    } else {
+        supervised_start
+    };
+
+    ChatMlSpan {
+        turn: turn_start..prompt.len(),
+        supervised: supervised_start..supervised_end,
+    }
 }
 
 impl<'a> PromptRenderer<'a> {
@@ -207,7 +296,7 @@ fn compact_parameters(parameters: &Value) -> Value {
 }
 
 /// Structured tool call emitted by the model or embedded in an assistant turn.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub name: String,
     pub arguments: Value,
@@ -231,7 +320,8 @@ impl ToolCall {
 }
 
 /// Role tags used by the shared ChatML formatter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
 pub enum ChatRole {
     System,
     User,
@@ -252,6 +342,12 @@ impl ChatRole {
     }
 }
 
+impl From<ChatRole> for String {
+    fn from(role: ChatRole) -> Self {
+        role.as_str().to_string()
+    }
+}
+
 impl From<&str> for ChatRole {
     fn from(role: &str) -> Self {
         match role {
@@ -264,11 +360,23 @@ impl From<&str> for ChatRole {
     }
 }
 
+impl From<String> for ChatRole {
+    fn from(role: String) -> Self {
+        Self::from(role.as_str())
+    }
+}
+
 /// Shared message shape used for prompt construction.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: ChatRole,
+    #[serde(default, deserialize_with = "deserialize_string_or_empty")]
     pub content: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_tool_calls_or_empty",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub tool_calls: Vec<ToolCall>,
 }
 
@@ -342,6 +450,27 @@ pub fn messages_to_prompt(messages: &[ChatMessage], tools: &[ToolDefinition]) ->
     renderer.finish()
 }
 
+/// Render structured chat messages and return byte spans for each turn.
+pub fn render_structured_chatml_with_spans(
+    messages: &[ChatMessage],
+    add_generation_prompt: bool,
+) -> RenderedChatMl {
+    let mut prompt = String::new();
+    let mut spans = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        spans.push(append_structured_chatml_message_with_span(
+            &mut prompt,
+            message,
+        ));
+    }
+    if add_generation_prompt {
+        prompt.push_str("<|im_start|>assistant\n");
+    }
+
+    RenderedChatMl { prompt, spans }
+}
+
 /// Parse `<tool_call>...</tool_call>` blocks from raw assistant output.
 pub fn parse_tool_calls(text: &str) -> ParsedAssistantResponse {
     let (stripped, tool_calls) = TOOL_CALL_BLOCK.strip_and_collect(text, |json_str| {
@@ -364,6 +493,48 @@ pub fn parse_tool_calls(text: &str) -> ParsedAssistantResponse {
     }
 }
 
+/// Render a raw ChatML message list using the canonical `<|im_start|>...`
+/// layout without tool or default-system injection.
+pub fn render_chatml(messages: &[ChatMlMessage<'_>], add_generation_prompt: bool) -> String {
+    render_chatml_with_spans(messages, add_generation_prompt).prompt
+}
+
+/// Render ChatML and return byte spans for each turn.
+pub fn render_chatml_with_spans(
+    messages: &[ChatMlMessage<'_>],
+    add_generation_prompt: bool,
+) -> RenderedChatMl {
+    let mut prompt = String::new();
+    let mut spans = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        spans.push(append_chatml_message_with_span(
+            &mut prompt,
+            message.role,
+            message.content,
+        ));
+    }
+    if add_generation_prompt {
+        prompt.push_str("<|im_start|>assistant\n");
+    }
+
+    RenderedChatMl { prompt, spans }
+}
+
+fn deserialize_string_or_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_tool_calls_or_empty<'de, D>(deserializer: D) -> Result<Vec<ToolCall>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<Vec<ToolCall>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,6 +544,41 @@ mod tests {
         let prompt = messages_to_prompt(&[ChatMessage::user("hello")], &[]);
         assert!(prompt.contains("<|im_start|>user\nhello<|im_end|>"));
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn render_chatml_single_message() {
+        let prompt = render_chatml(
+            &[ChatMlMessage {
+                role: "user",
+                content: "hello",
+            }],
+            true,
+        );
+
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn render_chatml_with_spans_tracks_body_range() {
+        let rendered = render_chatml_with_spans(
+            &[ChatMlMessage {
+                role: "assistant",
+                content: "\nhello",
+            }],
+            false,
+        );
+
+        assert_eq!(
+            rendered.prompt,
+            "<|im_start|>assistant\n\nhello<|im_end|>\n"
+        );
+        assert_eq!(rendered.spans.len(), 1);
+        assert_eq!(rendered.spans[0].turn, 0..39);
+        assert_eq!(rendered.spans[0].supervised, 22..38);
     }
 
     #[test]
@@ -437,6 +643,43 @@ mod tests {
         assert!(prompt.contains("<tool_call>"));
         assert!(prompt.contains(r#""name":"shell""#));
         assert!(prompt.contains(r#""command":"pwd""#));
+    }
+
+    #[test]
+    fn chat_message_deserializes_tool_calls_and_null_content() {
+        let message = serde_json::from_str::<ChatMessage>(
+            r#"{"role":"assistant","content":null,"tool_calls":[{"name":"shell","arguments":{"command":"pwd"}}]}"#,
+        )
+        .expect("chat message should deserialize");
+
+        assert_eq!(message.role, ChatRole::Assistant);
+        assert_eq!(message.content, "");
+        assert_eq!(message.tool_calls.len(), 1);
+        assert_eq!(message.tool_calls[0].name, "shell");
+        assert_eq!(message.tool_calls[0].arguments["command"], "pwd");
+    }
+
+    #[test]
+    fn structured_render_only_labels_assistant_turns() {
+        let rendered = render_structured_chatml_with_spans(
+            &[
+                ChatMessage::user("first"),
+                ChatMessage::assistant(
+                    "",
+                    vec![ToolCall::new("shell", json!({ "command": "pwd" }))],
+                ),
+                ChatMessage::tool_result("shell", "cwd"),
+                ChatMessage::assistant("done", vec![]),
+            ],
+            false,
+        );
+
+        assert!(rendered.prompt.contains("<tool_call>"));
+        assert!(rendered.prompt.contains("<tool_response>"));
+        assert!(rendered.spans[0].supervised.is_empty());
+        assert!(!rendered.spans[1].supervised.is_empty());
+        assert!(rendered.spans[2].supervised.is_empty());
+        assert!(!rendered.spans[3].supervised.is_empty());
     }
 
     #[test]

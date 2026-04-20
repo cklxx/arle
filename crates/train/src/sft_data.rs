@@ -7,24 +7,11 @@ use std::{
 use autograd::{AutogradError, Result};
 use serde::Deserialize;
 
-use crate::tokenizer::{ChatMessageRef, ChatTokenizer};
+pub use chat::{ChatMessage, ChatRole, ToolCall, render_structured_chatml_with_spans};
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
-}
+use crate::tokenizer::ChatTokenizer;
 
-impl<'a> From<&'a ChatMessage> for ChatMessageRef<'a> {
-    fn from(message: &'a ChatMessage) -> Self {
-        Self {
-            role: message.role.as_str(),
-            content: message.content.as_str(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SftExample {
     pub messages: Vec<ChatMessage>,
 }
@@ -75,7 +62,6 @@ pub fn tokenize_example(
     tokenizer: &ChatTokenizer,
     max_seq_len: usize,
 ) -> Result<TokenizedSft> {
-    const IM_END: &str = "<|im_end|>";
     let mut input_ids = Vec::new();
     let mut labels = Vec::new();
 
@@ -83,38 +69,25 @@ pub fn tokenize_example(
         // Encode each full turn as ONE string so BPE merges at boundaries
         // (prefix↔content, content↔<|im_end|>) are respected. Using the
         // combined form is what Qwen's chat template actually feeds the model
-        // at inference; piecewise-encoded concatenation can diverge.
-        let turn = format!(
-            "<|im_start|>{}\n{}{IM_END}\n",
-            message.role, message.content
-        );
-        let (turn_ids, offsets) = tokenizer.encode_with_offsets(&turn, false)?;
-        let supervise = message.role == "assistant";
-
-        // Locate the assistant body via **byte offsets** in the combined
-        // encoding, not piecewise token counts. Encoding the header alone
-        // isn't stable — e.g. content that starts with `\n` causes the
-        // header-trailing `\n` and the content-leading `\n` to merge into a
-        // single token, so the standalone header is one token longer than
-        // the header slice of `turn_ids`. Byte offsets remain accurate
-        // regardless of merges.
-        //
-        // A token belongs to the body if its span `[s, e)` overlaps
-        // `[header_byte_end, body_byte_end)`. Using `e > header_byte_end`
-        // (rather than `s >= header_byte_end`) catches the boundary-crossing
-        // token that merges the header's trailing `\n` with the content's
-        // leading `\n` — otherwise that token gets dropped from supervision.
-        let header_byte_end = format!("<|im_start|>{}\n", message.role).len();
-        let body_byte_end = header_byte_end + message.content.len() + IM_END.len();
-        let (body_start, body_end) = if supervise {
-            body_span(&offsets, header_byte_end, body_byte_end, turn_ids.len())
-        } else {
+        // at inference; piecewise-encoded concatenation can diverge. The
+        // ChatML assembly itself lives in `crates/chat` so training and serving
+        // stay on the same formatter.
+        let rendered = render_structured_chatml_with_spans(std::slice::from_ref(message), false);
+        let body_range = rendered
+            .spans
+            .first()
+            .map(|span| span.supervised.clone())
+            .expect("single message render always yields one span");
+        let (turn_ids, offsets) = tokenizer.encode_with_offsets(&rendered.prompt, false)?;
+        let (body_start, body_end) = if body_range.is_empty() {
             (turn_ids.len(), turn_ids.len())
+        } else {
+            body_span(&offsets, body_range.start, body_range.end, turn_ids.len())
         };
 
         for (i, &token_id) in turn_ids.iter().enumerate() {
             input_ids.push(token_id);
-            let supervised_here = supervise && i >= body_start && i < body_end;
+            let supervised_here = i >= body_start && i < body_end;
             labels.push(if supervised_here {
                 token_id as i32
             } else {
@@ -132,23 +105,23 @@ pub fn tokenize_example(
 }
 
 /// Find the token-index range `[body_start, body_end)` whose byte spans
-/// overlap `[header_byte_end, body_byte_end)`. A token counts as body if its
-/// span ends past `header_byte_end` (picks up tokens that straddle the
-/// header/body boundary — e.g. a merged `\n\n` when content begins with a
-/// newline) and its start is strictly inside the body range.
+/// overlap the supervised body range. A token counts as body if its span ends
+/// past `body_start_byte` (picks up tokens that straddle the header/body
+/// boundary — e.g. a merged `\n\n` when content begins with a newline) and
+/// its start is strictly inside the body range.
 fn body_span(
     offsets: &[(usize, usize)],
-    header_byte_end: usize,
-    body_byte_end: usize,
+    body_start_byte: usize,
+    body_end_byte: usize,
     total_tokens: usize,
 ) -> (usize, usize) {
     let start = offsets
         .iter()
-        .position(|&(_, e)| e > header_byte_end)
+        .position(|&(_, e)| e > body_start_byte)
         .unwrap_or(total_tokens);
     let end = offsets
         .iter()
-        .position(|&(s, _)| s >= body_byte_end)
+        .position(|&(s, _)| s >= body_end_byte)
         .unwrap_or(total_tokens);
     (start, end.max(start))
 }
@@ -164,7 +137,7 @@ mod tests {
     #[test]
     fn body_span_simple_non_merged() {
         // `<|im_start|>assistant\n` + `hello` + `<|im_end|>` + `\n`
-        // header_byte_end = 22, body_byte_end = 37
+        // supervised byte span = [22, 37)
         let offsets = vec![(0, 22), (22, 27), (27, 37), (37, 38)];
         let (s, e) = body_span(&offsets, 22, 37, offsets.len());
         assert_eq!((s, e), (1, 3));
@@ -174,9 +147,9 @@ mod tests {
     fn body_span_includes_boundary_crossing_token() {
         // Simulates Qwen BPE merging the header-trailing `\n` with the
         // content-leading `\n` into a single `\n\n` token whose span straddles
-        // the header/body boundary (Codex finding on 5004b4c).
+        // the supervised body boundary.
         // turn = `<|im_start|>assistant\n\nHello<|im_end|>\n`
-        // header_byte_end = 22, body_byte_end = 22 + 6 + 10 = 38.
+        // supervised byte span = [22, 38)
         let offsets = vec![
             (0, 12),  // <|im_start|>
             (12, 21), // assistant
@@ -194,10 +167,44 @@ mod tests {
     #[test]
     fn body_span_empty_content() {
         // turn = `<|im_start|>assistant\n<|im_end|>\n` — content is empty.
-        // header_byte_end = body_byte_end - 10 (just <|im_end|>).
+        // supervised byte span covers just `<|im_end|>`.
         let offsets = vec![(0, 22), (22, 32), (32, 33)];
         let (s, e) = body_span(&offsets, 22, 32, offsets.len());
         // <|im_end|> at (22, 32) straddles body start; should be included.
         assert_eq!((s, e), (1, 2));
+    }
+
+    #[test]
+    fn render_structured_chatml_with_spans_covers_assistant_body() {
+        let rendered = chat::render_structured_chatml_with_spans(
+            &[ChatMessage::assistant("hello", vec![])],
+            false,
+        );
+
+        assert_eq!(rendered.prompt, "<|im_start|>assistant\nhello<|im_end|>\n");
+        assert_eq!(rendered.spans.len(), 1);
+        assert_eq!(rendered.spans[0].supervised, 22..37);
+    }
+
+    #[test]
+    fn render_structured_chatml_with_spans_skips_tool_turns() {
+        let rendered = chat::render_structured_chatml_with_spans(
+            &[
+                ChatMessage::assistant(
+                    "",
+                    vec![ToolCall::new(
+                        "shell",
+                        serde_json::json!({ "command": "pwd" }),
+                    )],
+                ),
+                ChatMessage::tool_result("shell", "cwd"),
+            ],
+            false,
+        );
+
+        assert!(rendered.prompt.contains("<tool_call>"));
+        assert!(rendered.prompt.contains("<tool_response>"));
+        assert!(!rendered.spans[0].supervised.is_empty());
+        assert!(rendered.spans[1].supervised.is_empty());
     }
 }

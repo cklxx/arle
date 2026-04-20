@@ -28,7 +28,7 @@ use serde_json::json;
 use thiserror::Error;
 use train::{
     EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig,
-    checkpoint::write_latest_symlink,
+    checkpoint::publish_latest_after_weights,
     cli_args::{ArgError, next_value, parse_value},
     dataset::LcgRng,
     grad_clip::{GlobalNorm, GradClip, NoClip},
@@ -598,6 +598,20 @@ fn resume_from_checkpoint(
     store: &mut TensorStore,
     cfg: &Qwen3Config,
 ) -> Result<usize, CliError> {
+    // DX-1 follow-up (codex review 2026-04-20 on 8bde810, High): canonicalize
+    // at function entry so every subsequent read (weights, config, step
+    // derivation) refers to the same snapshot of the `latest` symlink. Without
+    // this, a concurrent trainer repointing `latest` between our opens could
+    // let us mix step N weights with step N+1 metadata. Bubble the error
+    // instead of silently falling back to step 0 — a broken symlink at resume
+    // time is the user's bug, not something we should paper over.
+    let resume_dir = resume_dir.canonicalize().map_err(|e| {
+        CliError::Custom(format!(
+            "failed to canonicalize --resume {}: {e} (is the path / symlink target missing?)",
+            resume_dir.display()
+        ))
+    })?;
+
     let weights = resume_dir.join("model.safetensors");
     if !weights.exists() {
         return Err(CliError::Custom(format!(
@@ -667,13 +681,10 @@ fn resume_from_checkpoint(
 
     registry.load_into_strict(store, &weights)?;
 
-    // Derive absolute step from the dir name `step_<N>` if present; otherwise 0.
-    // `--resume <out>/latest` is a DX-1 symlink; canonicalize so file_name()
-    // resolves to the `step_NNNNNN` target, not the literal "latest" string.
-    let canonical = resume_dir
-        .canonicalize()
-        .unwrap_or_else(|_| resume_dir.to_path_buf());
-    let start_step = canonical
+    // Derive absolute step from the canonical dir name `step_<N>`.
+    // `resume_dir` is already canonicalized above, so `file_name()` resolves
+    // to the `step_NNNNNN` target directly (not the literal "latest").
+    let start_step = resume_dir
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(|s| s.strip_prefix("step_"))
@@ -901,6 +912,7 @@ fn save_checkpoint(
         serde_json::to_string_pretty(&config_json)?,
     )?;
     fs::copy(tokenizer_path, step_dir.join("tokenizer.json"))?;
+    write_generation_config(&step_dir, bos_token_id, eos_token_id)?;
 
     let weights_path = step_dir.join("model.safetensors");
     match save_dtype {
@@ -909,7 +921,12 @@ fn save_checkpoint(
     }
     // DX-1: refresh `<out>/latest` symlink after weights write so the
     // just-written step becomes directly addressable for `infer` / resume.
-    write_latest_symlink(out_dir, &step_basename)?;
+    // `publish_latest_after_weights` asserts `model.safetensors` exists in
+    // `step_dir` before flipping the symlink — codifies the publish-last
+    // contract so a future refactor that moves this call above the weight
+    // write (or drops it) would fail a targeted unit test instead of silently
+    // exposing an incomplete checkpoint dir.
+    publish_latest_after_weights(out_dir, &step_basename)?;
 
     println!(
         "[pretrain_qwen3] saved step {} to {} (dtype: {:?})",
@@ -918,4 +935,41 @@ fn save_checkpoint(
         save_dtype
     );
     Ok(())
+}
+
+fn write_generation_config(
+    step_dir: &Path,
+    bos_token_id: u32,
+    eos_token_id: u32,
+) -> Result<(), CliError> {
+    let mut eos_token_ids = vec![eos_token_id];
+    if bos_token_id != eos_token_id {
+        eos_token_ids.push(bos_token_id);
+    }
+    let generation_config = json!({
+        "eos_token_id": eos_token_ids,
+    });
+    fs::write(
+        step_dir.join("generation_config.json"),
+        serde_json::to_string_pretty(&generation_config)?,
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn generation_config_is_written_with_stop_tokens() {
+        let tmp = tempdir().expect("tempdir");
+        write_generation_config(tmp.path(), 151_643, 151_645).expect("write generation config");
+
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(tmp.path().join("generation_config.json")).expect("read file"),
+        )
+        .expect("parse generation config");
+        assert_eq!(value["eos_token_id"], json!([151_645, 151_643]));
+    }
 }
