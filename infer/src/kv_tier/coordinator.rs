@@ -185,10 +185,19 @@ pub struct RehydrateRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordinatorCommand {
+    /// T0 → T1 demote. In v1 (scheduler-owns-copy, see
+    /// `docs/plans/gap5-c2-byte-path-architecture.md`), the scheduler
+    /// has already moved the bytes before submitting this — the
+    /// command exists so the coordinator can emit the matching
+    /// `DemoteQueued`/`DemoteCompleted` events for `/v1/stats`
+    /// observability. `byte_count` lets the metrics layer bump
+    /// `t1_bytes_demoted_total` without the scheduler needing to.
     Demote {
+        ticket: StageTicket,
         block: BlockId,
         from: BlockLocation,
         to: BlockLocation,
+        byte_count: usize,
     },
     Promote {
         block: BlockId,
@@ -268,6 +277,31 @@ pub enum CoordinatorEvent {
         failed_block: BlockId,
         reason: String,
     },
+    /// T0 → T1 demote enqueued. Informational — in v1 the scheduler
+    /// already moved the bytes (see
+    /// `docs/plans/gap5-c2-byte-path-architecture.md`); this fires so
+    /// metric counters stay aligned with the Spill/Rehydrate cadence.
+    DemoteQueued {
+        ticket: StageTicket,
+        block: BlockId,
+        to: BlockLocation,
+    },
+    /// T0 → T1 demote acknowledged. Scheduler bumps `t1_demotes_total`
+    /// + `t1_bytes_demoted_total` on receipt. `bytes` is the payload
+    /// size the scheduler reported on submit.
+    DemoteCompleted {
+        ticket: StageTicket,
+        block: BlockId,
+        bytes: usize,
+    },
+    /// T0 → T1 demote failed. Reserved for a future Option-B
+    /// migration where the coordinator runs the copy (see the
+    /// architecture decision doc). Unused in v1.
+    DemoteFailed {
+        ticket: StageTicket,
+        block: BlockId,
+        reason: String,
+    },
 }
 
 #[derive(Clone)]
@@ -303,6 +337,33 @@ impl CoordinatorHandle {
         let ticket = StageTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
         self.send(CoordinatorCommand::Spill { ticket, blocks })
             .ok()?;
+        Some(ticket)
+    }
+
+    /// Mint a fresh `StageTicket` for a T0 → T1 demote event and
+    /// enqueue the corresponding `Demote` command. Per v1 architecture
+    /// (scheduler-owns-copy), the caller must have already moved the
+    /// bytes (via `PagedKVPool::copy_pages_to_host` + memcpy into the
+    /// host pinned region) before calling this — the coordinator
+    /// simply emits the matching telemetry events. `byte_count` is the
+    /// payload size the scheduler already moved, used for the
+    /// `DemoteCompleted { bytes }` event.
+    pub fn submit_demote(
+        &self,
+        block: BlockId,
+        from: BlockLocation,
+        to: BlockLocation,
+        byte_count: usize,
+    ) -> Option<StageTicket> {
+        let ticket = StageTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
+        self.send(CoordinatorCommand::Demote {
+            ticket,
+            block,
+            from,
+            to,
+            byte_count,
+        })
+        .ok()?;
         Some(ticket)
     }
 
@@ -371,6 +432,32 @@ impl Coordinator {
                             .map_err(|e| anyhow!("coordinator event send failed: {e}"))?;
                         self.events
                             .send(CoordinatorEvent::StagingCompleted { ticket: *ticket })
+                            .map_err(|e| anyhow!("coordinator event send failed: {e}"))?;
+                    }
+                    CoordinatorCommand::Demote {
+                        ticket,
+                        block,
+                        to,
+                        byte_count,
+                        ..
+                    } => {
+                        // v1: scheduler already moved the bytes before
+                        // submitting; the coordinator only sequences
+                        // the telemetry events. See
+                        // `docs/plans/gap5-c2-byte-path-architecture.md`.
+                        self.events
+                            .send(CoordinatorEvent::DemoteQueued {
+                                ticket: *ticket,
+                                block: *block,
+                                to: to.clone(),
+                            })
+                            .map_err(|e| anyhow!("coordinator event send failed: {e}"))?;
+                        self.events
+                            .send(CoordinatorEvent::DemoteCompleted {
+                                ticket: *ticket,
+                                block: *block,
+                                bytes: *byte_count,
+                            })
                             .map_err(|e| anyhow!("coordinator event send failed: {e}"))?;
                     }
                     _ => {
@@ -464,6 +551,41 @@ mod tests {
         assert_eq!(
             events.recv().unwrap(),
             CoordinatorEvent::StagingCompleted { ticket }
+        );
+    }
+
+    #[test]
+    fn coordinator_demote_emits_queued_then_completed_events() {
+        // Gap #5 C2 shape freeze — scheduler submits a Demote with the
+        // byte_count it already moved; coordinator emits a telemetry
+        // pair (DemoteQueued, DemoteCompleted). See
+        // `docs/plans/gap5-c2-byte-path-architecture.md`.
+        let (coordinator, handle, events) = Coordinator::new(4);
+        let ticket = handle
+            .submit_demote(
+                BlockId(42),
+                BlockLocation::Gpu { slot: 7 },
+                BlockLocation::HostPinned { offset: 0x1000 },
+                147_456,
+            )
+            .expect("submit_demote returns ticket");
+
+        assert!(coordinator.run_once().unwrap());
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::DemoteQueued {
+                ticket,
+                block: BlockId(42),
+                to: BlockLocation::HostPinned { offset: 0x1000 },
+            }
+        );
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::DemoteCompleted {
+                ticket,
+                block: BlockId(42),
+                bytes: 147_456,
+            }
         );
     }
 

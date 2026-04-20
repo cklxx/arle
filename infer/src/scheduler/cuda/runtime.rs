@@ -44,8 +44,35 @@ impl<M: ModelForward> Scheduler<M> {
                     crate::kv_tier::CoordinatorEvent::CommandQueued(_)
                     | crate::kv_tier::CoordinatorEvent::StagingQueued { .. }
                     | crate::kv_tier::CoordinatorEvent::SpillQueued { .. }
-                    | crate::kv_tier::CoordinatorEvent::RehydrateQueued { .. },
+                    | crate::kv_tier::CoordinatorEvent::RehydrateQueued { .. }
+                    | crate::kv_tier::CoordinatorEvent::DemoteQueued { .. },
                 ) => {}
+                Ok(crate::kv_tier::CoordinatorEvent::DemoteCompleted {
+                    ticket,
+                    block,
+                    bytes,
+                }) => {
+                    // Gap #5 C2 shape freeze — v1 coordinator is a pure
+                    // telemetry sink (scheduler-owns-copy per
+                    // `docs/plans/gap5-c2-byte-path-architecture.md`).
+                    // Scheduler-side demote hook that wires this into
+                    // `t1_demotes_total` + `t1_bytes_demoted_total`
+                    // counters lands in C3.
+                    log::debug!(
+                        "demote acknowledged: ticket={} block={block:?} bytes={bytes}",
+                        ticket.0
+                    );
+                }
+                Ok(crate::kv_tier::CoordinatorEvent::DemoteFailed {
+                    ticket,
+                    block,
+                    reason,
+                }) => {
+                    log::warn!(
+                        "demote failed: ticket={} block={block:?} reason={reason}",
+                        ticket.0
+                    );
+                }
                 Ok(crate::kv_tier::CoordinatorEvent::StagingCompleted { ticket }) => {
                     let Some(staged) = self.stage_waiting.remove(&ticket) else {
                         log::debug!(
@@ -609,7 +636,7 @@ mod tests {
     use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerConfig};
     use crate::tokenizer::Tokenizer;
     use crate::types::SessionId;
-    use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec};
+    use cuda_kernels::prelude::{DeviceContext, DeviceVec};
     use log::{Level, LevelFilter, Log, Metadata, Record};
     use std::collections::HashMap;
     use std::sync::{Mutex, Once};
