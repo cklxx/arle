@@ -3,10 +3,30 @@
 > Template for canonical guidellm bench wins. Copy this file when
 > `scripts/bench_guidellm.sh` runs, fill the placeholders, commit. Never
 > edit an existing wins entry — always create a new dated one and diff
-> against the prior. Canonical params are locked in
+> against the prior. `scripts/bench_throughput.py` is legacy only.
+> Canonical params are locked in
 > [`docs/plans/guidellm-integration.md`](../../plans/guidellm-integration.md) §3.
 
-## Context
+## Goal
+
+- <one sentence describing the benchmark goal and goal type>
+
+## Hypothesis
+
+- <expected outcome before the run>
+
+## Command
+
+```bash
+scripts/bench_guidellm.sh <backend-label> \
+  [--target http://localhost:8000] \
+  [--model Qwen/Qwen3-4B] \
+  [--processor models/Qwen3-4B]
+```
+
+Invoked via: `scripts/bench_guidellm.sh <backend-label> [--target URL] [--model NAME] [--processor PATH]`
+
+## Environment
 
 - **Backend:** <cuda | metal>
 - **Model:** <Qwen/Qwen3-4B | Qwen/Qwen3.5-4B | THUDM/GLM-4 | ...>
@@ -18,19 +38,12 @@
 
 ## Canonical params (DO NOT CHANGE PER-RUN)
 
-```
-guidellm benchmark \
-  --target http://localhost:8000 \
-  --model <model> \
-  --profile sweep \
-  --data  prompt_tokens=4096,output_tokens=256 \
-  --max-seconds 60 \
-  --random-seed 20260416 \
-  --output-dir bench-output/<date>-<label>/ \
-  --outputs json,csv,html
-```
-
-Invoked via: `scripts/bench_guidellm.sh <backend-label>`
+- `--profile sweep`
+- `--data prompt_tokens=4096,output_tokens=256`
+- `--max-seconds 60`
+- `--random-seed 20260416`
+- `--outputs json,csv,html`
+- Wrapper: `scripts/bench_guidellm.sh <backend-label>`
 
 ## Results — sweep headline table
 
@@ -40,13 +53,15 @@ Invoked via: `scripts/bench_guidellm.sh <backend-label>`
 | ... (sweep auto-steps) ... |
 | saturation | ... | ... | ... | ... | ... | ... |
 
-## Artefacts
+## Problems
 
-- Raw: `bench-output/<date>-<label>/benchmarks.json`
-- CSV:  `bench-output/<date>-<label>/benchmarks.csv`
-- HTML: `bench-output/<date>-<label>/benchmarks.html`
+- <anything that degraded, crashed, or deviated from the watch-list>
 
-## Delta vs previous snapshot
+## Learnings
+
+- <generalizable rule or tuning takeaway>
+
+## Δ vs baseline
 
 - **Baseline:** <link to prior `<YYYY-MM-DD>-bench-guidellm-<label>.md`>
 - **Delta table** (only when a prior snapshot exists — else "first run"):
@@ -55,6 +70,12 @@ Invoked via: `scripts/bench_guidellm.sh <backend-label>`
 |---|---|---|---|
 | TTFT p50 @ synchronous | ... | ... | ... |
 | out tok/s @ saturation | ... | ... | ... |
+
+## Artefacts
+
+- Raw: `bench-output/<date>-<label>/benchmarks.json`
+- CSV:  `bench-output/<date>-<label>/benchmarks.csv`
+- HTML: `bench-output/<date>-<label>/benchmarks.html`
 
 ## Notes
 

@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -21,6 +20,7 @@ use train::{
     cli_args::{ArgError, next_value, parse_value},
     grad_clip::NoClip,
     qwen3::{Qwen3Error, Qwen3Model},
+    qwen3_support::{build_registry, live_tensor_ids, trainable_params},
     sft_data::{TokenizedSft, load_jsonl, tokenize_example},
     tokenizer::ChatTokenizer,
 };
@@ -495,30 +495,6 @@ fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
     }
 }
 
-fn build_registry(model: &Qwen3Model) -> SafetensorsRegistry {
-    let mut registry = SafetensorsRegistry::new();
-    for (name, tensor_id) in model.param_name_map() {
-        registry.insert(name, tensor_id);
-    }
-    registry
-}
-
-fn trainable_params(model: &Qwen3Model, store: &TensorStore) -> Vec<TensorId> {
-    let mut params = model
-        .param_name_map()
-        .into_values()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .filter(|tensor_id| {
-            store
-                .get(*tensor_id)
-                .is_some_and(|tensor| tensor.requires_grad)
-        })
-        .collect::<Vec<_>>();
-    params.sort_unstable();
-    params
-}
-
 fn assistant_masked_causal_loss(
     logits: TensorId,
     labels: &[i32],
@@ -629,6 +605,10 @@ fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), Cl
         ("num_key_value_heads", cfg.num_key_value_heads as i64),
         ("head_dim", cfg.head_dim as i64),
         ("vocab_size", cfg.vocab_size as i64),
+        (
+            "max_position_embeddings",
+            cfg.max_position_embeddings as i64,
+        ),
     ]
     .iter()
     .filter_map(|(k, v)| match file_cfg.get(*k).and_then(|x| x.as_i64()) {
@@ -654,6 +634,12 @@ fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), Cl
             "tie_word_embeddings: ckpt={saw} live={}",
             cfg.tie_word_embeddings
         ));
+    }
+
+    if let Some(seen) = file_cfg.get("rope_theta").and_then(|v| v.as_f64())
+        && seen != cfg.rope_theta as f64
+    {
+        mismatches.push(format!("rope_theta: ckpt={seen} live={}", cfg.rope_theta));
     }
 
     if !mismatches.is_empty() {
@@ -761,10 +747,76 @@ fn write_generation_config(
     Ok(())
 }
 
+fn has_supervised_target(example: &TokenizedSft) -> bool {
+    example.labels.iter().skip(1).any(|&label| label >= 0)
+}
+
+/// Deterministic in `(seed, step, micro_step)` — stateless w.r.t. any
+/// running RNG, so a `--resume-from` run picks up the same data stream a
+/// single uninterrupted run would have produced. Mixing is SplitMix64 on
+/// top of a `step * golden_ratio ^ (micro_step << 32)` combine so
+/// consecutive triples spread uniformly across `[0, upper)` instead of
+/// clustering on a single-bit flip.
+///
+/// Codex review 2026-04-20 on 49512b1 (#2 Medium): prior version drew
+/// from a shared `LcgRng` whose position was not persisted in the
+/// checkpoint, so a resumed run redrew from position 0 and diverged
+/// immediately from the interrupted-run's data order.
+fn sample_index(seed: u64, upper: usize, step: usize, micro_step: usize) -> usize {
+    if upper <= 1 {
+        return 0;
+    }
+    let mut h =
+        seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ((micro_step as u64) << 32);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    (h % upper as u64) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn resume_cfg() -> Qwen3Config {
+        Qwen3Config {
+            hidden_size: 2048,
+            intermediate_size: 5632,
+            num_hidden_layers: 24,
+            num_attention_heads: 32,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            vocab_size: 151936,
+            rms_norm_eps: 1.0e-6,
+            rope_theta: 1_000_000.0,
+            tie_word_embeddings: true,
+            max_position_embeddings: 32768,
+        }
+    }
+
+    fn write_resume_config(dir: &Path, cfg: &Qwen3Config) {
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_string_pretty(&json!({
+                "hidden_size": cfg.hidden_size,
+                "intermediate_size": cfg.intermediate_size,
+                "num_hidden_layers": cfg.num_hidden_layers,
+                "num_attention_heads": cfg.num_attention_heads,
+                "num_key_value_heads": cfg.num_key_value_heads,
+                "head_dim": cfg.head_dim,
+                "vocab_size": cfg.vocab_size,
+                "rms_norm_eps": cfg.rms_norm_eps,
+                "rope_theta": cfg.rope_theta,
+                "tie_word_embeddings": cfg.tie_word_embeddings,
+                "max_position_embeddings": cfg.max_position_embeddings,
+            }))
+            .expect("serialize config"),
+        )
+        .expect("write config");
+    }
 
     #[test]
     fn generation_config_is_copied_when_present() {
@@ -817,42 +869,52 @@ mod tests {
         .expect("parse generation config");
         assert_eq!(generated["eos_token_id"], json!([7, 3]));
     }
-}
 
-fn has_supervised_target(example: &TokenizedSft) -> bool {
-    example.labels.iter().skip(1).any(|&label| label >= 0)
-}
+    #[test]
+    fn validate_resume_config_accepts_matching_config() {
+        let tmp = tempdir().expect("tempdir");
+        let resume_dir = tmp.path();
+        let cfg = resume_cfg();
+        write_resume_config(resume_dir, &cfg);
 
-/// Deterministic in `(seed, step, micro_step)` — stateless w.r.t. any
-/// running RNG, so a `--resume-from` run picks up the same data stream a
-/// single uninterrupted run would have produced. Mixing is SplitMix64 on
-/// top of a `step * golden_ratio ^ (micro_step << 32)` combine so
-/// consecutive triples spread uniformly across `[0, upper)` instead of
-/// clustering on a single-bit flip.
-///
-/// Codex review 2026-04-20 on 49512b1 (#2 Medium): prior version drew
-/// from a shared `LcgRng` whose position was not persisted in the
-/// checkpoint, so a resumed run redrew from position 0 and diverged
-/// immediately from the interrupted-run's data order.
-fn sample_index(seed: u64, upper: usize, step: usize, micro_step: usize) -> usize {
-    if upper <= 1 {
-        return 0;
+        validate_resume_config(resume_dir, &cfg).expect("matching config should pass");
     }
-    let mut h =
-        seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ((micro_step as u64) << 32);
-    h ^= h >> 30;
-    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    h ^= h >> 27;
-    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
-    h ^= h >> 31;
-    (h % upper as u64) as usize
-}
 
-fn live_tensor_ids(store: &TensorStore) -> HashSet<TensorId> {
-    store
-        .tensors
-        .iter()
-        .enumerate()
-        .filter_map(|(tensor_id, slot)| slot.as_ref().map(|_| tensor_id))
-        .collect()
+    #[test]
+    fn validate_resume_config_rejects_max_position_embeddings_mismatch() {
+        let tmp = tempdir().expect("tempdir");
+        let resume_dir = tmp.path();
+        let cfg = resume_cfg();
+        write_resume_config(resume_dir, &cfg);
+
+        let live_cfg = Qwen3Config {
+            max_position_embeddings: cfg.max_position_embeddings + 1,
+            ..cfg
+        };
+
+        let err = validate_resume_config(resume_dir, &live_cfg).expect_err("should reject");
+        assert!(
+            err.to_string().contains("max_position_embeddings"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resume_config_rejects_rope_theta_mismatch() {
+        let tmp = tempdir().expect("tempdir");
+        let resume_dir = tmp.path();
+        let cfg = resume_cfg();
+        write_resume_config(resume_dir, &cfg);
+
+        let live_cfg = Qwen3Config {
+            rope_theta: cfg.rope_theta * 2.0,
+            ..cfg
+        };
+
+        let err = validate_resume_config(resume_dir, &live_cfg).expect_err("should reject");
+        assert!(
+            err.to_string().contains("rope_theta"),
+            "unexpected error: {err}"
+        );
+    }
 }

@@ -30,6 +30,17 @@
 
 * { box-sizing: border-box; }
 
+/* visually-hidden for screen-reader-only text (e.g. h1 title) */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 html {
   scroll-behavior: smooth;
   background: var(--paper);
@@ -182,6 +193,16 @@ code      { font-family: inherit; color: var(--coral-dim); }
   color: var(--paper);
   background: var(--ochre);
 }
+.jumps .lang {
+  margin-left: auto;
+  color: var(--ink-dim);
+  padding: 2px 4px;
+  border-left: 1px dashed var(--ochre);
+  padding-left: 10px;
+}
+.jumps .lang b { color: var(--coral-dim); font-weight: 700; }
+.jumps .lang a { color: var(--ochre); padding: 0 2px; }
+.jumps .lang a:hover { color: var(--paper); background: var(--ochre); }
 
 /* ── sections ──────────────────────────────────────────────────────── */
 
