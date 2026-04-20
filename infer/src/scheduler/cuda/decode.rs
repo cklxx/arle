@@ -257,7 +257,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    fn mixed_prefill_budget_tokens(&self) -> usize {
+    pub(super) fn mixed_prefill_budget_tokens(&self) -> usize {
         self.config
             .max_prefill_tokens
             .min(MIXED_PREFILL_TOKENS_ALLOC_CAP)
@@ -394,11 +394,7 @@ impl<M: ModelForward> Scheduler<M> {
 
             let mut protected_slots = decode_slot_indices.clone();
             protected_slots.extend(candidates.iter().map(|cand| cand.slot_idx));
-            match self.plan_pool_capacity_without_retract(
-                required_tokens,
-                required_pages,
-                &protected_slots,
-            ) {
+            match self.plan_pool_capacity(required_tokens, required_pages, &protected_slots) {
                 Ok(pool_plan) => {
                     let sampling_params_greedy = decode_indices
                         .iter()
@@ -431,13 +427,13 @@ impl<M: ModelForward> Scheduler<M> {
                 Err(e) if candidates.len() > 1 => {
                     let dropped = candidates.pop().expect("checked len > 1");
                     warn!(
-                        "Mixed decode plan: dropping req {} from this tick after non-retract pool planning failed: {}",
+                        "Mixed decode plan: dropping req {} from this tick after pool planning failed: {}",
                         self.active[dropped.req_idx].id, e
                     );
                 }
                 Err(e) => {
                     warn!(
-                        "Mixed decode plan falling back to plain decode after non-retract pool planning failed: {}",
+                        "Mixed decode plan falling back to plain decode after pool planning failed: {}",
                         e
                     );
                     return self
@@ -808,7 +804,6 @@ impl<M: ModelForward> Scheduler<M> {
             }
             mixed_prefill_chunks.push(PendingPrefillChunk {
                 req_idx: chunk.req_idx,
-                token_count: c_i,
                 completes: chunk.completes,
                 logit_row,
             });

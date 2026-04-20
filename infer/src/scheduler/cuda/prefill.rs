@@ -278,16 +278,12 @@ impl<M: ModelForward> Scheduler<M> {
         let chunk_pool_plan = if uses_paged {
             let (required_tokens, required_pages) =
                 self.pool_append_requirements(&[(slot_idx, chunk_len)]);
-            match self.plan_pool_capacity_without_retract(
-                required_tokens,
-                required_pages,
-                &[slot_idx],
-            ) {
+            match self.plan_pool_capacity(required_tokens, required_pages, &[slot_idx]) {
                 Ok(plan) => Some(plan),
                 Err(e) => {
                     let req_id = self.active[idx].id;
                     warn!(
-                        "Request {}: deferring paged prefill chunk this tick without decode retract (slot {}, len={}): {}",
+                        "Request {}: deferring paged prefill chunk this tick (slot {}, len={}): {}",
                         req_id, slot_idx, chunk_len, e
                     );
                     return None;
@@ -302,16 +298,12 @@ impl<M: ModelForward> Scheduler<M> {
         {
             let (required_tokens, required_pages) =
                 self.pool_append_requirements(&[(slot_idx, total)]);
-            match self.plan_pool_capacity_without_retract(
-                required_tokens,
-                required_pages,
-                &[slot_idx],
-            ) {
+            match self.plan_pool_capacity(required_tokens, required_pages, &[slot_idx]) {
                 Ok(plan) => Some(plan),
                 Err(e) => {
                     let req_id = self.active[idx].id;
                     warn!(
-                        "Request {}: deferring final prefill chunk before migration without decode retract (slot {}, total={}): {}",
+                        "Request {}: deferring final prefill chunk before migration (slot {}, total={}): {}",
                         req_id, slot_idx, total, e
                     );
                     return None;

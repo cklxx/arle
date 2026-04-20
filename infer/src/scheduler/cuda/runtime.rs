@@ -528,8 +528,8 @@ impl<M: ModelForward> Scheduler<M> {
                     self.slot_materialized_prompt_lens[req.slot_idx] = 0;
                 }
                 // Pool pages already freed inside retract; `free_slot`
-                // here is idempotent but we keep it so the non-retract
-                // path (normal completion) still releases.
+                // here is idempotent but we keep it so the normal
+                // completion path still releases.
                 self.paged_kv_pool.free_slot(req.slot_idx);
 
                 if was_retracted {
@@ -1228,98 +1228,4 @@ mod tests {
         assert!(scheduler.paged_kv_pool.free_count() >= 768);
     }
 
-    #[test]
-    fn pool_plan_without_retract_defers_prefill_pressure() {
-        let mut scheduler = test_scheduler();
-
-        let (tx0, _rx0) = mpsc::unbounded_channel();
-        let (tx1, _rx1) = mpsc::unbounded_channel();
-        scheduler.active.push(ActiveRequest {
-            id: 1,
-            slot_idx: 0,
-            admitted_at: std::time::Instant::now(),
-            first_token_at: None,
-            prompt: "tok tok".to_string(),
-            prompt_tokens: vec![1; 64],
-            generated_tokens: vec![1; 8],
-            max_tokens: 32,
-            sampling: SamplingParams::default(),
-            stop: None,
-            session_id: Some(SessionId::from("req-0")),
-            delta_tx: tx0,
-            full_decoded: String::new(),
-            decoded_token_count: 0,
-            sent_len: 0,
-            phase: Phase::Decoding,
-            cacheable_prompt_len: 0,
-            prefix_byte_len: 0,
-            latest_logprob: None,
-            reusable_prefix_len: 0,
-            reusable_cached_prompt_len: 0,
-            first_step_at: None,
-            finished_at: None,
-            t_prefill_us: 0,
-            t_decode_us: 0,
-            t_emit_us: 0,
-            t_new_us: 0,
-            step_count: 0,
-        });
-        scheduler.active.push(ActiveRequest {
-            id: 2,
-            slot_idx: 1,
-            admitted_at: std::time::Instant::now(),
-            first_token_at: None,
-            prompt: "tok tok tok".to_string(),
-            prompt_tokens: vec![1; 32],
-            generated_tokens: Vec::new(),
-            max_tokens: 32,
-            sampling: SamplingParams::default(),
-            stop: None,
-            session_id: Some(SessionId::from("req-1")),
-            delta_tx: tx1,
-            full_decoded: String::new(),
-            decoded_token_count: 0,
-            sent_len: 0,
-            phase: Phase::Prefilling {
-                effective_tokens: vec![1; 512],
-                progress: 512,
-            },
-            cacheable_prompt_len: 0,
-            prefix_byte_len: 0,
-            latest_logprob: None,
-            reusable_prefix_len: 0,
-            reusable_cached_prompt_len: 0,
-            first_step_at: None,
-            finished_at: None,
-            t_prefill_us: 0,
-            t_decode_us: 0,
-            t_emit_us: 0,
-            t_new_us: 0,
-            step_count: 0,
-        });
-
-        scheduler
-            .paged_kv_pool
-            .alloc_tokens(0, 256)
-            .expect("protected slot alloc should succeed");
-        scheduler
-            .paged_kv_pool
-            .alloc_tokens(1, 512)
-            .expect("victim slot alloc should succeed");
-
-        let (required_tokens, required_pages) = scheduler.pool_append_requirements(&[(0, 400)]);
-        let err = scheduler
-            .plan_pool_capacity_without_retract(required_tokens, required_pages, &[0])
-            .expect_err("non-retract planner should defer instead of evicting active decode");
-        assert!(err.to_string().contains("without retract"));
-        assert!(matches!(scheduler.active[0].phase, Phase::Decoding));
-        assert!(matches!(
-            scheduler.active[1].phase,
-            Phase::Prefilling { .. }
-        ));
-        assert!(scheduler.waiting.is_empty());
-        assert!(scheduler.retracted_request_ids.is_empty());
-        assert_eq!(scheduler.paged_kv_pool.seq_len(0), 256);
-        assert_eq!(scheduler.paged_kv_pool.seq_len(1), 512);
-    }
 }

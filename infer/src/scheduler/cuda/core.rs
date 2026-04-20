@@ -70,7 +70,6 @@ pub(super) struct StagedAdmission {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PendingPrefillChunk {
     pub req_idx: usize,
-    pub token_count: usize,
     pub completes: bool,
     #[allow(dead_code)]
     pub logit_row: usize,
@@ -236,8 +235,9 @@ pub struct Scheduler<M: ModelForward> {
     /// Pending decode state for GPU/CPU overlap.
     pub(super) pending_decode: Option<PendingDecode>,
     /// Prefill requests consumed by the mixed decode launch in the current
-    /// step. Populated by `step_decode_launch_mixed`, read by the regular
-    /// prefill section in `execution.rs` so we skip reqs already fused.
+    /// step. Populated by `step_decode_launch_mixed`, read by Phase 2c in
+    /// `execution.rs`; when non-empty, the mixed launch owns this tick's
+    /// prefill work and Phase 2c does not enqueue standalone prefill.
     pub(super) pending_mixed_prefill_idxs: Vec<usize>,
     /// Round-robin cursor into `active` for fair mixed-prefill selection.
     /// Advances by the number of prefills actually fused each tick.
@@ -256,13 +256,6 @@ pub struct Scheduler<M: ModelForward> {
 }
 
 impl<M: ModelForward> Scheduler<M> {
-    fn warmup_mixed_graphs_enabled() -> bool {
-        matches!(
-            std::env::var("INFER_WARMUP_MIXED_CUDA_GRAPH").as_deref(),
-            Ok("1") | Ok("true") | Ok("yes")
-        )
-    }
-
     fn prepare_warmup_decode_slots(&mut self, slot_count: usize) -> Result<usize> {
         let mut prepared = 0;
         for slot in 0..slot_count {
@@ -1243,7 +1236,6 @@ impl<M: ModelForward> Scheduler<M> {
         required_tokens: usize,
         required_pages: usize,
         protected_slots: &[usize],
-        allow_retract: bool,
     ) -> Result<PoolReservationPlan> {
         if (required_tokens == 0 && required_pages == 0) || !self.paged_kv_pool.is_active() {
             return Ok(PoolReservationPlan {
@@ -1275,18 +1267,6 @@ impl<M: ModelForward> Scheduler<M> {
                 retracted_tokens: 0,
             });
         }
-        if !allow_retract {
-            return Err(anyhow::anyhow!(
-                "pool plan deferred without retract: need_tokens={} need_pages={} free_tokens={} free_pages={} reclaimed_prefix={} protected_slots={:?}",
-                required_tokens,
-                required_pages,
-                self.paged_kv_pool.free_count(),
-                self.paged_kv_pool.free_page_count(),
-                reclaimed_prefix_tokens,
-                protected_slots
-            ));
-        }
-
         let retract_target_tokens = required_tokens.saturating_sub(self.paged_kv_pool.free_count());
         let retracted_tokens =
             self.retract_pool_pressure_victims_excluding(retract_target_tokens, protected_slots);
@@ -1319,16 +1299,7 @@ impl<M: ModelForward> Scheduler<M> {
         required_pages: usize,
         protected_slots: &[usize],
     ) -> Result<PoolReservationPlan> {
-        self.plan_pool_capacity_internal(required_tokens, required_pages, protected_slots, true)
-    }
-
-    pub(super) fn plan_pool_capacity_without_retract(
-        &mut self,
-        required_tokens: usize,
-        required_pages: usize,
-        protected_slots: &[usize],
-    ) -> Result<PoolReservationPlan> {
-        self.plan_pool_capacity_internal(required_tokens, required_pages, protected_slots, false)
+        self.plan_pool_capacity_internal(required_tokens, required_pages, protected_slots)
     }
 
     /// Retract running requests to free at least `required_tokens` worth of
@@ -1523,7 +1494,7 @@ impl<M: ModelForward> Scheduler<M> {
         let graph_capture_enabled = self.model.supports_cuda_graph_decode();
         let warmup_mixed_graphs = graph_capture_enabled
             && self.model.supports_mixed_batch()
-            && Self::warmup_mixed_graphs_enabled();
+            && self.config.enable_mixed_chunk;
         let max_bs = num_slots.min(256);
         let warmup_sizes = Self::cuda_graph_batch_sizes(max_bs);
 

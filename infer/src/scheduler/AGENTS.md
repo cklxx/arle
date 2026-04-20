@@ -36,9 +36,16 @@ works with any backend. Load before editing any scheduler internals.
    These are tuned — change only with a bench snapshot.
 4. **`PREFIX_CACHE_BLOCK_SIZE = 16` matches the paged-pool page size.**
    Changing one without the other breaks M2 dual residency.
-5. **`ChunkingPolicy` is decode-aware.** Default prefill chunk = 4096;
-   drops to 64 when decode is active so prefill can't starve decode ITL.
-   The test is `active_decodes > 0`, not "any running request".
+5. **Do not confuse policy helpers with the production CUDA scheduler.**
+   `policy.rs::DecodeAwareChunking` is a legacy/generic policy helper used by
+   the CPU accounting scheduler tests; it is **not** the source of truth for
+   CUDA runtime chunk sizing. In production CUDA:
+   - standalone prefill chunk size comes from `Scheduler::prefill_chunk_size()`
+     (`chunked_prefill_size`, plus contiguous-scratch bounds when applicable),
+     and is **not** globally forced to `64` just because decode is active;
+   - `64` is currently the `Qwen3` mixed fused prefill-token cap
+     (`model/qwen3/batch_decode.rs::MIXED_PREFILL_CAP`), i.e. a mixed-kernel
+     launch limit, not a project-wide prefill invariant.
 6. **Hybrid models (Qwen3.5) cannot truncate recurrent state.** `prefill.rs`
    downgrades partial prefix hits to full MISS when
    `!state.supports_partial_prefix()`. Only full-prefix hits benefit from

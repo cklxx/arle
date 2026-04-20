@@ -135,6 +135,10 @@ pub trait ChunkingPolicy: Send + Sync {
 }
 
 /// Decode-aware chunking policy with a conservative fallback.
+///
+/// This is a generic policy helper used by the backend-agnostic batch
+/// scheduler/tests. It is not the production CUDA runtime's source of truth
+/// for standalone prefill chunk sizing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeAwareChunking {
     pub decode_active_chunk: usize,
