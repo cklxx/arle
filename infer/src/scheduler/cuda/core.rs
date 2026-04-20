@@ -245,7 +245,8 @@ impl<M: ModelForward> Scheduler<M> {
     pub fn read_block_payload(&self, fingerprint: BlockFingerprint) -> Option<Vec<u8>> {
         let block_id = self.prefix_cache.block_id_for_fingerprint(fingerprint)?;
         let pages = self.block_to_pages.get(&block_id)?;
-        self.paged_kv_pool.copy_pages_to_host(pages).ok()
+        let stream = &self.model.device_context().stream;
+        self.paged_kv_pool.copy_pages_to_host(pages, stream).ok()
     }
 
     pub fn install_restored_kv(
@@ -259,13 +260,14 @@ impl<M: ModelForward> Scheduler<M> {
             .max(1);
         let mut prepared = HashMap::with_capacity(payloads.len());
 
+        let stream = self.model.device_context().stream.clone();
         for (&fingerprint, payload) in payloads {
             let Ok(pages) = self.paged_kv_pool.alloc_detached_pages(pages_per_block) else {
                 break;
             };
             if self
                 .paged_kv_pool
-                .copy_pages_from_host(&pages, payload)
+                .copy_pages_from_host(&pages, payload, &stream)
                 .is_err()
             {
                 continue;

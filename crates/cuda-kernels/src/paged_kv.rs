@@ -510,38 +510,168 @@ impl TokenKVPool {
         Ok(new_pages)
     }
 
-    /// INTENTIONALLY left as `todo!()` in the cuda branch until a CUDA host validates it.
-    pub fn copy_pages_to_host(&self, pages: &[u32]) -> Result<Vec<u8>> {
-        #[cfg(feature = "cuda")]
-        {
-            let _ = pages;
-            todo!("PagedKVPool::copy_pages_to_host requires validation on a CUDA host")
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = pages;
-            Err(anyhow!(
-                "PagedKVPool::copy_pages_to_host is unavailable without feature=cuda"
-            ))
-        }
+    /// Bytes per pool page for one layer's K (or V) buffer.
+    /// Layout: `[max_total_pages, num_kv_heads, page_size, head_dim]` with
+    /// `bytes_per_element` per value, so one page = `num_kv_heads *
+    /// page_size * head_dim * bpe` bytes.
+    #[inline]
+    fn bytes_per_page_per_layer(&self) -> usize {
+        self.num_kv_heads * self.page_size * self.head_dim * self.format.bytes_per_element()
     }
 
-    /// INTENTIONALLY left as `todo!()` in the cuda branch until a CUDA host validates it.
-    pub fn copy_pages_from_host(&self, pages: &[u32], payload: &[u8]) -> Result<()> {
-        #[cfg(feature = "cuda")]
-        {
-            let _ = pages;
-            let _ = payload;
-            todo!("PagedKVPool::copy_pages_from_host requires validation on a CUDA host")
+    /// Total host-buffer bytes for a set of pages:
+    /// `pages.len() * num_layers * 2 (K+V) * bytes_per_page_per_layer`.
+    /// Scale/norm tensors (INT8 / TurboQuant) are NOT included — T1 demote
+    /// is gated to BF16 in v1 per `docs/plans/gap5-kv-tier-demote-prefetch.md`.
+    pub fn pages_host_byte_len(&self, pages: &[u32]) -> usize {
+        pages.len() * self.num_layers * 2 * self.bytes_per_page_per_layer()
+    }
+
+    /// D→H copy a contiguous set of pool pages for all layers' K+V into a
+    /// freshly allocated host `Vec<u8>`. Host layout is page-major,
+    /// layer-minor:
+    /// ```text
+    /// page 0: [L0 K bytes][L0 V bytes][L1 K bytes][L1 V bytes]...[L_{N-1} V bytes]
+    /// page 1: same shape
+    /// ...
+    /// ```
+    /// Total bytes = [`Self::pages_host_byte_len`]`(pages)`. The copy is
+    /// queued on the provided `stream` and drained synchronously (cudarc's
+    /// `memcpy_dtoh` routes through `cuMemcpyDtoHAsync_v2` + stream sync).
+    /// For the async copy-stream path (fire-and-forget + event-polled
+    /// completion), see Gap #5 Commit 2 (`LocalCudaTransport`).
+    ///
+    /// BF16-only in v1. FP8/INT8/TurboQuant include separate scale/norm
+    /// tensors that this helper does not carry; promote-back would need
+    /// round-tripping those too.
+    pub fn copy_pages_to_host(
+        &self,
+        pages: &[u32],
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> Result<Vec<u8>> {
+        if self.format != KVFormat::BF16 {
+            return Err(anyhow!(
+                "PagedKVPool::copy_pages_to_host: unsupported format {:?} (BF16 only in v1)",
+                self.format,
+            ));
         }
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = pages;
-            let _ = payload;
-            Err(anyhow!(
-                "PagedKVPool::copy_pages_from_host is unavailable without feature=cuda"
-            ))
+        let stride = self.bytes_per_page_per_layer();
+        let mut out = vec![0u8; self.pages_host_byte_len(pages)];
+        for (page_slot, &page) in pages.iter().enumerate() {
+            let page_usize = page as usize;
+            if page_usize >= self.max_total_pages {
+                return Err(anyhow!(
+                    "PagedKVPool::copy_pages_to_host: page {} out of range ({})",
+                    page,
+                    self.max_total_pages,
+                ));
+            }
+            let page_byte_base = page_usize * stride;
+            let host_page_base = page_slot * self.num_layers * 2 * stride;
+            for layer in 0..self.num_layers {
+                let host_k = host_page_base + layer * 2 * stride;
+                let host_v = host_k + stride;
+
+                let k_view = self.k_data[layer].slice(page_byte_base..page_byte_base + stride);
+                let v_view = self.v_data[layer].slice(page_byte_base..page_byte_base + stride);
+
+                stream
+                    .memcpy_dtoh(&k_view, &mut out[host_k..host_k + stride])
+                    .map_err(|e| {
+                        anyhow!(
+                            "copy_pages_to_host: D2H K layer {} page {}: {}",
+                            layer,
+                            page,
+                            e
+                        )
+                    })?;
+                stream
+                    .memcpy_dtoh(&v_view, &mut out[host_v..host_v + stride])
+                    .map_err(|e| {
+                        anyhow!(
+                            "copy_pages_to_host: D2H V layer {} page {}: {}",
+                            layer,
+                            page,
+                            e
+                        )
+                    })?;
+            }
         }
+        Ok(out)
+    }
+
+    /// H→D copy — inverse of [`Self::copy_pages_to_host`]. `payload.len()`
+    /// must equal [`Self::pages_host_byte_len`]`(pages)` with the same
+    /// page-major / layer-minor layout.
+    ///
+    /// Note: the caller is responsible for ensuring the target pool pages
+    /// are allocated (e.g. via [`Self::alloc_detached_pages`]) and not
+    /// concurrently being read by attention kernels. T0 promote-back
+    /// coordinates this through the `StagingCompleted` event drain.
+    pub fn copy_pages_from_host(
+        &mut self,
+        pages: &[u32],
+        payload: &[u8],
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> Result<()> {
+        if self.format != KVFormat::BF16 {
+            return Err(anyhow!(
+                "PagedKVPool::copy_pages_from_host: unsupported format {:?} (BF16 only in v1)",
+                self.format,
+            ));
+        }
+        let expected = self.pages_host_byte_len(pages);
+        if payload.len() != expected {
+            return Err(anyhow!(
+                "PagedKVPool::copy_pages_from_host: payload len {} != expected {}",
+                payload.len(),
+                expected,
+            ));
+        }
+        let stride = self.bytes_per_page_per_layer();
+        for (page_slot, &page) in pages.iter().enumerate() {
+            let page_usize = page as usize;
+            if page_usize >= self.max_total_pages {
+                return Err(anyhow!(
+                    "PagedKVPool::copy_pages_from_host: page {} out of range ({})",
+                    page,
+                    self.max_total_pages,
+                ));
+            }
+            let page_byte_base = page_usize * stride;
+            let host_page_base = page_slot * self.num_layers * 2 * stride;
+            for layer in 0..self.num_layers {
+                let host_k = host_page_base + layer * 2 * stride;
+                let host_v = host_k + stride;
+
+                let mut k_view =
+                    self.k_data[layer].slice_mut(page_byte_base..page_byte_base + stride);
+                let mut v_view =
+                    self.v_data[layer].slice_mut(page_byte_base..page_byte_base + stride);
+
+                stream
+                    .memcpy_htod(&payload[host_k..host_k + stride], &mut k_view)
+                    .map_err(|e| {
+                        anyhow!(
+                            "copy_pages_from_host: H2D K layer {} page {}: {}",
+                            layer,
+                            page,
+                            e
+                        )
+                    })?;
+                stream
+                    .memcpy_htod(&payload[host_v..host_v + stride], &mut v_view)
+                    .map_err(|e| {
+                        anyhow!(
+                            "copy_pages_from_host: H2D V layer {} page {}: {}",
+                            layer,
+                            page,
+                            e
+                        )
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     /// Free all token slots for a request.
