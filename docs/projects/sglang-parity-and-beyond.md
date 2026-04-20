@@ -133,7 +133,7 @@ tier state out of the CUDA graph capture, which is A1-critical.
        └ post-tick ─→ publish_to_prefix_cache
                       ├─→ page_ref_count += 1 on radix pin
                       └─→ hit_count bumped on subsequent lookup
-                           ↓ ≥ write_through_threshold
+                           ↓ ≥ t1_demote_min_hits  (config / CLI flag)
   Cleanup
     ├─→ evict_prefix_cache_if_pressured
     │   ├─ gate: hit_count ≥ threshold → demote to T1 (Gap #5 C3)
@@ -251,7 +251,7 @@ Recommended next-commit order, constrained by dependency chain
 
 1. **ROI#2 C2** — unblocks the real perf win the last 4 days of
    probes forecast. Biggest dollar value. ~350 LoC.
-2. **Gap #5 C3** — scheduler demote hook + `t1_write_through_threshold`
+2. **Gap #5 C3** — scheduler demote hook + `t1_demote_min_hits`
    config. Uses `PagedKVPool::copy_pages_to_host` directly (Option A
    decision closed in C2). ~150-200 LoC, lower complexity than the
    original plan estimate thanks to the scheduler-owns-copy

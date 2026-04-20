@@ -46,7 +46,7 @@ The radix block is `PREFIX_CACHE_BLOCK_SIZE = 16` tokens (`core.rs:20`). One rad
 
 Replace the bytes-drop sequence with a copy-then-drop. In `evict_prefix_cache_if_pressured` around `core.rs:827-858`:
 
-1. **Gate by hit_count (sglang `write_through_threshold`).** Read `prefix_cache.hit_count_of(bid)` (new accessor — `Node::hit_count` is private today). If `hit_count < config.t1_write_through_threshold`, go straight to `release_pages` (today's path). Otherwise:
+1. **Gate by hit_count (sglang `write_through_threshold`).** Read `prefix_cache.hit_count_of(bid)` (new accessor — `Node::hit_count` is private today). If `hit_count < config.t1_demote_min_hits`, go straight to `release_pages` (today's path). Otherwise:
 2. **Reserve a T1 region.** Call `host_pool.reserve(block_byte_len)`. If `None` (T1 exhausted), fall back to today's free-outright path and bump a `t1_pool_exhausted_total` counter.
 3. **Enter `Demoting{ticket, target: HostPinned{offset: region.offset}}`.** Use `page_lifecycle.begin_demote` (`coordinator.rs:97-119`) with a real minted ticket (not `u64::MAX`).
 4. **Submit `CoordinatorCommand::Demote { block, from: Gpu{slot:..}, to: HostPinned{offset} }`** via `coordinator_handle.send`. New payload extension: the command must carry the page list so the coordinator can call `paged_kv_pool.copy_pages_to_host_async(pages, host_region, stream)`. Either (a) extend `Demote` with `pages: Vec<u32>` and `host_region: HostPinnedRegion`, or (b) wire demote through the existing `Stage` shape but with explicit direction — option (a) is cleaner; `Stage` is already overloaded for T1→T0 rehydrate in `drain_coordinator_events`.
@@ -114,7 +114,7 @@ The demote side only changed **what the radix records**. The promote-back wire m
 
 ### Threshold policy
 
-- **`t1_write_through_threshold: u32` on `SchedulerConfig`, default 2** (sglang parity). Validation: `≥ 1`; at 1 every eviction demotes (parity with "always write-through"), at 2 only blocks reused at least once demote.
+- **`t1_demote_min_hits: u32` on `SchedulerConfig`, default 2** (sglang parity). Validation: `≥ 1`; at 1 every eviction demotes (parity with "always write-through"), at 2 only blocks reused at least once demote.
 - **Read access:** `evict_prefix_cache_if_pressured` / `evict_prefix_cache_for_allocation` both need to know a block's hit_count at eviction time. Add `RadixCache::hit_count_of(bid: BlockId) -> Option<u32>` — O(1) via the existing `block_index` (`prefix_cache.rs:185-186`).
 - **No per-request override** in v1. The threshold is global; sglang doesn't expose it per-request either.
 
@@ -203,7 +203,7 @@ DEBUG logs:
 
 1. **`coordinator_demote_routes_bytes`** — `Coordinator::new` with a `LocalCudaTransport` stub that records calls. Emit `Demote{block, from: Gpu{slot:0}, to: HostPinned{offset:0}, pages: vec![0], host_region}`. Assert the stub records one D→H op and emits `DemoteCompleted` after `poll` reports Ready.
 2. **`radix_cache_demote_then_match_returns_t1`** — insert a block, `set_block_location(bid, HostPinned{offset:4096})`, `set_block_byte_len(bid, 8192)`, then `lookup_or_stage`. Assert matching block has `HitKind::StagingFromHost` and the returned `StageTicket` is `Some`.
-3. **`t1_write_through_threshold_gates_demote`** — configure threshold=2, simulate eviction of a block with `hit_count=1`. Assert no `Demote` command fired (check the `t1_evictions_gated_total` counter bumps, coordinator's command channel stays empty).
+3. **`t1_demote_min_hits_gates_demote`** — configure threshold=2, simulate eviction of a block with `hit_count=1`. Assert no `Demote` command fired (check the `t1_evictions_gated_total` counter bumps, coordinator's command channel stays empty).
 4. **`promote_back_round_trip_bytes`** — `feature="cuda"` test: alloc a pool page, write a pattern, `copy_pages_to_host` into a host region, free the page, `alloc_detached_pages`, `copy_pages_from_host` from the same region, assert byte-equal round trip. Blocked on the `todo!()` pair at `paged_kv.rs:514` — landing this test is the same commit that implements the copy helpers.
 
 ### Integration tests
@@ -239,11 +239,11 @@ Each commit gated behind a feature flag or `SchedulerConfig` default so a regres
    - Unit test: `coordinator_demote_routes_bytes`.
    - Bench: guidellm c=16 baseline; expected flat. Commit the snapshot as regression-check per CLAUDE.md.
 
-3. **C3 — Scheduler demote hook + T1 reserve + radix tier_location flip on evict.** `evict_prefix_cache_if_pressured` consults `t1_write_through_threshold` and issues `Demote` for eligible blocks. `drain_coordinator_events` handles `DemoteCompleted` by flipping `tier_location` to `HostPinned` and calling `release_pages`.
-   - Files: `infer/src/scheduler/cuda/core.rs:803-870`, `infer/src/scheduler/cuda/runtime.rs:40-170`, `infer/src/scheduler/types.rs` (new `t1_write_through_threshold: u32` field, default 2; `t1_host_pinned_bytes: usize`, default 2 GiB).
+3. **C3 — Scheduler demote hook + T1 reserve + radix tier_location flip on evict.** `evict_prefix_cache_if_pressured` consults `t1_demote_min_hits` and issues `Demote` for eligible blocks. `drain_coordinator_events` handles `DemoteCompleted` by flipping `tier_location` to `HostPinned` and calling `release_pages`.
+   - Files: `infer/src/scheduler/cuda/core.rs:803-870`, `infer/src/scheduler/cuda/runtime.rs:40-170`, `infer/src/scheduler/types.rs` (new `t1_demote_min_hits: u32` field, default 2; `t1_host_pinned_bytes: usize`, default 2 GiB).
    - Also: `HostPinnedPool::new(config.t1_host_pinned_bytes)` alloc at engine init (`core.rs:~390`).
    - Still gated: `INFER_T1_DEMOTE_ENABLED=false` default skips the `Demote` submit and goes through today's `release_pages`-outright path.
-   - Unit tests: `t1_write_through_threshold_gates_demote`, `radix_cache_demote_then_match_returns_t1`.
+   - Unit tests: `t1_demote_min_hits_gates_demote`, `radix_cache_demote_then_match_returns_t1`.
    - Bench: guidellm with flag on and off; expect parity on both (demote happens but nothing reads T1 yet).
 
 4. **C4 — Real promote-back in `StagePlanner::stage` handler.** Coordinator's `Stage` command now allocates pool pages via `alloc_detached_pages` and runs H→D copy. `StagingCompleted` carries the new `BlockId → pages` map; scheduler installs into `block_to_pages` and flips tier_location back to `Gpu`.

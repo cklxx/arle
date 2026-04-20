@@ -102,6 +102,25 @@ pub struct SchedulerConfig {
     /// A/B test K=1 / K=3 / K=4 probes without re-benching the
     /// alloc sizes.
     pub mixed_prefill_max_reqs: usize,
+    /// Minimum lookup-hit count a prefix block must have before it
+    /// gets demoted to the host-pinned T1 tier on eviction. One-hit
+    /// wonders fall straight off the GPU (free pages outright) so
+    /// they don't thrash T1.
+    ///
+    /// Default 2 — a block has to have been re-matched at least once
+    /// to be worth demoting. Tuning:
+    /// - `0`: disable demote entirely (every eviction frees outright;
+    ///   pre-Gap-#5 behaviour)
+    /// - `1`: always demote on eviction (debug / repeated-prefix
+    ///   workloads)
+    /// - `2..`: only demote popular blocks
+    ///
+    /// Maps to sglang's `HiRadixCache.write_through_threshold` (same
+    /// semantics, clearer name). CLI flag: `--t1-demote-min-hits`.
+    /// Read by Gap #5 C3's `evict_prefix_cache_if_pressured` demote
+    /// hook (not yet wired in HEAD; this field is shape-only ahead
+    /// of C3).
+    pub t1_demote_min_hits: u32,
 }
 
 impl Default for SchedulerConfig {
@@ -134,6 +153,7 @@ impl Default for SchedulerConfig {
             t1_host_pinned_keepalive_ticks: 128,
             disk_store_root: std::env::temp_dir().join("infer-kv"),
             mixed_prefill_max_reqs: 2,
+            t1_demote_min_hits: 2,
         }
     }
 }

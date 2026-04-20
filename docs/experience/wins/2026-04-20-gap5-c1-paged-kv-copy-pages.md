@@ -52,6 +52,6 @@ The `todo!()` in the CUDA branch was the single structural blocker for HiRadixCa
 ## Follow-ups
 
 - **Gap #5 C2**: Coordinator `Demote` + `DemoteCompleted` byte path over the dedicated copy stream in `LocalCudaTransport`. Sits under `INFER_T1_DEMOTE_ENABLED=false` gate initially.
-- **Gap #5 C3**: Scheduler demote hook in `evict_prefix_cache_if_pressured` + `t1_write_through_threshold` config.
+- **Gap #5 C3**: Scheduler demote hook in `evict_prefix_cache_if_pressured` + `t1_demote_min_hits` config.
 - **Gap #5 C4**: Real promote-back in `StagePlanner::stage` — allocs fresh pool pages via `alloc_detached_pages`, H→D copies from the T1 region, emits `StagingCompleted`.
 - **Non-BF16 support (v2)**: FP8/INT8/TurboQuant would also need to round-trip scale/norm tensors (`k_scales`, `v_scales`, `k_norms`, `v_norms`, TurboQuant state). Not blocking current L4 c=16 Qwen3-4B BF16 workload.

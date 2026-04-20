@@ -88,6 +88,18 @@ struct Args {
     /// rebuild. See `docs/research/2026-04-19-sglang-gap-analysis.md`.
     #[arg(long, default_value_t = 2)]
     mixed_prefill_max_reqs: usize,
+
+    /// Minimum lookup-hit count a prefix block must reach before it's
+    /// demoted to the host-pinned T1 tier on GPU-pool eviction. Default
+    /// 2 — a block must have been re-matched at least once to be worth
+    /// keeping warm in T1. `0` disables demote (free outright on
+    /// eviction, pre-Gap-#5 behaviour); `1` always demotes (debug /
+    /// repeated-prefix workloads). Maps to sglang's
+    /// `HiRadixCache.write_through_threshold` with clearer naming.
+    /// Reserved for Gap #5 C3 wiring; ignored in HEAD until the demote
+    /// hook lands.
+    #[arg(long, default_value_t = 2)]
+    t1_demote_min_hits: u32,
 }
 
 #[tokio::main]
@@ -151,6 +163,7 @@ async fn main() {
             min_seq_len: args.min_seq_len,
             kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
             mixed_prefill_max_reqs: args.mixed_prefill_max_reqs,
+            t1_demote_min_hits: args.t1_demote_min_hits,
             ..SchedulerConfig::runtime_defaults(num_slots)
         },
         seed: 42,

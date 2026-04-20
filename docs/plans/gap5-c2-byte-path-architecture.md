@@ -146,7 +146,7 @@ poll + event record. Command shape and event shape don't change.
 **Not in C2:**
 - Scheduler-side demote hook (that's C3; depends on this event shape).
 - `HostPinnedPool::reserve` wiring for demote reservations (C3).
-- `t1_write_through_threshold` config field (C3).
+- `t1_demote_min_hits` config field (C3).
 - `/v1/stats` counter wiring (C3–C5, per Gap #5 plan).
 
 ## Verify gate

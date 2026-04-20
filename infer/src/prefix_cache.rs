@@ -297,6 +297,16 @@ impl RadixCache {
         self.nodes.get_mut(idx)
     }
 
+    /// Read the block's `hit_count` (lookup-hit history). O(1) via
+    /// `block_index`. Used by Gap #5 C3's `t1_demote_min_hits` gate in
+    /// `evict_prefix_cache_if_pressured` — only blocks that have been
+    /// matched ≥ N times are demoted to T1 on eviction. Returns
+    /// `None` if the block is unknown to the radix.
+    pub(crate) fn hit_count_of(&self, block: BlockId) -> Option<u32> {
+        let idx = *self.block_index.get(&block)?;
+        self.nodes.get(idx).map(|node| node.hit_count)
+    }
+
     // -------------------------------------------------------------------------
     // Lookup
     // -------------------------------------------------------------------------
