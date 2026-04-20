@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(any(feature = "metal", feature = "cpu", test))]
@@ -19,8 +18,6 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedSender;
 
-#[cfg(any(feature = "metal", feature = "cpu"))]
-use crate::backend::InferenceBackend;
 #[cfg(feature = "cpu")]
 use crate::backend::cpu::CpuBackend;
 #[cfg(feature = "cuda")]
@@ -29,12 +26,17 @@ pub use crate::backend::cuda::bootstrap::{
 };
 #[cfg(feature = "metal")]
 use crate::backend::metal::MetalBackend;
+#[cfg(any(feature = "metal", feature = "cpu"))]
+use crate::backend::runtime::StopChunkProcessor;
+#[cfg(any(feature = "metal", feature = "cpu"))]
+use crate::backend::{InferenceBackend, StreamingInferenceBackend};
 #[cfg(feature = "cuda")]
 use crate::model::{GLM4Model, GenerationState, ModelForward, Qwen3Model, Qwen35Model};
 use crate::sampler::SamplingParams;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use crate::session_persistence::SessionPersistence;
 #[cfg(feature = "cuda")]
 use crate::tokenizer::Tokenizer;
-use crate::types::{BlockFingerprint, BlockId};
 
 /// Truncate at the first occurrence of any stop string (OpenAI-compatible).
 /// Returns the prefix of `text` up to (but not including) the earliest stop.
@@ -108,7 +110,12 @@ fn choose_prefix_reuse_action(
 /// If `new_full` (accumulated text) ends with any of `stops`, return the delta to send
 /// (from `sent_len` up to but not including the stop) and the matching stop.
 /// Prefers the longest matching stop when several match at the end.
-#[cfg(feature = "cuda")]
+///
+/// Only used by the CUDA single-request streaming path — the
+/// Metal/CPU `BackendInferenceEngine::complete_stream` uses
+/// `StopChunkProcessor` instead, which scans the unsent suffix and
+/// handles mid-chunk + chunk-spanning stops.
+#[cfg(any(feature = "cuda", test))]
 fn truncate_at_stop<'a>(
     new_full: &str,
     sent_len: usize,
@@ -239,40 +246,6 @@ pub trait InferenceEngine: Send {
         req: CompletionRequest,
         tx: UnboundedSender<CompletionStreamDelta>,
     ) -> Result<()>;
-
-    fn session_fingerprints(&self, session_id: &str) -> Vec<BlockFingerprint> {
-        let _ = session_id;
-        Vec::new()
-    }
-
-    fn read_block_payload(&self, fingerprint: BlockFingerprint) -> Option<Vec<u8>> {
-        let _ = fingerprint;
-        None
-    }
-
-    fn install_restored_kv(
-        &mut self,
-        payloads: &HashMap<BlockFingerprint, Vec<u8>>,
-    ) -> Box<dyn FnMut(BlockFingerprint) -> Option<BlockId> + Send> {
-        let _ = payloads;
-        Box::new(|_| None)
-    }
-
-    fn kv_format_tag(&self) -> u8 {
-        0
-    }
-
-    fn session_disk_store(
-        &self,
-    ) -> std::result::Result<&crate::kv_tier::transport::DiskStore, &'static str> {
-        Err("engine does not expose a session-scoped DiskStore")
-    }
-
-    fn session_radix_cache(
-        &self,
-    ) -> std::result::Result<&crate::prefix_cache::RadixCache, &'static str> {
-        Err("engine does not expose a session-scoped RadixCache")
-    }
 }
 
 // ============================================================================
@@ -286,24 +259,97 @@ struct StreamingStats {
     consumer_dropped: bool,
 }
 
+/// Decision returned by a generation sink for each sampled token.
+///
+/// `Continue` advances the loop; `ConsumerDropped` aborts (used by the
+/// streaming path when the HTTP client disconnects).
 #[cfg(feature = "cuda")]
-fn generate<M: ModelForward>(
+enum SinkControl {
+    Continue,
+    ConsumerDropped,
+}
+
+/// Telemetry flavor for `generate_inner`. Captures the per-variant observable
+/// differences without introducing a new async boundary or trait object.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+enum TraceMode {
+    /// `generate` — outer span "generate", TTFT/TPOT via both span props and `debug!`.
+    Full,
+    /// `generate_tokens_with_logprobs_inner` — no fastrace span, no TTFT/TPOT debug logs.
+    Silent,
+    /// `generate_streaming_with_callback` — outer span "generate_streaming", TTFT/TPOT via `debug!` only.
+    Streaming,
+}
+
+/// Shared driver for the three CUDA generation variants. All three share the
+/// same tokenize → prefill → (first-token sample) → decode-loop → stop-check →
+/// emit shape; they differ only in:
+///
+/// - **Sampler**: `select_token` vs `select_token_with_logprob` (driven by
+///   `want_logprobs`; pre-existing default impl of `select_token_with_logprob`
+///   falls back to `select_token` so the non-greedy path stays identical).
+/// - **Per-token observation/control**: what to do with the sampled token.
+///   Split into two callbacks to preserve the original logprob-path timing:
+///   `on_sampled` fires **before** the stop-token check (so logprobs for a
+///   stop-token get recorded), `on_emit` fires **after** the token has been
+///   pushed onto `tokens` (so the streaming callback sees tokens that made it
+///   into the output).
+/// - **Trace/debug emission**: see [`TraceMode`].
+#[cfg(feature = "cuda")]
+fn generate_inner<M, Observe, Emit>(
     model: &M,
     state: &mut M::State,
     prompt_tokens: &[u32],
     max_new_tokens: usize,
     params: &SamplingParams,
     rng: &mut StdRng,
-) -> Result<Vec<u32>> {
+    want_logprobs: bool,
+    trace: TraceMode,
+    mut on_sampled: Observe,
+    mut on_emit: Emit,
+) -> Result<(Vec<u32>, StreamingStats)>
+where
+    M: ModelForward,
+    Observe: FnMut(u32, Option<f32>),
+    Emit: FnMut(u32) -> SinkControl,
+{
     anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
-    let _span = LocalSpan::enter_with_local_parent("generate").with_properties(|| {
-        [
-            ("prompt_len", prompt_tokens.len().to_string()),
-            ("max_new_tokens", max_new_tokens.to_string()),
-        ]
-    });
+
+    let _outer_span = match trace {
+        TraceMode::Full => Some(
+            LocalSpan::enter_with_local_parent("generate").with_properties(|| {
+                [
+                    ("prompt_len", prompt_tokens.len().to_string()),
+                    ("max_new_tokens", max_new_tokens.to_string()),
+                ]
+            }),
+        ),
+        TraceMode::Streaming => Some(
+            LocalSpan::enter_with_local_parent("generate_streaming").with_properties(|| {
+                [
+                    ("prompt_len", prompt_tokens.len().to_string()),
+                    ("max_new_tokens", max_new_tokens.to_string()),
+                ]
+            }),
+        ),
+        TraceMode::Silent => None,
+    };
 
     let mut tokens = prompt_tokens.to_vec();
+    let emit_debug = !matches!(trace, TraceMode::Silent);
+
+    // Closure unifying the two sampler shapes. The trait default for
+    // `select_token_with_logprob` is `select_token` + `None`, so passing
+    // `want_logprobs = false` lets model impls that override `select_token`
+    // (e.g. batched decode) skip the logprob path entirely.
+    let sample = |state: &mut M::State, rng: &mut StdRng| -> Result<(u32, Option<f32>)> {
+        if want_logprobs {
+            model.select_token_with_logprob(state, params, rng)
+        } else {
+            model.select_token(state, params, rng).map(|t| (t, None))
+        }
+    };
 
     let ttft_start = Instant::now();
     model.forward_prefill(prompt_tokens, state)?;
@@ -313,171 +359,74 @@ fn generate<M: ModelForward>(
             e
         );
     }
-    let next_token = model.select_token(state, params, rng)?;
+    let (next_token, next_lp) = sample(state, rng)?;
     let ttft = ttft_start.elapsed();
 
-    LocalSpan::add_property(|| ("ttft_ms", format!("{:.2}", ttft.as_secs_f64() * 1000.0)));
-    debug!(
-        "TTFT: {:.2}ms (prompt_len={})",
-        ttft.as_secs_f64() * 1000.0,
-        prompt_tokens.len()
-    );
-
-    if !params.ignore_eos && model.is_stop_token(next_token) {
-        return Ok(tokens);
+    if matches!(trace, TraceMode::Full) {
+        LocalSpan::add_property(|| ("ttft_ms", format!("{:.2}", ttft.as_secs_f64() * 1000.0)));
     }
-    tokens.push(next_token);
-
-    let tpot_start = Instant::now();
-    let mut generated_count = 0;
-    for i in 1..max_new_tokens {
-        let _span = LocalSpan::enter_with_local_parent("decode_step")
-            .with_property(|| ("step", i.to_string()));
-        model.forward_decode(*tokens.last().unwrap(), state)?;
-        let next_token = model.select_token(state, params, rng)?;
-
-        if !params.ignore_eos && model.is_stop_token(next_token) {
-            break;
-        }
-        tokens.push(next_token);
-        generated_count += 1;
-    }
-
-    if generated_count > 0 {
-        let tpot_total = tpot_start.elapsed();
-        let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
-        LocalSpan::add_properties(|| {
-            [
-                ("tpot_avg_ms", format!("{:.2}", tpot_avg * 1000.0)),
-                ("generated_tokens", generated_count.to_string()),
-                (
-                    "tok_per_sec",
-                    format!("{:.1}", generated_count as f64 / tpot_total.as_secs_f64()),
-                ),
-            ]
-        });
+    if emit_debug {
         debug!(
-            "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
-            tpot_avg * 1000.0,
-            generated_count,
-            tpot_total.as_secs_f64() * 1000.0,
-            generated_count as f64 / tpot_total.as_secs_f64()
+            "TTFT: {:.2}ms (prompt_len={})",
+            ttft.as_secs_f64() * 1000.0,
+            prompt_tokens.len()
         );
     }
 
-    Ok(tokens)
-}
+    // Observe the freshly sampled token (incl. its logprob) BEFORE the
+    // stop-token check — matches the original logprob-path semantics where
+    // a stop token's logprob is recorded even though the token itself is
+    // not appended to `tokens`.
+    on_sampled(next_token, next_lp);
 
-/// Same as `generate_tokens_inner` but also returns per-token logprobs (greedy only).
-#[cfg(feature = "cuda")]
-fn generate_tokens_with_logprobs_inner<M: ModelForward>(
-    model: &M,
-    state: &mut M::State,
-    prompt_tokens: &[u32],
-    max_new_tokens: usize,
-    params: &SamplingParams,
-    rng: &mut StdRng,
-) -> Result<(Vec<u32>, Vec<f32>)> {
-    anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
-
-    let mut tokens = prompt_tokens.to_vec();
-    let mut logprobs = Vec::new();
-
-    model.forward_prefill(prompt_tokens, state)?;
-    if let Err(e) = state.save_prefix_snapshot() {
-        warn!(
-            "KV prefix cache snapshot save failed after prefill: {} (exact-hit reuse may fall back later)",
-            e
-        );
-    }
-    let (next_token, lp) = model.select_token_with_logprob(state, params, rng)?;
-    if let Some(lp) = lp {
-        logprobs.push(lp);
-    }
-
+    // Stop-token early-return. Matches the original per-variant behavior:
+    // - generate / logprobs: return the (unchanged) prompt-only tokens.
+    // - streaming: return emitted=0, hit_eos=true.
     if !params.ignore_eos && model.is_stop_token(next_token) {
-        return Ok((tokens, logprobs));
-    }
-    tokens.push(next_token);
-
-    for _i in 1..max_new_tokens {
-        model.forward_decode(*tokens.last().unwrap(), state)?;
-        let (next_token, lp) = model.select_token_with_logprob(state, params, rng)?;
-        if let Some(lp) = lp {
-            logprobs.push(lp);
-        }
-
-        if !params.ignore_eos && model.is_stop_token(next_token) {
-            break;
-        }
-        tokens.push(next_token);
+        return Ok((
+            tokens,
+            StreamingStats {
+                emitted_tokens: 0,
+                hit_eos: true,
+                consumer_dropped: false,
+            },
+        ));
     }
 
-    Ok((tokens, logprobs))
-}
-
-#[cfg(feature = "cuda")]
-fn generate_streaming_with_callback<M: ModelForward>(
-    model: &M,
-    state: &mut M::State,
-    prompt_tokens: &[u32],
-    max_new_tokens: usize,
-    params: &SamplingParams,
-    rng: &mut StdRng,
-    mut on_token: impl FnMut(u32) -> bool,
-) -> Result<StreamingStats> {
-    anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
-    let _span = LocalSpan::enter_with_local_parent("generate_streaming").with_properties(|| {
-        [
-            ("prompt_len", prompt_tokens.len().to_string()),
-            ("max_new_tokens", max_new_tokens.to_string()),
-        ]
-    });
-
-    let mut tokens = prompt_tokens.to_vec();
-
-    let ttft_start = Instant::now();
-    model.forward_prefill(prompt_tokens, state)?;
-    if let Err(e) = state.save_prefix_snapshot() {
-        warn!(
-            "KV prefix cache snapshot save failed after prefill: {} (exact-hit reuse may fall back later)",
-            e
-        );
-    }
-    let next_token = model.select_token(state, params, rng)?;
-    let ttft = ttft_start.elapsed();
-    debug!(
-        "TTFT: {:.2}ms (prompt_len={})",
-        ttft.as_secs_f64() * 1000.0,
-        prompt_tokens.len()
-    );
-
-    if !params.ignore_eos && model.is_stop_token(next_token) {
-        return Ok(StreamingStats {
-            emitted_tokens: 0,
-            hit_eos: true,
-            consumer_dropped: false,
-        });
-    }
-
+    // Emit the first generated token. A ConsumerDropped here only happens in
+    // the streaming variant; non-streaming callers always return Continue.
+    // Matches the original streaming behavior exactly: the token IS pushed,
+    // emitted_tokens=1, then we abort with consumer_dropped=true.
     tokens.push(next_token);
     let mut emitted_tokens = 1usize;
-    if !on_token(next_token) {
-        return Ok(StreamingStats {
-            emitted_tokens,
-            hit_eos: false,
-            consumer_dropped: true,
-        });
+    if let SinkControl::ConsumerDropped = on_emit(next_token) {
+        return Ok((
+            tokens,
+            StreamingStats {
+                emitted_tokens,
+                hit_eos: false,
+                consumer_dropped: true,
+            },
+        ));
     }
 
     let tpot_start = Instant::now();
     let mut generated_count = 0;
     let mut hit_eos = false;
     for i in 1..max_new_tokens {
-        let _span = LocalSpan::enter_with_local_parent("decode_step")
-            .with_property(|| ("step", i.to_string()));
+        let _decode_span = if matches!(trace, TraceMode::Full | TraceMode::Streaming) {
+            Some(
+                LocalSpan::enter_with_local_parent("decode_step")
+                    .with_property(|| ("step", i.to_string())),
+            )
+        } else {
+            None
+        };
         model.forward_decode(*tokens.last().unwrap(), state)?;
-        let next_token = model.select_token(state, params, rng)?;
+        let (next_token, next_lp) = sample(state, rng)?;
+
+        // Observe BEFORE stop-check (preserves logprob recording for the stop token).
+        on_sampled(next_token, next_lp);
 
         if !params.ignore_eos && model.is_stop_token(next_token) {
             hit_eos = true;
@@ -488,32 +437,52 @@ fn generate_streaming_with_callback<M: ModelForward>(
         generated_count += 1;
         emitted_tokens += 1;
 
-        if !on_token(next_token) {
-            return Ok(StreamingStats {
-                emitted_tokens,
-                hit_eos: false,
-                consumer_dropped: true,
-            });
+        if let SinkControl::ConsumerDropped = on_emit(next_token) {
+            return Ok((
+                tokens,
+                StreamingStats {
+                    emitted_tokens,
+                    hit_eos: false,
+                    consumer_dropped: true,
+                },
+            ));
         }
     }
 
     if generated_count > 0 {
         let tpot_total = tpot_start.elapsed();
         let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
-        debug!(
-            "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
-            tpot_avg * 1000.0,
-            generated_count,
-            tpot_total.as_secs_f64() * 1000.0,
-            generated_count as f64 / tpot_total.as_secs_f64()
-        );
+        if matches!(trace, TraceMode::Full) {
+            LocalSpan::add_properties(|| {
+                [
+                    ("tpot_avg_ms", format!("{:.2}", tpot_avg * 1000.0)),
+                    ("generated_tokens", generated_count.to_string()),
+                    (
+                        "tok_per_sec",
+                        format!("{:.1}", generated_count as f64 / tpot_total.as_secs_f64()),
+                    ),
+                ]
+            });
+        }
+        if emit_debug {
+            debug!(
+                "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
+                tpot_avg * 1000.0,
+                generated_count,
+                tpot_total.as_secs_f64() * 1000.0,
+                generated_count as f64 / tpot_total.as_secs_f64()
+            );
+        }
     }
 
-    Ok(StreamingStats {
-        emitted_tokens,
-        hit_eos,
-        consumer_dropped: false,
-    })
+    Ok((
+        tokens,
+        StreamingStats {
+            emitted_tokens,
+            hit_eos,
+            consumer_dropped: false,
+        },
+    ))
 }
 
 // ============================================================================
@@ -701,26 +670,28 @@ impl<M: ModelForward> InferenceEngine for ModelInferenceEngine<M> {
     fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
         let (effective, _prefix_len) = self.prepare_with_prefix_cache(&prompt_tokens)?;
-        let (output_tokens, token_logprobs) = if req.logprobs && req.sampling.is_greedy() {
-            generate_tokens_with_logprobs_inner(
-                &self.model,
-                &mut self.state,
-                &effective,
-                req.max_tokens,
-                &req.sampling,
-                &mut self.rng,
-            )?
-        } else {
-            let tokens = generate(
-                &self.model,
-                &mut self.state,
-                &effective,
-                req.max_tokens,
-                &req.sampling,
-                &mut self.rng,
-            )?;
-            (tokens, vec![])
-        };
+        let want_logprobs = req.logprobs && req.sampling.is_greedy();
+        let mut token_logprobs: Vec<f32> = Vec::new();
+        let (output_tokens, _stats) = generate_inner(
+            &self.model,
+            &mut self.state,
+            &effective,
+            req.max_tokens,
+            &req.sampling,
+            &mut self.rng,
+            want_logprobs,
+            if want_logprobs {
+                TraceMode::Silent
+            } else {
+                TraceMode::Full
+            },
+            |_token, lp| {
+                if want_logprobs && let Some(lp) = lp {
+                    token_logprobs.push(lp);
+                }
+            },
+            |_token| SinkControl::Continue,
+        )?;
         // Update cached prompt for next request.
         self.cached_prompt = prompt_tokens.clone();
         // output_tokens = effective_prompt + generated tokens
@@ -773,62 +744,72 @@ impl<M: ModelForward> InferenceEngine for ModelInferenceEngine<M> {
         let mut sent_len: usize = 0;
         let stopped_by_stop_sequence = std::cell::Cell::new(false);
 
-        let stats = generate_streaming_with_callback(
+        let mut on_token = |token_id: u32| match decoder.step(token_id) {
+            Ok(Some(text_delta)) => {
+                if let Some(ref stop_list) = stops {
+                    let new_full = {
+                        let emitted = decoder.emitted_text();
+                        emitted.to_string()
+                    };
+                    if let Some((to_send, stopped)) =
+                        truncate_at_stop(&new_full, sent_len, stop_list)
+                    {
+                        if !to_send.is_empty()
+                            && tx
+                                .send(CompletionStreamDelta {
+                                    text_delta: to_send,
+                                    finish_reason: None,
+                                    usage: None,
+                                    logprob: None,
+                                })
+                                .is_err()
+                        {
+                            return false;
+                        }
+                        sent_len = new_full.len() - stopped.len();
+                        stopped_by_stop_sequence.set(true);
+                        return false;
+                    }
+                    let to_send = &new_full[sent_len..];
+                    sent_len = new_full.len();
+                    tx.send(CompletionStreamDelta {
+                        text_delta: to_send.to_string(),
+                        finish_reason: None,
+                        usage: None,
+                        logprob: None,
+                    })
+                    .is_ok()
+                } else {
+                    tx.send(CompletionStreamDelta {
+                        text_delta,
+                        finish_reason: None,
+                        usage: None,
+                        logprob: None,
+                    })
+                    .is_ok()
+                }
+            }
+            Ok(None) => true,
+            Err(err) => {
+                decode_error = Some(err);
+                false
+            }
+        };
+        let (_tokens, stats) = generate_inner(
             &self.model,
             &mut self.state,
             &effective_prompt,
             req.max_tokens,
             &req.sampling,
             &mut self.rng,
-            |token_id| match decoder.step(token_id) {
-                Ok(Some(text_delta)) => {
-                    if let Some(ref stop_list) = stops {
-                        let new_full = {
-                            let emitted = decoder.emitted_text();
-                            emitted.to_string()
-                        };
-                        if let Some((to_send, stopped)) =
-                            truncate_at_stop(&new_full, sent_len, stop_list)
-                        {
-                            if !to_send.is_empty()
-                                && tx
-                                    .send(CompletionStreamDelta {
-                                        text_delta: to_send,
-                                        finish_reason: None,
-                                        usage: None,
-                                        logprob: None,
-                                    })
-                                    .is_err()
-                            {
-                                return false;
-                            }
-                            sent_len = new_full.len() - stopped.len();
-                            stopped_by_stop_sequence.set(true);
-                            return false;
-                        }
-                        let to_send = &new_full[sent_len..];
-                        sent_len = new_full.len();
-                        tx.send(CompletionStreamDelta {
-                            text_delta: to_send.to_string(),
-                            finish_reason: None,
-                            usage: None,
-                            logprob: None,
-                        })
-                        .is_ok()
-                    } else {
-                        tx.send(CompletionStreamDelta {
-                            text_delta,
-                            finish_reason: None,
-                            usage: None,
-                            logprob: None,
-                        })
-                        .is_ok()
-                    }
-                }
-                Ok(None) => true,
-                Err(err) => {
-                    decode_error = Some(err);
-                    false
+            false,
+            TraceMode::Streaming,
+            |_token, _lp| {},
+            |token| {
+                if on_token(token) {
+                    SinkControl::Continue
+                } else {
+                    SinkControl::ConsumerDropped
                 }
             },
         )?;
@@ -942,7 +923,9 @@ impl BackendInferenceEngine<CpuBackend> {
 }
 
 #[cfg(any(feature = "metal", feature = "cpu"))]
-impl<B: InferenceBackend> InferenceEngine for BackendInferenceEngine<B> {
+impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
+    for BackendInferenceEngine<B>
+{
     fn model_id(&self) -> &str {
         &self.model_id
     }
@@ -984,24 +967,116 @@ impl<B: InferenceBackend> InferenceEngine for BackendInferenceEngine<B> {
         })
     }
 
+    /// Chunk-by-chunk streaming over `StreamingInferenceBackend`.
+    ///
+    /// Two design points the previous revision (70e2776) got wrong:
+    ///
+    /// 1. **Stop detection must scan the unsent suffix, not just the
+    ///    accumulated tail.** The default `StreamingInferenceBackend`
+    ///    impl emits the entire completion as one chunk ([backend.rs:62]),
+    ///    and real backends can produce stops that span chunk boundaries.
+    ///    We route through [`StopChunkProcessor`] — same helper the
+    ///    serial-runtime path uses ([backend/runtime.rs:253]) — which
+    ///    scans for the earliest stop and withholds `max_stop_len - 1`
+    ///    bytes so a marker crossing a chunk boundary isn't leaked.
+    ///
+    /// 2. **Usage must come from the backend, not be hard-coded.** The
+    ///    stop path must not return `Err` from `generate_stream` — the
+    ///    REPL reads `prompt_tokens`/`completion_tokens` from the final
+    ///    delta ([crates/cli/src/repl.rs:787]). We let the backend run
+    ///    to its own EOS/`max_tokens`, silently absorb post-stop chunks
+    ///    in the processor, and report real totals.
+    ///
+    /// Dropping `tx` (rx disconnected) still propagates back through the
+    /// callback as an `Err` — the REPL's Ctrl-C path relies on that
+    /// (see [crates/cli/src/repl.rs:646]).
     fn complete_stream(
         &mut self,
         req: CompletionRequest,
         tx: UnboundedSender<CompletionStreamDelta>,
     ) -> Result<()> {
-        let output = self.complete(req)?;
-        if !output.text.is_empty() {
+        let mut sampling = req.sampling;
+        sampling.max_new_tokens = Some(req.max_tokens);
+
+        let stops: Vec<String> = req
+            .stop
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let processor = std::cell::RefCell::new(StopChunkProcessor::new(stops));
+        let consumer_dropped = std::cell::Cell::new(false);
+
+        let backend_name = self.backend.name();
+        let generated = catch_unwind(AssertUnwindSafe(|| {
+            self.backend
+                .generate_stream(&req.prompt, &sampling, |chunk: &str| -> Result<()> {
+                    let delta = processor.borrow_mut().push_chunk(chunk);
+                    if let Some(delta) = delta
+                        && !delta.is_empty()
+                        && tx
+                            .send(CompletionStreamDelta {
+                                text_delta: delta,
+                                finish_reason: None,
+                                usage: None,
+                                logprob: None,
+                            })
+                            .is_err()
+                    {
+                        consumer_dropped.set(true);
+                        return Err(anyhow::anyhow!("consumer dropped"));
+                    }
+                    Ok(())
+                })
+        }))
+        .map_err(|panic| {
+            anyhow::anyhow!(
+                "{} backend panicked during completion: {}",
+                backend_name,
+                panic_message(panic)
+            )
+        })?;
+
+        // Cancel path: rx dropped mid-generation. Backend exited via the
+        // `Err` we threaded through `on_chunk`. Return Ok — the REPL
+        // (or any other tokio consumer) already handled the cancel
+        // signal itself.
+        if consumer_dropped.get() {
+            return Ok(());
+        }
+
+        // Backend completed naturally (EOS, max_tokens, or stop hit +
+        // processor absorbing the tail). Flush any bytes still held back
+        // by the max_stop_len - 1 safety window, then emit the final
+        // delta with the backend's actual usage numbers.
+        let generated = generated?;
+
+        if let Some(trailing) = processor.borrow_mut().finish()
+            && !trailing.is_empty()
+        {
             let _ = tx.send(CompletionStreamDelta {
-                text_delta: output.text.clone(),
+                text_delta: trailing,
                 finish_reason: None,
                 usage: None,
                 logprob: None,
             });
         }
+
+        let finish_reason = if processor.borrow().hit_stop() {
+            FinishReason::Stop
+        } else {
+            parse_finish_reason(&generated.finish_reason)
+        };
+
         let _ = tx.send(CompletionStreamDelta {
             text_delta: String::new(),
-            finish_reason: Some(output.finish_reason),
-            usage: Some(output.usage),
+            finish_reason: Some(finish_reason),
+            usage: Some(TokenUsage {
+                prompt_tokens: generated.prompt_tokens,
+                completion_tokens: generated.completion_tokens,
+                total_tokens: generated.prompt_tokens + generated.completion_tokens,
+            }),
             logprob: None,
         });
         Ok(())
@@ -1237,9 +1312,18 @@ impl InferenceEngine for LoadedInferenceEngine {
     }
 }
 
+#[cfg(feature = "cuda")]
+impl<M: ModelForward> SessionPersistence for ModelInferenceEngine<M> {}
+
+#[cfg(any(feature = "metal", feature = "cpu"))]
+impl<B: InferenceBackend> SessionPersistence for BackendInferenceEngine<B> {}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+impl SessionPersistence for LoadedInferenceEngine {}
+
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
     use super::truncate_at_stop;
     use super::{FinishReason, model_id_from_path, parse_finish_reason, truncate_at_first_stop};
     #[cfg(any(feature = "cuda", test))]
@@ -1273,7 +1357,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
     #[test]
     fn test_truncate_at_stop() {
         let stops = ["\n"];
@@ -1286,6 +1370,401 @@ mod tests {
             truncate_at_stop("ab\n", 2, &stops),
             Some((String::new(), "\n"))
         );
+    }
+
+    /// Regression test for codex review 0da212f/97c1a95 High: before this
+    /// fix, `BackendInferenceEngine<Metal|Cpu>::complete_stream` called
+    /// `self.complete(req)?` — a blocking full generation — and only
+    /// touched `tx` at the end. Dropping `rx` mid-generation had no
+    /// effect: the worker thread blocked until completion. The REPL's
+    /// Ctrl-C path at `crates/cli/src/repl.rs:646` (which relies on
+    /// `tx.send` failing when `rx` is dropped) was a lie on Metal + CPU.
+    ///
+    /// This test drops the receiver after zero chunks read, then
+    /// asserts the mock backend's chunk counter stops at 1 (not 10) —
+    /// i.e. the `on_chunk` callback propagated the `rx-disconnected`
+    /// error back through `generate_stream`, short-circuiting the loop.
+    #[cfg(any(feature = "metal", feature = "cpu"))]
+    #[test]
+    fn backend_complete_stream_short_circuits_when_rx_dropped() {
+        use super::{BackendInferenceEngine, CompletionRequest, InferenceEngine};
+        use crate::backend::{GenerateResult, InferenceBackend, StreamingInferenceBackend};
+        use crate::sampler::SamplingParams;
+        use std::path::Path;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::mpsc;
+
+        #[derive(Clone)]
+        struct CountingMock {
+            chunks_attempted: Arc<AtomicUsize>,
+        }
+
+        impl InferenceBackend for CountingMock {
+            fn load(&mut self, _p: &Path) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+            ) -> anyhow::Result<GenerateResult> {
+                unreachable!("test exercises streaming path only")
+            }
+            fn name(&self) -> &'static str {
+                "counting-mock"
+            }
+        }
+
+        impl StreamingInferenceBackend for CountingMock {
+            fn generate_stream<F>(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+                mut on_chunk: F,
+            ) -> anyhow::Result<GenerateResult>
+            where
+                F: FnMut(&str) -> anyhow::Result<()>,
+            {
+                for _ in 0..10 {
+                    self.chunks_attempted.fetch_add(1, Ordering::Relaxed);
+                    on_chunk("x")?; // returns Err the instant tx fails
+                }
+                Ok(GenerateResult {
+                    text: "xxxxxxxxxx".into(),
+                    prompt_tokens: 1,
+                    completion_tokens: 10,
+                    finish_reason: "length".into(),
+                    ttft_ms: 0.0,
+                    prompt_tps: 0.0,
+                    generation_tps: 0.0,
+                    total_time_ms: 0.0,
+                })
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut engine = BackendInferenceEngine {
+            model_id: "counting-mock".into(),
+            backend: CountingMock {
+                chunks_attempted: counter.clone(),
+            },
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx); // simulate REPL cancel before the first chunk.
+
+        let res = engine.complete_stream(
+            CompletionRequest {
+                prompt: "hi".into(),
+                max_tokens: 10,
+                sampling: SamplingParams::default(),
+                stop: None,
+                logprobs: false,
+            },
+            tx,
+        );
+
+        assert!(res.is_ok(), "consumer-dropped is not an error");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "generate_stream must exit after the first failed tx.send, \
+             not keep looping through all 10 chunks"
+        );
+    }
+
+    /// Normal completion: no stop sequences, reader intact → backend
+    /// runs to completion, each chunk flows through, and the final
+    /// delta carries `finish_reason` + `usage`.
+    #[cfg(any(feature = "metal", feature = "cpu"))]
+    #[tokio::test]
+    async fn backend_complete_stream_emits_all_chunks_and_finish_marker() {
+        use super::{BackendInferenceEngine, CompletionRequest, InferenceEngine};
+        use crate::backend::{GenerateResult, InferenceBackend, StreamingInferenceBackend};
+        use crate::sampler::SamplingParams;
+        use std::path::Path;
+        use tokio::sync::mpsc;
+
+        struct FullRunMock;
+        impl InferenceBackend for FullRunMock {
+            fn load(&mut self, _p: &Path) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+            ) -> anyhow::Result<GenerateResult> {
+                unreachable!()
+            }
+            fn name(&self) -> &'static str {
+                "full-run-mock"
+            }
+        }
+        impl StreamingInferenceBackend for FullRunMock {
+            fn generate_stream<F>(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+                mut on_chunk: F,
+            ) -> anyhow::Result<GenerateResult>
+            where
+                F: FnMut(&str) -> anyhow::Result<()>,
+            {
+                on_chunk("hel")?;
+                on_chunk("lo")?;
+                Ok(GenerateResult {
+                    text: "hello".into(),
+                    prompt_tokens: 1,
+                    completion_tokens: 2,
+                    finish_reason: "length".into(),
+                    ttft_ms: 0.0,
+                    prompt_tps: 0.0,
+                    generation_tps: 0.0,
+                    total_time_ms: 0.0,
+                })
+            }
+        }
+
+        let mut engine = BackendInferenceEngine {
+            model_id: "full-run-mock".into(),
+            backend: FullRunMock,
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let res = engine.complete_stream(
+            CompletionRequest {
+                prompt: "p".into(),
+                max_tokens: 8,
+                sampling: SamplingParams::default(),
+                stop: None,
+                logprobs: false,
+            },
+            tx,
+        );
+        assert!(res.is_ok());
+
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut finish: Option<FinishReason> = None;
+        while let Ok(chunk) = rx.try_recv() {
+            if chunk.finish_reason.is_some() {
+                finish = chunk.finish_reason;
+            }
+            if !chunk.text_delta.is_empty() {
+                text_parts.push(chunk.text_delta);
+            }
+        }
+        assert_eq!(text_parts.concat(), "hello");
+        assert_eq!(finish, Some(FinishReason::Length));
+    }
+
+    /// Regression for codex review 70e2776 High #1 — stop *inside* a
+    /// single chunk. The default `StreamingInferenceBackend` impl sends
+    /// the whole completion as one chunk; the old end-of-buffer check
+    /// would only fire when the chunk *ended* with the stop, so a stop
+    /// mid-chunk leaked the raw marker + trailing bytes. With
+    /// `StopChunkProcessor::push_chunk` scanning the unsent suffix,
+    /// everything after the stop is withheld.
+    #[cfg(any(feature = "metal", feature = "cpu"))]
+    #[tokio::test]
+    async fn backend_complete_stream_stop_inside_single_chunk() {
+        use super::{BackendInferenceEngine, CompletionRequest, InferenceEngine, TokenUsage};
+        use crate::backend::{GenerateResult, InferenceBackend, StreamingInferenceBackend};
+        use crate::sampler::SamplingParams;
+        use std::path::Path;
+        use tokio::sync::mpsc;
+
+        struct SingleChunkMock;
+        impl InferenceBackend for SingleChunkMock {
+            fn load(&mut self, _p: &Path) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+            ) -> anyhow::Result<GenerateResult> {
+                unreachable!()
+            }
+            fn name(&self) -> &'static str {
+                "single-chunk-mock"
+            }
+        }
+        impl StreamingInferenceBackend for SingleChunkMock {
+            fn generate_stream<F>(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+                mut on_chunk: F,
+            ) -> anyhow::Result<GenerateResult>
+            where
+                F: FnMut(&str) -> anyhow::Result<()>,
+            {
+                on_chunk("hello<|im_end|>trailing")?;
+                Ok(GenerateResult {
+                    text: "hello<|im_end|>trailing".into(),
+                    prompt_tokens: 3,
+                    completion_tokens: 7,
+                    finish_reason: "stop".into(),
+                    ttft_ms: 0.0,
+                    prompt_tps: 0.0,
+                    generation_tps: 0.0,
+                    total_time_ms: 0.0,
+                })
+            }
+        }
+
+        let mut engine = BackendInferenceEngine {
+            model_id: "single-chunk-mock".into(),
+            backend: SingleChunkMock,
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        engine
+            .complete_stream(
+                CompletionRequest {
+                    prompt: "p".into(),
+                    max_tokens: 32,
+                    sampling: SamplingParams::default(),
+                    stop: Some(vec!["<|im_end|>".into()]),
+                    logprobs: false,
+                },
+                tx,
+            )
+            .unwrap();
+
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut finish: Option<FinishReason> = None;
+        let mut usage: Option<TokenUsage> = None;
+        while let Ok(chunk) = rx.try_recv() {
+            if chunk.finish_reason.is_some() {
+                finish = chunk.finish_reason;
+            }
+            if chunk.usage.is_some() {
+                usage = chunk.usage;
+            }
+            if !chunk.text_delta.is_empty() {
+                text_parts.push(chunk.text_delta);
+            }
+        }
+        let joined = text_parts.concat();
+        assert_eq!(joined, "hello", "stop marker + trailing must be withheld");
+        assert!(
+            !joined.contains("<|im_end|>"),
+            "raw stop marker must never reach the consumer"
+        );
+        assert_eq!(finish, Some(FinishReason::Stop));
+        let usage = usage.expect("final delta must carry usage");
+        assert_eq!(
+            usage.completion_tokens, 7,
+            "real backend usage must propagate (not hard-coded 0)"
+        );
+        assert_eq!(usage.prompt_tokens, 3);
+    }
+
+    /// Regression for codex review 70e2776 High #2 — stop *spanning*
+    /// chunk boundaries. Before the fix, the first chunk's bytes were
+    /// forwarded immediately and the stop was only detected on the
+    /// chunk that completed it — by then the prefix had already been
+    /// leaked. `StopChunkProcessor` withholds the last `max_stop_len-1`
+    /// bytes of each chunk until the next one arrives.
+    #[cfg(any(feature = "metal", feature = "cpu"))]
+    #[tokio::test]
+    async fn backend_complete_stream_stop_spanning_chunks() {
+        use super::{BackendInferenceEngine, CompletionRequest, InferenceEngine, TokenUsage};
+        use crate::backend::{GenerateResult, InferenceBackend, StreamingInferenceBackend};
+        use crate::sampler::SamplingParams;
+        use std::path::Path;
+        use tokio::sync::mpsc;
+
+        struct SplitChunkMock;
+        impl InferenceBackend for SplitChunkMock {
+            fn load(&mut self, _p: &Path) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+            ) -> anyhow::Result<GenerateResult> {
+                unreachable!()
+            }
+            fn name(&self) -> &'static str {
+                "split-chunk-mock"
+            }
+        }
+        impl StreamingInferenceBackend for SplitChunkMock {
+            fn generate_stream<F>(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+                mut on_chunk: F,
+            ) -> anyhow::Result<GenerateResult>
+            where
+                F: FnMut(&str) -> anyhow::Result<()>,
+            {
+                on_chunk("hello<|im_")?;
+                on_chunk("end|>trail")?;
+                Ok(GenerateResult {
+                    text: "hello<|im_end|>trail".into(),
+                    prompt_tokens: 2,
+                    completion_tokens: 5,
+                    finish_reason: "stop".into(),
+                    ttft_ms: 0.0,
+                    prompt_tps: 0.0,
+                    generation_tps: 0.0,
+                    total_time_ms: 0.0,
+                })
+            }
+        }
+
+        let mut engine = BackendInferenceEngine {
+            model_id: "split-chunk-mock".into(),
+            backend: SplitChunkMock,
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        engine
+            .complete_stream(
+                CompletionRequest {
+                    prompt: "p".into(),
+                    max_tokens: 32,
+                    sampling: SamplingParams::default(),
+                    stop: Some(vec!["<|im_end|>".into()]),
+                    logprobs: false,
+                },
+                tx,
+            )
+            .unwrap();
+
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut finish: Option<FinishReason> = None;
+        let mut usage: Option<TokenUsage> = None;
+        while let Ok(chunk) = rx.try_recv() {
+            if chunk.finish_reason.is_some() {
+                finish = chunk.finish_reason;
+            }
+            if chunk.usage.is_some() {
+                usage = chunk.usage;
+            }
+            if !chunk.text_delta.is_empty() {
+                text_parts.push(chunk.text_delta);
+            }
+        }
+        let joined = text_parts.concat();
+        assert_eq!(
+            joined, "hello",
+            "stop split across chunks must still strip the marker"
+        );
+        assert!(
+            !joined.contains("<|im_") && !joined.contains("im_end") && !joined.contains("|>"),
+            "no partial stop-marker bytes may leak (got {joined:?})",
+        );
+        assert_eq!(finish, Some(FinishReason::Stop));
+        let usage = usage.expect("final delta must carry usage");
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.prompt_tokens, 2);
     }
 
     #[test]

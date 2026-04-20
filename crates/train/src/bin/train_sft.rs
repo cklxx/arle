@@ -2,9 +2,9 @@ use std::{
     collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
+    process::ExitCode,
     str::FromStr,
     sync::Arc,
-    time::Instant,
 };
 
 use autograd::{
@@ -12,10 +12,14 @@ use autograd::{
     ops::{gather_last_dim, log_softmax, mul, mul_scalar, sum},
     optim::AdamW,
 };
+use qwen3_spec::{Qwen3Config, Qwen3ConfigError};
 use thiserror::Error;
 use train::{
-    dataset::LcgRng,
-    qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
+    StepOutcome, Trainer, TrainerConfig,
+    checkpoint::write_latest_symlink,
+    cli_args::{ArgError, next_value, parse_value},
+    grad_clip::NoClip,
+    qwen3::{Qwen3Error, Qwen3Model},
     sft_data::{TokenizedSft, load_jsonl, tokenize_example},
     tokenizer::ChatTokenizer,
 };
@@ -79,6 +83,13 @@ struct CliArgs {
     log_every: usize,
     seed: u64,
     save_dtype: SaveDtype,
+    // Phase 2 acceptance flags (docs/plans/train-runtime-architecture-v1.md §9).
+    lr_schedule: String,
+    warmup_steps: u64,
+    min_lr: f32,
+    grad_accum_steps: Option<usize>,
+    metrics_jsonl: Option<PathBuf>,
+    resume_from: Option<PathBuf>,
 }
 
 impl Default for CliArgs {
@@ -96,6 +107,12 @@ impl Default for CliArgs {
             log_every: 1,
             seed: 0,
             save_dtype: SaveDtype::Bf16,
+            lr_schedule: "constant".to_string(),
+            warmup_steps: 0,
+            min_lr: 0.0,
+            grad_accum_steps: None,
+            metrics_jsonl: None,
+            resume_from: None,
         }
     }
 }
@@ -108,17 +125,29 @@ enum CliError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Qwen3(#[from] Qwen3Error),
-    #[error("unknown flag {0}")]
-    UnknownFlag(String),
-    #[error("missing value for flag {0}")]
-    MissingValue(String),
-    #[error("invalid value for {flag}: {value}")]
-    InvalidValue { flag: String, value: String },
+    #[error(transparent)]
+    Qwen3Config(#[from] Qwen3ConfigError),
+    #[error(transparent)]
+    Arg(#[from] ArgError),
     #[error("{0}")]
     Custom(String),
 }
 
-fn main() -> Result<(), CliError> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        // Display (not Debug): thiserror's #[error(transparent)] already
+        // delegates to the inner error's Display impl, so io errors surface as
+        // "No such file or directory (os error 2)" instead of the Debug blob
+        // "Os { code: 2, kind: NotFound, message: \"...\" }".
+        Err(err) => {
+            eprintln!("[train_sft] error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), CliError> {
     let args = parse_args()?;
     validate_args(&args)?;
     fs::create_dir_all(&args.out)?;
@@ -137,7 +166,7 @@ fn main() -> Result<(), CliError> {
         ));
     }
 
-    let cfg = Qwen3Config::from_json_file(&config_path)?;
+    let cfg = Qwen3Config::from_json_file(&config_path).map_err(Qwen3Error::from)?;
     let tokenizer = ChatTokenizer::from_file(&tokenizer_path)?;
     let mut store = TensorStore::with_backend(build_backend(args.backend)?);
     let model = Qwen3Model::new(&cfg, &mut store)?;
@@ -151,6 +180,12 @@ fn main() -> Result<(), CliError> {
             "qwen3 model exposed no trainable parameters".into(),
         ));
     }
+    let param_names = model
+        .param_name_map()
+        .into_iter()
+        .filter(|(_, id)| params.contains(id))
+        .map(|(name, id)| (id, name.to_string()))
+        .collect::<Vec<_>>();
 
     let raw_examples = load_jsonl(&args.data)?;
     let dataset = raw_examples
@@ -176,68 +211,162 @@ fn main() -> Result<(), CliError> {
         ));
     }
 
-    let mut optimizer = AdamW::new(args.lr, DEFAULT_BETAS, DEFAULT_EPS, DEFAULT_WEIGHT_DECAY);
-    let mut tape = Tape::new();
-    let mut rng = LcgRng::seed(args.seed);
+    // --- Trainer setup (Wave 3 migration) ---
+    let optim = AdamW::new(args.lr, DEFAULT_BETAS, DEFAULT_EPS, DEFAULT_WEIGHT_DECAY);
+    // `--grad-accum-steps` overrides `--batch` when passed; otherwise the
+    // pre-migration semantics ("batch folds grads into a single optim step")
+    // hold. max(1) to keep the zero-check above happy even if a user passes 0.
+    let grad_accum = args.grad_accum_steps.unwrap_or(args.batch).max(1) as u64;
+    let schedule: Box<dyn autograd::LrSchedule> = autograd::parse_lr_schedule(
+        &args.lr_schedule,
+        args.lr,
+        args.warmup_steps,
+        args.steps as u64,
+        args.min_lr,
+    )
+    .map_err(|e| CliError::Custom(format!("bad --lr-schedule: {e}")))?;
+    let metrics = train::metrics::open_sink(args.metrics_jsonl.as_deref(), true)
+        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+    // Enable the Trainer's built-in save path so every checkpoint round
+    // gets `trainer_state.json + optimizer.safetensors` written next to the
+    // bf16 model weights the on_step_end hook produces — without this wiring,
+    // `--resume-from` could not reload optimizer state from our own output
+    // (codex review 2026-04-20 on ad5568b, P1). Trainer lays files out at
+    // `<save_dir>/step_{:06}/`; the hook below matches that format.
+    let trainer_cfg = TrainerConfig {
+        total_steps: args.steps as u64,
+        grad_accum_steps: grad_accum,
+        log_every: args.log_every.max(1) as u64,
+        eval_every: None,
+        save_every: Some(args.save_every as u64),
+        save_dir: Some(args.out.clone()),
+        resume_from: args.resume_from.clone(),
+        rng_seed: args.seed,
+    };
+    let mut trainer = Trainer::new(optim, NoClip, schedule, metrics, trainer_cfg);
 
-    for step in 0..args.steps {
-        let step_start = Instant::now();
-        optimizer.zero_grad(&params, &mut store);
-
-        let mut step_loss = 0.0_f32;
-        // Each micro-step's loss is already averaged over its own supervised
-        // tokens, so the gradient accumulated by tape.backward() is the
-        // per-example gradient. Scale by 1/batch before backward so the
-        // summed gradient equals the mean across micro-steps — otherwise
-        // the effective learning rate grows linearly with --batch.
-        let loss_scale = 1.0_f32 / args.batch.max(1) as f32;
-        for micro_step in 0..args.batch {
-            let example_index = sample_index(&mut rng, dataset.len(), step, micro_step);
-            step_loss += train_on_example(
-                &model,
-                &dataset[example_index],
-                &mut store,
-                &mut tape,
-                &cfg,
-                loss_scale,
-            )?;
-
-            tape.entries.clear();
-            tape.set_enabled(true);
-            let keep = retained_ids(&model_ids, &params, &store);
-            store.retain_ids(&keep);
+    // Resume if `--resume-from` was passed.
+    //
+    // Codex review 2026-04-20 on ad5568b (P1): `resume_if_configured` only
+    // restores optimizer state + step counter — the Trainer is
+    // architecture-agnostic and does not know how to reload model weights.
+    // So we first overwrite the base `--model` weights with the checkpoint's
+    // `model.safetensors`, then call the trainer-side restore.
+    //
+    // Codex review 2026-04-20 on 49512b1 (#1, High): the bare weight reload
+    // is not enough — (a) `load_into` silently ignores registered tensors
+    // absent from the file, so a partial checkpoint silently hybridises
+    // with base weights; (b) a checkpoint with mismatched architecture
+    // slips through until a shape mismatch crashes mid-training. Use the
+    // strict variant + validate the checkpoint's `config.json` matches the
+    // live `--model` config before letting the run proceed.
+    if let Some(resume_dir) = &args.resume_from {
+        let resume_weights = resume_dir.join("model.safetensors");
+        if !resume_weights.is_file() {
+            return Err(CliError::Custom(format!(
+                "--resume-from {} has no model.safetensors",
+                resume_dir.display(),
+            )));
         }
-
-        optimizer.step(&params, &mut store);
-
-        tape.entries.clear();
-        tape.set_enabled(true);
-        let keep = retained_ids(&model_ids, &params, &store);
-        store.retain_ids(&keep);
-
-        let mean_loss = step_loss / args.batch as f32;
-        if step % args.log_every == 0 || step + 1 == args.steps {
-            println!(
-                "step={} loss={mean_loss:.6} lr={} ms={:.2}",
-                step + 1,
-                args.lr,
-                step_start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-
-        if (step + 1) % args.save_every == 0 || step + 1 == args.steps {
-            save_checkpoint(
-                &args.model,
-                &args.out,
-                step + 1,
-                &registry,
-                &mut store,
-                &config_path,
-                &tokenizer_path,
-                args.save_dtype,
-            )?;
-        }
+        validate_resume_config(resume_dir, &cfg)?;
+        registry.load_into_strict(&mut store, &resume_weights)?;
+        let resumed = trainer
+            .resume_if_configured(&param_names)
+            .map_err(CliError::Autograd)?;
+        eprintln!(
+            "[train_sft] resumed from step {resumed} (weights from {})",
+            resume_weights.display()
+        );
     }
+
+    let mut tape = Tape::new();
+    let dataset_len = dataset.len();
+    let total_steps = args.steps;
+    let save_every = args.save_every;
+    let save_dtype = args.save_dtype;
+    let seed = args.seed;
+
+    // Step closure: forward + assistant-masked cross-entropy. Trainer handles
+    // the `1/batch` loss-scale + backward + optimizer.step + cleanup.
+    //
+    // Codex review 2026-04-20 on 49512b1 (#2, Medium): sample_index is
+    // keyed on `(seed, step, micro_idx)` alone — NOT on a shared stateful
+    // RNG. A stateful RNG would reset to position 0 on `--resume-from`
+    // (we don't persist RNG state in the checkpoint codec), causing data
+    // order to diverge from the interrupted run. With this derivation,
+    // step/micro_idx is a natural resume cursor: a resumed run picks up
+    // the same sequence it would have seen in a single uninterrupted run.
+    let model_ref = &model;
+    let cfg_ref = &cfg;
+    let dataset_ref = &dataset;
+    let step_fn = |ctx: &mut train::StepCtx<'_>| -> autograd::Result<StepOutcome> {
+        let example_index =
+            sample_index(seed, dataset_len, ctx.step as usize, ctx.micro_idx as usize);
+        let example = &dataset_ref[example_index];
+        let input_len = example.input_ids.len() - 1;
+        let position_ids = (0..input_len).map(|index| index as u32).collect::<Vec<_>>();
+        let logits = model_ref
+            .forward(
+                ctx.store,
+                ctx.tape,
+                &example.input_ids[..input_len],
+                &position_ids,
+            )
+            .map_err(autograd_from_qwen3)?;
+        let loss_id = assistant_masked_causal_loss(
+            logits,
+            &example.labels[1..],
+            ctx.store,
+            ctx.tape,
+            cfg_ref,
+        )?;
+        Ok(StepOutcome {
+            loss_id,
+            token_count: input_len as u64,
+        })
+    };
+
+    // Post-step hook: dump bf16/f32 model weights to `<out>/step_<N>/` on
+    // `save_every` boundaries (and always on the final step). Mirrors the
+    // pre-migration behavior byte-for-byte.
+    let model_path = args.model.clone();
+    let out_path = args.out.clone();
+    let cfg_path = config_path.clone();
+    let tok_path = tokenizer_path.clone();
+    let registry_ref = &registry;
+    let on_step_end = |step: u64, store: &mut TensorStore| -> autograd::Result<()> {
+        let step_usize = step as usize;
+        // Gate matches the Trainer's save_every + force-final behavior so the
+        // bf16 weights file always lands in the same `step_{:06}/` directory
+        // that the Trainer just populated with `trainer_state.json +
+        // optimizer.safetensors`. Keep the two gates in sync.
+        if step_usize.is_multiple_of(save_every) || step_usize == total_steps {
+            save_checkpoint_via_registry(
+                &model_path,
+                &out_path,
+                step_usize,
+                registry_ref,
+                store,
+                &cfg_path,
+                &tok_path,
+                save_dtype,
+            )
+            .map_err(autograd_from_cli)?;
+        }
+        Ok(())
+    };
+
+    trainer
+        .run_with_hooks(
+            &mut store,
+            &mut tape,
+            params,
+            param_names,
+            model_ids,
+            step_fn,
+            on_step_end,
+        )
+        .map_err(CliError::Autograd)?;
 
     Ok(())
 }
@@ -257,7 +386,7 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--backend" => {
                 args.backend = next_value(&mut iter, &flag)?
                     .parse()
-                    .map_err(|value| CliError::InvalidValue { flag, value })?;
+                    .map_err(|value| CliError::Arg(ArgError::InvalidValue { flag, value }))?;
             }
             "--save-every" => {
                 args.save_every = parse_value(&flag, next_value(&mut iter, &flag)?)?;
@@ -269,9 +398,27 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--save-dtype" => {
                 args.save_dtype = next_value(&mut iter, &flag)?
                     .parse()
-                    .map_err(|value| CliError::InvalidValue { flag, value })?;
+                    .map_err(|value| CliError::Arg(ArgError::InvalidValue { flag, value }))?;
             }
-            _ => return Err(CliError::UnknownFlag(flag)),
+            "--lr-schedule" => {
+                args.lr_schedule = next_value(&mut iter, &flag)?;
+            }
+            "--warmup-steps" => {
+                args.warmup_steps = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
+            "--min-lr" => {
+                args.min_lr = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
+            "--grad-accum-steps" => {
+                args.grad_accum_steps = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
+            }
+            "--metrics-jsonl" => {
+                args.metrics_jsonl = Some(PathBuf::from(next_value(&mut iter, &flag)?));
+            }
+            "--resume-from" => {
+                args.resume_from = Some(PathBuf::from(next_value(&mut iter, &flag)?));
+            }
+            _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
     }
 
@@ -296,28 +443,13 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
         ("--log-every", args.log_every),
     ] {
         if value == 0 {
-            return Err(CliError::InvalidValue {
+            return Err(CliError::Arg(ArgError::InvalidValue {
                 flag: flag.into(),
                 value: "0".into(),
-            });
+            }));
         }
     }
     Ok(())
-}
-
-fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, CliError> {
-    iter.next()
-        .ok_or_else(|| CliError::MissingValue(flag.to_string()))
-}
-
-fn parse_value<T>(flag: &str, value: String) -> Result<T, CliError>
-where
-    T: FromStr,
-{
-    value.parse::<T>().map_err(|_| CliError::InvalidValue {
-        flag: flag.to_string(),
-        value,
-    })
 }
 
 fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
@@ -368,38 +500,13 @@ fn trainable_params(model: &Qwen3Model, store: &TensorStore) -> Vec<TensorId> {
     params
 }
 
-fn train_on_example(
-    model: &Qwen3Model,
-    example: &TokenizedSft,
-    store: &mut TensorStore,
-    tape: &mut Tape,
-    cfg: &Qwen3Config,
-    loss_scale: f32,
-) -> Result<f32, CliError> {
-    let input_len = example.input_ids.len() - 1;
-    let position_ids = (0..input_len).map(|index| index as u32).collect::<Vec<_>>();
-    let logits = model.forward(store, tape, &example.input_ids[..input_len], &position_ids)?;
-    let loss_id = assistant_masked_causal_loss(logits, &example.labels[1..], store, tape, cfg)?;
-    let loss = store.to_host(loss_id)?[0];
-    // Scale the loss used for backward so the accumulated per-example
-    // gradients average (rather than sum) across micro-steps. Reported loss
-    // is the unscaled value so log output remains human-meaningful.
-    let backward_id = if (loss_scale - 1.0).abs() > f32::EPSILON {
-        mul_scalar(loss_id, loss_scale, store, tape)?
-    } else {
-        loss_id
-    };
-    tape.backward(backward_id, store)?;
-    Ok(loss)
-}
-
 fn assistant_masked_causal_loss(
     logits: TensorId,
     labels: &[i32],
     store: &mut TensorStore,
     tape: &mut Tape,
     cfg: &Qwen3Config,
-) -> Result<TensorId, CliError> {
+) -> autograd::Result<TensorId> {
     let logits_shape = store
         .get(logits)
         .ok_or(AutogradError::InvalidTensorId(logits))?
@@ -410,8 +517,8 @@ fn assistant_masked_causal_loss(
         .take(logits_shape.len() - 1)
         .product::<usize>();
     if labels.len() != target_count {
-        return Err(CliError::Custom(format!(
-            "shifted label count {} does not match logits prefix size {}",
+        return Err(leak_autograd_err(format!(
+            "train_sft: shifted label count {} does not match logits prefix size {}",
             labels.len(),
             target_count
         )));
@@ -419,22 +526,25 @@ fn assistant_masked_causal_loss(
 
     let valid_count = labels.iter().filter(|&&label| label >= 0).count();
     if valid_count == 0 {
-        return Err(CliError::Custom(
-            "example has no supervised assistant tokens after shifting".into(),
+        return Err(AutogradError::TapeInvariant(
+            "train_sft: example has no supervised assistant tokens after shifting",
         ));
     }
 
-    let gather_indices = labels
-        .iter()
-        .map(|&label| match usize::try_from(label) {
-            Ok(index) if index < cfg.vocab_size => Ok(index),
-            Ok(index) => Err(CliError::Custom(format!(
-                "label {index} is outside vocab size {}",
-                cfg.vocab_size
-            ))),
-            Err(_) => Ok(0),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut gather_indices: Vec<usize> = Vec::with_capacity(labels.len());
+    for &label in labels {
+        let idx = match usize::try_from(label) {
+            Ok(index) if index < cfg.vocab_size => index,
+            Ok(index) => {
+                return Err(leak_autograd_err(format!(
+                    "train_sft: label {index} is outside vocab size {}",
+                    cfg.vocab_size
+                )));
+            }
+            Err(_) => 0,
+        };
+        gather_indices.push(idx);
+    }
     let mask_values = labels
         .iter()
         .map(|&label| if label >= 0 { 1.0 } else { 0.0 })
@@ -450,10 +560,94 @@ fn assistant_masked_causal_loss(
     let mask = store.from_slice(&mask_values, &target_shape)?;
     let masked = mul(target_log_probs, mask, store, tape)?;
     let total = sum(masked, store, tape)?;
-    Ok(mul_scalar(total, -1.0 / valid_count as f32, store, tape)?)
+    mul_scalar(total, -1.0 / valid_count as f32, store, tape)
 }
 
-fn save_checkpoint(
+/// Leak a `String` into a `&'static str` for `AutogradError::TapeInvariant`.
+/// Matches the pattern in `autograd/src/safetensors_io.rs` — fires at most
+/// once per run because the error immediately propagates up and aborts.
+fn leak_autograd_err(msg: String) -> AutogradError {
+    AutogradError::TapeInvariant(Box::leak(msg.into_boxed_str()))
+}
+
+fn autograd_from_qwen3(err: Qwen3Error) -> AutogradError {
+    leak_autograd_err(format!("train_sft: qwen3 forward: {err}"))
+}
+
+fn autograd_from_cli(err: CliError) -> AutogradError {
+    leak_autograd_err(format!("train_sft: checkpoint save: {err}"))
+}
+
+/// Verify the resume dir's `config.json` matches the live `--model` config
+/// on the dimensions that determine tensor shapes — hidden size, layer
+/// count, attention shape, vocab. A silent shape mismatch would otherwise
+/// surface as a mid-training crash on the first forward pass; per the
+/// codex review of 49512b1 (#1 High), fail fast before the run starts.
+///
+/// Missing `config.json` is a hard error: codex review 429efc3 (Medium)
+/// flagged that silently skipping the config-match check when cfg.json
+/// is absent reopens the tied/untied silent-corruption path this
+/// function is meant to close. Older checkpoints that need to resume
+/// can regenerate their `config.json` from the live `Qwen3Config` and
+/// drop it into the resume dir.
+fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), CliError> {
+    let cfg_path = resume_dir.join("config.json");
+    if !cfg_path.exists() {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} has no config.json; refuse to resume without a config-match check \
+             (would otherwise silently miss tie_word_embeddings / shape drift). \
+             Regenerate config.json from the source model or fresh-start without --resume-from.",
+            resume_dir.display()
+        )));
+    }
+    let file_cfg: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cfg_path)?)
+        .map_err(|e| CliError::Custom(format!("resume config.json parse error: {e}")))?;
+    let mut mismatches: Vec<String> = [
+        ("hidden_size", cfg.hidden_size as i64),
+        ("intermediate_size", cfg.intermediate_size as i64),
+        ("num_hidden_layers", cfg.num_hidden_layers as i64),
+        ("num_attention_heads", cfg.num_attention_heads as i64),
+        ("num_key_value_heads", cfg.num_key_value_heads as i64),
+        ("head_dim", cfg.head_dim as i64),
+        ("vocab_size", cfg.vocab_size as i64),
+    ]
+    .iter()
+    .filter_map(|(k, v)| match file_cfg.get(*k).and_then(|x| x.as_i64()) {
+        Some(seen) if seen != *v => Some(format!("{k}: ckpt={seen} live={v}")),
+        _ => None,
+    })
+    .collect();
+
+    // Codex review 2026-04-20 on d9eee61 (High): `tie_word_embeddings`
+    // changes the live parameter map — when true, `embed_tokens.weight`
+    // and `lm_head.weight` alias to the same `TensorId` in `param_ids`,
+    // when false they are distinct. An untied checkpoint resumed against
+    // a tied live config would pass the shape check above, then
+    // `load_into_strict` would load two different file tensors into the
+    // same live TensorId with the second one silently winning. Treat the
+    // flag as a shape-determining field so the run fails fast.
+    if let Some(saw) = file_cfg
+        .get("tie_word_embeddings")
+        .and_then(|v| v.as_bool())
+        && saw != cfg.tie_word_embeddings
+    {
+        mismatches.push(format!(
+            "tie_word_embeddings: ckpt={saw} live={}",
+            cfg.tie_word_embeddings
+        ));
+    }
+
+    if !mismatches.is_empty() {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} config mismatch with --model: {}",
+            resume_dir.display(),
+            mismatches.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn save_checkpoint_via_registry(
     model_dir: &Path,
     out_dir: &Path,
     step: usize,
@@ -463,7 +657,13 @@ fn save_checkpoint(
     tokenizer_path: &Path,
     save_dtype: SaveDtype,
 ) -> Result<(), CliError> {
-    let step_dir = out_dir.join(format!("step_{step}"));
+    // Zero-padded 6-digit format matches the Trainer's own save_checkpoint
+    // path (`step_{:06}`), so the bf16 weights file lands next to
+    // `trainer_state.json + optimizer.safetensors` in a single directory —
+    // required for `--resume-from` to roundtrip correctly (codex review
+    // 2026-04-20 on ad5568b, P1).
+    let step_basename = format!("step_{step:06}");
+    let step_dir = out_dir.join(&step_basename);
     fs::create_dir_all(&step_dir)?;
     fs::copy(config_path, step_dir.join("config.json"))?;
     fs::copy(tokenizer_path, step_dir.join("tokenizer.json"))?;
@@ -472,6 +672,14 @@ fn save_checkpoint(
         SaveDtype::F32 => registry.save_from(store, &weights_path)?,
         SaveDtype::Bf16 => registry.save_from_bf16(store, &weights_path)?,
     }
+
+    // DX-1: refresh `<out>/latest` symlink so `infer --model-path <out>/latest`
+    // and `--resume-from <out>/latest` address the newest checkpoint without
+    // the caller reading directory listings. Trainer::save_checkpoint (for
+    // optimizer/trainer state) writes the same symlink in parallel — last
+    // writer wins, and both point at the same step_dir basename.
+    write_latest_symlink(out_dir, &step_basename)?;
+
     println!(
         "[train_sft] saved checkpoint for step {} to {} (source model dir: {}, dtype: {:?})",
         step,
@@ -486,15 +694,29 @@ fn has_supervised_target(example: &TokenizedSft) -> bool {
     example.labels.iter().skip(1).any(|&label| label >= 0)
 }
 
-fn sample_index(rng: &mut LcgRng, upper: usize, step: usize, micro_step: usize) -> usize {
+/// Deterministic in `(seed, step, micro_step)` — stateless w.r.t. any
+/// running RNG, so a `--resume-from` run picks up the same data stream a
+/// single uninterrupted run would have produced. Mixing is SplitMix64 on
+/// top of a `step * golden_ratio ^ (micro_step << 32)` combine so
+/// consecutive triples spread uniformly across `[0, upper)` instead of
+/// clustering on a single-bit flip.
+///
+/// Codex review 2026-04-20 on 49512b1 (#2 Medium): prior version drew
+/// from a shared `LcgRng` whose position was not persisted in the
+/// checkpoint, so a resumed run redrew from position 0 and diverged
+/// immediately from the interrupted-run's data order.
+fn sample_index(seed: u64, upper: usize, step: usize, micro_step: usize) -> usize {
     if upper <= 1 {
         return 0;
     }
-    let mix = rng
-        .next_u64()
-        .wrapping_add(step as u64)
-        .wrapping_add((micro_step as u64) << 32);
-    (mix % upper as u64) as usize
+    let mut h =
+        seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ((micro_step as u64) << 32);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    (h % upper as u64) as usize
 }
 
 fn live_tensor_ids(store: &TensorStore) -> HashSet<TensorId> {
@@ -504,19 +726,4 @@ fn live_tensor_ids(store: &TensorStore) -> HashSet<TensorId> {
         .enumerate()
         .filter_map(|(tensor_id, slot)| slot.as_ref().map(|_| tensor_id))
         .collect()
-}
-
-fn retained_ids(
-    model_ids: &HashSet<TensorId>,
-    params: &[TensorId],
-    store: &TensorStore,
-) -> HashSet<TensorId> {
-    let mut keep = model_ids.clone();
-    for &param_id in params {
-        keep.insert(param_id);
-        if let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) {
-            keep.insert(grad_id);
-        }
-    }
-    keep
 }

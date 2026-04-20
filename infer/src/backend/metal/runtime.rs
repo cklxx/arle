@@ -563,7 +563,7 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options(
     model_path: &str,
     options: MetalBackendOptions,
     max_waiting: usize,
-) -> Result<SchedulerHandle> {
+) -> Result<MetalSchedulerHandle> {
     let model_id = Path::new(model_path)
         .file_name()
         .and_then(|name| name.to_str())
@@ -577,16 +577,68 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options(
     )
 }
 
+/// Wrapper that pairs a `SchedulerHandle` with DFlash init-time metadata for
+/// HTTP-layer introspection (`/v1/models`).
+///
+/// The inner scheduler handle submits work exactly as the raw
+/// `SchedulerHandle` does — this struct only adds a read-only side channel
+/// for the DFlash draft id and speculative block size, captured at backend
+/// load time. Acceptance rate is NOT stored here; it is read from the shared
+/// `ServerMetrics` at response time (rolling counter).
+#[derive(Clone)]
+pub struct MetalSchedulerHandle {
+    inner: SchedulerHandle,
+    dflash_status: Option<crate::request_handle::DflashStatus>,
+}
+
+impl MetalSchedulerHandle {
+    /// Borrow the underlying `SchedulerHandle` for callers that still expect
+    /// the raw scheduler type (e.g. bench harness token-counter plumbing).
+    pub fn inner(&self) -> &SchedulerHandle {
+        &self.inner
+    }
+}
+
+impl crate::request_handle::RequestHandle for MetalSchedulerHandle {
+    fn submit(
+        &self,
+        req: IncomingRequest,
+    ) -> std::result::Result<(), crate::request_handle::SubmitError> {
+        SchedulerHandle::submit(&self.inner, req).map_err(|_| crate::request_handle::SubmitError)
+    }
+
+    fn model_id(&self) -> &str {
+        SchedulerHandle::model_id(&self.inner)
+    }
+
+    fn dflash_status(&self) -> Option<crate::request_handle::DflashStatus> {
+        self.dflash_status.clone()
+    }
+}
+
 pub fn spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
     model_path: &str,
     options: MetalBackendOptions,
     max_waiting: usize,
     metrics: ServerMetrics,
-) -> Result<SchedulerHandle> {
+) -> Result<MetalSchedulerHandle> {
     // DFlash is now supported: Qwen3StepDriver's token-buffer pattern runs
     // speculative blocks inside decode_token, transparent to the scheduler.
     let mut backend = MetalBackend::with_options(options);
     backend.load(Path::new(model_path))?;
+
+    // Snapshot DFlash metadata BEFORE the backend is leaked into the
+    // scheduler thread. When DFlash is disabled at load time (either no
+    // draft requested, or a compatibility check failed and fell back),
+    // this reads `None` and the HTTP layer reports DFlash disabled —
+    // matching the actual runtime state.
+    let dflash_status =
+        backend
+            .dflash_runtime_ref()
+            .map(|rt| crate::request_handle::DflashStatus {
+                draft_model: rt.draft_model_id().to_string(),
+                speculative_tokens: rt.block_size(),
+            });
 
     let model_id = Path::new(model_path)
         .file_name()
@@ -638,13 +690,16 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
         }
     });
 
-    Ok(handle)
+    Ok(MetalSchedulerHandle {
+        inner: handle,
+        dflash_status,
+    })
 }
 
 pub fn spawn_metal_scheduler_handle_from_path(
     model_path: &str,
     max_waiting: usize,
-) -> Result<SchedulerHandle> {
+) -> Result<MetalSchedulerHandle> {
     spawn_metal_scheduler_handle_from_path_with_options(
         model_path,
         MetalBackendOptions::default(),
@@ -1021,6 +1076,19 @@ fn execute_prefill_chunk(
                     && let Err(err) = prefix_runtime.publish_prompt_prefix(request)
                 {
                     warn!("Metal live prefix publish failed for {:?}: {err:#}", req_id);
+                }
+                // DFlash widens the runtime-side prefill budget to consume
+                // the whole prompt in one FFI call (see budget override
+                // above). The scheduler-side `prefill_progress` still only
+                // advanced by `chunk_cap` per step, so we must re-sync it
+                // before `complete_prefill`, which otherwise rejects with
+                // `WrongPhase` for any prompt > prefill_chunk_size.
+                // See docs/experience/errors/2026-04-19-dflash-long-prompt-prefill-chunking-desync.md.
+                if let Some(request) = active.get(&req_id)
+                    && request.request_state.is_dflash_enabled()
+                {
+                    let prompt_len = request.request_state.prompt_len();
+                    scheduler.fast_forward_prefill(req_id, prompt_len);
                 }
                 match scheduler.complete_prefill(req_id, token) {
                     Ok(done) => scheduler_finished = done,

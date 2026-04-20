@@ -20,13 +20,27 @@
 //!   data[data_len]: f32 LE
 //! ```
 
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use autograd::adamw_state::{AdamWParamState, AdamWState};
 use autograd::{TensorId, TensorStore, module::Module};
+use safetensors::{Dtype, SafeTensors, serialize_to_file};
+use serde::{Deserialize, Serialize};
 
 use crate::model::TransformerConfig;
+
+/// Codec version for the v2 directory checkpoint layout.
+pub const TRAINER_STATE_CODEC_VERSION: u32 = 2;
+
+/// Filename for the trainer scalar/schedule JSON under a v2 checkpoint dir.
+pub const TRAINER_STATE_FILENAME: &str = "trainer_state.json";
+
+/// Filename for the AdamW moments safetensors file under a v2 checkpoint dir.
+pub const OPTIMIZER_STATE_FILENAME: &str = "optimizer.safetensors";
 
 // bumped 2026-04-19 when TinyLM was renamed to Transformer (no on-disk format change)
 const MAGIC: &[u8; 8] = b"LMCKP003";
@@ -47,6 +61,14 @@ pub enum CheckpointError {
     },
     #[error("missing tensor id {0}")]
     MissingTensor(TensorId),
+    #[error("trainer state json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("missing optim tensor pair for param '{0}' (need both .m and .v)")]
+    MissingMomentPair(String),
+    #[error("trainer state v2 codec version mismatch: expected 2, got {0}")]
+    VersionMismatch(u32),
+    #[error("safetensors: {0}")]
+    Safetensors(String),
 }
 
 pub type Result<T> = std::result::Result<T, CheckpointError>;
@@ -171,4 +193,393 @@ fn read_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf)?;
     Ok(u64::from_le_bytes(buf))
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint Codec v2 — directory layout (trainer_state.json + optimizer.safetensors)
+// ---------------------------------------------------------------------------
+
+/// Trainer-side scalar/schedule state persisted alongside optimizer moments.
+///
+/// Serialized pretty to `<dir>/trainer_state.json`. Kept open-schema via
+/// `schedule_params: serde_json::Value` so schedule implementations can own
+/// their own parameter shape without a matching enum in this crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainerStateDoc {
+    pub step: u64,
+    /// Schema tag for the optimizer state. Today: `"adamw-v1"`.
+    pub optim_schema: String,
+    /// `"constant"` | `"linear-warmup"` | `"cosine-with-warmup"`.
+    pub schedule_name: String,
+    pub schedule_params: serde_json::Value,
+    pub grad_accum_current: u64,
+    pub rng_seed: u64,
+    /// On-disk codec version. Must equal [`TRAINER_STATE_CODEC_VERSION`].
+    pub codec_version: u32,
+}
+
+/// Save a v2 directory checkpoint (scalar trainer state + AdamW moments).
+///
+/// Writes:
+/// - `<dir>/trainer_state.json` (pretty-printed JSON)
+/// - `<dir>/optimizer.safetensors` (each param → two tensors `"{name}.m"`,
+///   `"{name}.v"`, f32; top-level metadata carries `step` + `skipped_export`)
+///
+/// Creates `dir` (and any missing parents) on demand.
+pub fn save_trainer_state_v2(
+    dir: &Path,
+    state: &TrainerStateDoc,
+    optim: &AdamWState,
+) -> std::result::Result<(), CheckpointError> {
+    std::fs::create_dir_all(dir)?;
+
+    let json = serde_json::to_string_pretty(state)?;
+    std::fs::write(dir.join(TRAINER_STATE_FILENAME), json)?;
+
+    let mut tensors: Vec<(String, OptimTensorView)> = Vec::with_capacity(optim.params.len() * 2);
+    for param in &optim.params {
+        let expected_len: usize = if param.shape.is_empty() {
+            1
+        } else {
+            param.shape.iter().product()
+        };
+        if param.m.len() != expected_len || param.v.len() != expected_len {
+            return Err(CheckpointError::Safetensors(format!(
+                "AdamW moment length mismatch for '{}' during save: shape {:?} => {} elems, m {} v {}",
+                param.name,
+                param.shape,
+                expected_len,
+                param.m.len(),
+                param.v.len(),
+            )));
+        }
+        tensors.push((
+            format!("{}.m", param.name),
+            OptimTensorView::from_f32(param.shape.clone(), &param.m),
+        ));
+        tensors.push((
+            format!("{}.v", param.name),
+            OptimTensorView::from_f32(param.shape.clone(), &param.v),
+        ));
+    }
+
+    let mut metadata: HashMap<String, String> = HashMap::new();
+    metadata.insert("step".to_string(), optim.step.to_string());
+    metadata.insert(
+        "skipped_export".to_string(),
+        optim.skipped_export.to_string(),
+    );
+
+    serialize_to_file(tensors, Some(metadata), &dir.join(OPTIMIZER_STATE_FILENAME))
+        .map_err(|err| CheckpointError::Safetensors(err.to_string()))?;
+
+    Ok(())
+}
+
+/// Load a v2 directory checkpoint written by [`save_trainer_state_v2`].
+pub fn load_trainer_state_v2(
+    dir: &Path,
+) -> std::result::Result<(TrainerStateDoc, AdamWState), CheckpointError> {
+    let json_path = dir.join(TRAINER_STATE_FILENAME);
+    let json_bytes = std::fs::read(&json_path)?;
+    let state: TrainerStateDoc = serde_json::from_slice(&json_bytes)?;
+    if state.codec_version != TRAINER_STATE_CODEC_VERSION {
+        return Err(CheckpointError::VersionMismatch(state.codec_version));
+    }
+
+    let optim_path = dir.join(OPTIMIZER_STATE_FILENAME);
+    let optim_bytes = std::fs::read(&optim_path)?;
+    // `SafeTensors::deserialize` gives us tensor views; the top-level
+    // metadata lives on `Metadata` and has to be fetched via `read_metadata`.
+    let (_, header_metadata) = SafeTensors::read_metadata(&optim_bytes)
+        .map_err(|err| CheckpointError::Safetensors(err.to_string()))?;
+    let st = SafeTensors::deserialize(&optim_bytes)
+        .map_err(|err| CheckpointError::Safetensors(err.to_string()))?;
+
+    // Group by base name (strip .m/.v suffix), preserving first-seen order so
+    // saved-order round-trips deterministically.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: BTreeMap<String, MomentPair> = BTreeMap::new();
+    for (key, view) in st.tensors() {
+        let (base, which) = split_moment_key(&key).ok_or_else(|| {
+            CheckpointError::Safetensors(format!(
+                "optimizer.safetensors: tensor '{key}' has no .m/.v suffix"
+            ))
+        })?;
+        let entry = groups.entry(base.to_string()).or_insert_with(|| {
+            order.push(base.to_string());
+            MomentPair::default()
+        });
+        let shape = view.shape().to_vec();
+        let data = optim_tensor_view_to_f32(&view)
+            .map_err(|err| CheckpointError::Safetensors(err.to_string()))?;
+        match which {
+            Moment::M => entry.m = Some((shape, data)),
+            Moment::V => entry.v = Some((shape, data)),
+        }
+    }
+
+    let mut params = Vec::with_capacity(order.len());
+    for name in &order {
+        let pair = groups.get(name).expect("just inserted");
+        let (m_shape, m_data) = pair
+            .m
+            .clone()
+            .ok_or_else(|| CheckpointError::MissingMomentPair(name.clone()))?;
+        let (v_shape, v_data) = pair
+            .v
+            .clone()
+            .ok_or_else(|| CheckpointError::MissingMomentPair(name.clone()))?;
+        if m_shape != v_shape {
+            return Err(CheckpointError::Safetensors(format!(
+                "optimizer.safetensors: '{name}' .m shape {m_shape:?} != .v shape {v_shape:?}"
+            )));
+        }
+        params.push(AdamWParamState {
+            name: name.clone(),
+            m: m_data,
+            v: v_data,
+            shape: m_shape,
+        });
+    }
+
+    let metadata: &Option<HashMap<String, String>> = header_metadata.metadata();
+    let step = metadata
+        .as_ref()
+        .and_then(|m: &HashMap<String, String>| m.get("step"))
+        .and_then(|s: &String| s.parse::<u64>().ok())
+        .unwrap_or(state.step);
+    let skipped_export = metadata
+        .as_ref()
+        .and_then(|m: &HashMap<String, String>| m.get("skipped_export"))
+        .and_then(|s: &String| s.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    Ok((
+        state,
+        AdamWState {
+            step,
+            params,
+            skipped_export,
+        },
+    ))
+}
+
+#[derive(Default)]
+struct MomentPair {
+    m: Option<(Vec<usize>, Vec<f32>)>,
+    v: Option<(Vec<usize>, Vec<f32>)>,
+}
+
+enum Moment {
+    M,
+    V,
+}
+
+fn split_moment_key(key: &str) -> Option<(&str, Moment)> {
+    if let Some(base) = key.strip_suffix(".m") {
+        Some((base, Moment::M))
+    } else {
+        key.strip_suffix(".v").map(|base| (base, Moment::V))
+    }
+}
+
+fn optim_tensor_view_to_f32(
+    view: &safetensors::tensor::TensorView<'_>,
+) -> std::result::Result<Vec<f32>, String> {
+    match view.dtype() {
+        Dtype::F32 => Ok(view
+            .data()
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect()),
+        dtype => Err(format!("optimizer.safetensors: unsupported dtype {dtype}")),
+    }
+}
+
+/// Thin `safetensors::View` impl that borrows moment data as little-endian f32
+/// bytes without a heap-allocated detour.
+struct OptimTensorView {
+    shape: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+impl OptimTensorView {
+    fn from_f32(shape: Vec<usize>, values: &[f32]) -> Self {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        Self { shape, bytes }
+    }
+}
+
+impl safetensors::View for OptimTensorView {
+    fn dtype(&self) -> Dtype {
+        Dtype::F32
+    }
+
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn data(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(self.bytes.as_slice())
+    }
+
+    fn data_len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+/// Atomically refresh a `latest` symlink inside `parent` pointing at a
+/// sibling directory named `target_basename`. Used by every training
+/// binary's save-checkpoint path so downstream tooling (e.g.
+/// `infer --model-path <out>/latest`) can reference "the most recent
+/// checkpoint" without knowing the step number. Docs/plan:
+/// `docs/plans/train-eval-infer-dx-v1.md` Phase DX-1.
+///
+/// `target_basename` must be a basename (e.g. `"step_000100"`), not a
+/// full path — the symlink is relative so the whole `<parent>/` tree
+/// remains copyable / rsync-safe.
+///
+/// Refuses to overwrite a regular file or directory at `<parent>/latest`
+/// (only an existing symlink is replaced). This guards against a user
+/// accidentally stashing their final checkpoint under that exact name.
+///
+/// The update is atomic from a reader's perspective: we create the new
+/// symlink under `.latest.tmp` first, then `rename()` it onto `latest`.
+/// POSIX `rename` on the same directory is atomic, so readers either see
+/// the old target or the new one — never a missing/half-applied pointer.
+/// Codex review 2026-04-20 on 0da212f (Medium): the previous
+/// remove-then-create sequence exposed a brief window where `latest`
+/// did not exist. An `infer --model-path <out>/latest` call that landed
+/// in that window would fail even though a checkpoint was ready.
+#[cfg(unix)]
+pub fn write_latest_symlink(parent: &Path, target_basename: &str) -> io::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    if target_basename.contains('/') || target_basename.contains('\\') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("write_latest_symlink: target must be a basename, got {target_basename:?}"),
+        ));
+    }
+
+    let link = parent.join("latest");
+    // Refuse to overwrite a non-symlink (file or directory) at `<parent>/latest`.
+    // We only want to atomically swap an existing symlink or fill an empty slot.
+    match std::fs::symlink_metadata(&link) {
+        Ok(meta) if meta.file_type().is_symlink() => { /* swap via rename below */ }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "write_latest_symlink: refusing to overwrite non-symlink at {}",
+                    link.display()
+                ),
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => { /* fresh install */ }
+        Err(e) => return Err(e),
+    }
+
+    // Clean up any leftover tmp from a prior crashed call.
+    let tmp = parent.join(".latest.tmp");
+    match std::fs::symlink_metadata(&tmp) {
+        Ok(_) => std::fs::remove_file(&tmp)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    symlink(target_basename, &tmp)?;
+    // POSIX rename is atomic on the same filesystem and will replace an
+    // existing symlink at `link` without an intermediate "missing" state.
+    std::fs::rename(&tmp, &link).map_err(|err| {
+        // Best-effort cleanup so we don't leave `.latest.tmp` behind.
+        let _ = std::fs::remove_file(&tmp);
+        err
+    })
+}
+
+#[cfg(not(unix))]
+pub fn write_latest_symlink(_parent: &Path, _target_basename: &str) -> io::Result<()> {
+    // Non-unix targets (currently unsupported by this workspace per
+    // CLAUDE.md support matrix) — no-op rather than erroring. Callers
+    // who need a portable marker should fall back to reading the
+    // lexicographically-largest `step_*` entry.
+    Ok(())
+}
+
+#[cfg(test)]
+mod latest_symlink_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_latest_symlink_when_absent() {
+        let dir = tempdir().expect("tempdir");
+        let step_dir = dir.path().join("step_000001");
+        fs::create_dir_all(&step_dir).unwrap();
+        fs::write(step_dir.join("config.json"), "{}").unwrap();
+
+        write_latest_symlink(dir.path(), "step_000001").expect("write latest");
+
+        let link = dir.path().join("latest");
+        let meta = fs::symlink_metadata(&link).expect("latest exists");
+        assert!(meta.file_type().is_symlink(), "latest must be a symlink");
+        let resolved = fs::canonicalize(&link).expect("resolve latest");
+        let expected = fs::canonicalize(&step_dir).expect("resolve step");
+        assert_eq!(resolved, expected, "latest must point at step_000001");
+        // Downstream tooling treats `<out>/latest` as a model dir; the
+        // symlink must transparently expose the step dir's files.
+        assert!(
+            link.join("config.json").exists(),
+            "config.json must resolve through the symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refreshes_latest_symlink_to_new_target() {
+        let dir = tempdir().expect("tempdir");
+        let step1 = dir.path().join("step_000001");
+        let step2 = dir.path().join("step_000002");
+        fs::create_dir_all(&step1).unwrap();
+        fs::create_dir_all(&step2).unwrap();
+        fs::write(step1.join("marker.txt"), "one").unwrap();
+        fs::write(step2.join("marker.txt"), "two").unwrap();
+
+        write_latest_symlink(dir.path(), "step_000001").unwrap();
+        write_latest_symlink(dir.path(), "step_000002").unwrap();
+
+        let link = dir.path().join("latest");
+        let marker = fs::read_to_string(link.join("marker.txt")).expect("read marker");
+        assert_eq!(marker, "two", "latest must now point at step_000002");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_overwrite_regular_file_at_latest() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("latest"), "user-data").expect("pre-existing file");
+
+        let err = write_latest_symlink(dir.path(), "step_000001")
+            .expect_err("must refuse to clobber regular file");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+
+        // User data must survive.
+        let surviving = fs::read_to_string(dir.path().join("latest")).unwrap();
+        assert_eq!(surviving, "user-data");
+    }
+
+    #[test]
+    fn rejects_basename_with_path_separator() {
+        let dir = tempdir().expect("tempdir");
+        let err = write_latest_symlink(dir.path(), "../etc/passwd")
+            .expect_err("must reject path-like basename");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
 }

@@ -13,11 +13,12 @@ use mlx_sys::{
     MLX_FLOAT32, MLX_INT32, mlx_add, mlx_array_data_float32, mlx_array_free, mlx_array_from_data,
     mlx_array_new_float32, mlx_array_size, mlx_concatenate_axis, mlx_eval, mlx_exp,
     mlx_fast_rms_norm, mlx_logsumexp_axis, mlx_matmul, mlx_mean_axis, mlx_multiply, mlx_negative,
-    mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_subtract, mlx_sum_axis,
-    mlx_take_axis, mlx_tanh,
+    mlx_reshape, mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_subtract,
+    mlx_sum_axis, mlx_take_axis, mlx_tanh, mlx_transpose_axes,
 };
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // MLX's default stream/device is process-global and its C++ allocator is
 // not re-entrant across threads. Concurrent `mlx_matmul` calls (e.g.
@@ -25,6 +26,35 @@ use std::sync::Mutex;
 // mutex here is coarse but correct — training is single-threaded, and
 // the lock is held only for the duration of one matmul FFI round-trip.
 pub(crate) static MLX_GUARD: Mutex<()> = Mutex::new(());
+
+// Per-process counter for every `mlx_eval` call that flows through the
+// Metal backend. Used by M5.3a acceptance tests to confirm that a
+// well-structured forward+backward step terminates in exactly one eval
+// boundary (see `docs/plans/m5.3-device-resident-tensor.md` §5). Covers
+// `MetalBackend::eval` as well as the legacy `eval_and_readback` tail
+// used by non-device-resident ops.
+static METAL_EVAL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of `mlx_eval` invocations performed by the Metal backend since
+/// process start (or the last `reset_eval_count`). Cheap atomic load;
+/// intended for tests and bench harnesses, not hot-path instrumentation.
+pub fn eval_count() -> u64 {
+    METAL_EVAL_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset the eval counter to zero. Exposed so test harnesses can scope a
+/// measurement around a single training step. Thread-safe but not
+/// synchronized with concurrent `mlx_eval` calls — the training tape is
+/// single-threaded, so resetting immediately before the step under test
+/// is the contract.
+pub fn reset_eval_count() {
+    METAL_EVAL_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn bump_eval_count() {
+    METAL_EVAL_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MetalBackend;
@@ -113,6 +143,7 @@ impl Backend for MetalBackend {
         unsafe {
             mlx_eval(metal_handles.as_mut_ptr(), metal_handles.len());
         }
+        bump_eval_count();
 
         Ok(())
     }
@@ -174,6 +205,29 @@ impl Backend for MetalBackend {
         Ok((out, out_shape))
     }
 
+    fn matmul_backward(
+        &self,
+        a: &[f32],
+        a_shape: &[usize],
+        b: &[f32],
+        b_shape: &[usize],
+        grad_out: &[f32],
+        grad_out_shape: &[usize],
+        need_grad_a: bool,
+        need_grad_b: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        mlx_matmul_backward(
+            a,
+            a_shape,
+            b,
+            b_shape,
+            grad_out,
+            grad_out_shape,
+            need_grad_a,
+            need_grad_b,
+        )
+    }
+
     fn softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
         mlx_softmax_like(x, shape, SoftmaxKind::Softmax)
     }
@@ -203,6 +257,49 @@ impl Backend for MetalBackend {
             let out_arr = mlx_add(a_handle.as_ptr(), b_handle.as_ptr());
             if out_arr.is_null() {
                 return Err(AutogradError::TapeInvariant("mlx_add returned null"));
+            }
+            DeviceHandle::Metal(MlxHandle::from_raw(out_arr))
+        };
+
+        Ok(out)
+    }
+
+    // Lazy reduce-sum-all: reshape `x` into a 1-D `[N]` view (an MLX no-op
+    // when the input is contiguous) and call `mlx_sum_axis(_, 0, keepdims=false)`
+    // to produce a rank-0 scalar that composes into MLX's lazy graph. NO
+    // `mlx_eval` here — the tape's terminal flush (`ensure_host` on the loss)
+    // is the single eval boundary. This is the M5.3b.1 deliverable; before
+    // M5.3b.1 `sum` always forced a flush via `sum_last_axis_forward`.
+    fn sum_all(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(x_handle) = x else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot sum a non-metal device handle",
+            ));
+        };
+        let size = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product::<usize>()
+        };
+
+        let flat_shape = [size as i32];
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+        // Safety: `x_handle` is a live MLX array borrowed for this call;
+        // both intermediate arrays we allocate here are freed (the reshape
+        // node) or transferred into `MlxHandle` (the sum result) before
+        // returning, and `MLX_GUARD` serializes MLX state access.
+        let out = unsafe {
+            let flat = mlx_reshape(x_handle.as_ptr(), flat_shape.as_ptr(), 1);
+            if flat.is_null() {
+                return Err(AutogradError::TapeInvariant("mlx_reshape returned null"));
+            }
+            let out_arr = mlx_sum_axis(flat, 0, false);
+            mlx_array_free(flat);
+            if out_arr.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_sum_axis returned null (sum_all)",
+                ));
             }
             DeviceHandle::Metal(MlxHandle::from_raw(out_arr))
         };
@@ -309,6 +406,202 @@ impl Backend for MetalBackend {
     }
 }
 
+// Compute matmul gradients on-device. `grad_a = grad_out @ B^T` and
+// `grad_b = A^T @ grad_out`; the inner-most two axes of A/B are transposed
+// via `mlx_transpose_axes` (a lazy view that MLX fuses into the GEMM), so
+// no host-side transpose or extra upload is needed. The `need_grad_a`/
+// `need_grad_b` gates let the caller skip whichever SGEMM is not needed.
+//
+// One MLX round-trip per requested gradient: upload A, B, grad_out once,
+// issue two matmuls and one eval, then copy the results back. Mirrors the
+// forward's lock/eval/readback discipline.
+fn mlx_matmul_backward(
+    a: &[f32],
+    a_shape: &[usize],
+    b: &[f32],
+    b_shape: &[usize],
+    grad_out: &[f32],
+    grad_out_shape: &[usize],
+    need_grad_a: bool,
+    need_grad_b: bool,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let expected_out = matmul_output_shape(a_shape, b_shape)?;
+    if grad_out_shape != expected_out.as_slice() {
+        return Err(AutogradError::ShapeMismatch {
+            expected: expected_out,
+            got: grad_out_shape.to_vec(),
+        });
+    }
+    let a_size: usize = a_shape.iter().product();
+    let b_size: usize = b_shape.iter().product();
+    let g_size: usize = grad_out_shape.iter().product();
+    if a.len() != a_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: a.len(),
+            shape: a_shape.to_vec(),
+            size: a_size,
+        });
+    }
+    if b.len() != b_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: b.len(),
+            shape: b_shape.to_vec(),
+            size: b_size,
+        });
+    }
+    if grad_out.len() != g_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: grad_out.len(),
+            shape: grad_out_shape.to_vec(),
+            size: g_size,
+        });
+    }
+
+    if !need_grad_a && !need_grad_b {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let rank = a_shape.len();
+    if rank != 2 && rank != 3 {
+        return Err(AutogradError::InvalidRank {
+            expected: "both operands must be rank-2 or rank-3",
+            got: rank,
+        });
+    }
+
+    // Axes permutation that swaps the last two dims (rank 2 or 3). MLX's
+    // transpose_axes takes the full permutation vector.
+    let transpose_axes: Vec<i32> = if rank == 2 { vec![1, 0] } else { vec![0, 2, 1] };
+
+    let a_shape_i32: Vec<i32> = a_shape.iter().map(|&d| d as i32).collect();
+    let b_shape_i32: Vec<i32> = b_shape.iter().map(|&d| d as i32).collect();
+    let g_shape_i32: Vec<i32> = grad_out_shape.iter().map(|&d| d as i32).collect();
+
+    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+    // Safety: `a`, `b`, `grad_out` outlive the FFI calls (MLX copies host
+    // slices into its own storage); every MLX array allocated below is freed
+    // on every return path.
+    unsafe {
+        let g_arr = mlx_array_from_data(
+            grad_out.as_ptr() as *const c_void,
+            g_shape_i32.as_ptr(),
+            g_shape_i32.len() as i32,
+            MLX_FLOAT32,
+        );
+        if g_arr.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_array_from_data returned null (grad_out)",
+            ));
+        }
+
+        // grad_a = grad_out @ B^T
+        let grad_a_host = if need_grad_a {
+            let b_arr = mlx_array_from_data(
+                b.as_ptr() as *const c_void,
+                b_shape_i32.as_ptr(),
+                b_shape_i32.len() as i32,
+                MLX_FLOAT32,
+            );
+            if b_arr.is_null() {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_array_from_data returned null (b)",
+                ));
+            }
+            let b_t = mlx_transpose_axes(b_arr, transpose_axes.as_ptr(), transpose_axes.len());
+            mlx_array_free(b_arr);
+            if b_t.is_null() {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_transpose_axes returned null (b)",
+                ));
+            }
+            let out = mlx_matmul(g_arr, b_t);
+            mlx_array_free(b_t);
+            if out.is_null() {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_matmul returned null (grad_a)",
+                ));
+            }
+            let host = match eval_and_readback(out) {
+                Ok(h) => h,
+                Err(e) => {
+                    mlx_array_free(out);
+                    mlx_array_free(g_arr);
+                    return Err(e);
+                }
+            };
+            mlx_array_free(out);
+            if host.len() != a_size {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::ShapeMismatch {
+                    expected: a_shape.to_vec(),
+                    got: vec![host.len()],
+                });
+            }
+            host
+        } else {
+            Vec::new()
+        };
+
+        // grad_b = A^T @ grad_out
+        let grad_b_host = if need_grad_b {
+            let a_arr = mlx_array_from_data(
+                a.as_ptr() as *const c_void,
+                a_shape_i32.as_ptr(),
+                a_shape_i32.len() as i32,
+                MLX_FLOAT32,
+            );
+            if a_arr.is_null() {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_array_from_data returned null (a)",
+                ));
+            }
+            let a_t = mlx_transpose_axes(a_arr, transpose_axes.as_ptr(), transpose_axes.len());
+            mlx_array_free(a_arr);
+            if a_t.is_null() {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_transpose_axes returned null (a)",
+                ));
+            }
+            let out = mlx_matmul(a_t, g_arr);
+            mlx_array_free(a_t);
+            if out.is_null() {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_matmul returned null (grad_b)",
+                ));
+            }
+            let host = match eval_and_readback(out) {
+                Ok(h) => h,
+                Err(e) => {
+                    mlx_array_free(out);
+                    mlx_array_free(g_arr);
+                    return Err(e);
+                }
+            };
+            mlx_array_free(out);
+            if host.len() != b_size {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::ShapeMismatch {
+                    expected: b_shape.to_vec(),
+                    got: vec![host.len()],
+                });
+            }
+            host
+        } else {
+            Vec::new()
+        };
+
+        mlx_array_free(g_arr);
+        Ok((grad_a_host, grad_b_host))
+    }
+}
+
 #[derive(Copy, Clone)]
 enum SoftmaxKind {
     Softmax,
@@ -386,6 +679,7 @@ fn mlx_softmax_like(x: &[f32], shape: &[usize], kind: SoftmaxKind) -> Result<Vec
 
         let mut eval_handles = [out_arr];
         mlx_eval(eval_handles.as_mut_ptr(), eval_handles.len());
+        bump_eval_count();
 
         let size = mlx_array_size(out_arr);
         let data_ptr = mlx_array_data_float32(out_arr);
@@ -1341,6 +1635,7 @@ unsafe fn eval_and_readback(arr: *mut mlx_sys::mlx_array) -> Result<Vec<f32>> {
     unsafe {
         let mut eval_handles = [arr];
         mlx_eval(eval_handles.as_mut_ptr(), eval_handles.len());
+        bump_eval_count();
         let size = mlx_array_size(arr);
         let data_ptr = mlx_array_data_float32(arr);
         if data_ptr.is_null() {

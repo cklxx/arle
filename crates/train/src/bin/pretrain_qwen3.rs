@@ -3,6 +3,13 @@
 // layout that infer/ can load. Mirrors train_sft.rs's save pipeline but
 // starts from scratch (no source model dir) and drives a packed 1D forward
 // over random corpus windows.
+//
+// Phase 3 (2026-04-20): migrated onto the generic `Trainer<O, C, S>` loop.
+// The hand-written optimizer-step / clip / backward / cleanup sequence now
+// lives in `train::Trainer`; this binary owns only the data sampler, the
+// forward+loss closure, the eval closure, and the model-weight checkpoint
+// save pipeline (wired via `on_step_end`). See `pretrain.rs` for the
+// template and `docs/plans/train-runtime-architecture-v1.md` for context.
 
 use std::{
     collections::HashSet,
@@ -10,20 +17,24 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
-    time::Instant,
 };
 
 use autograd::{
-    AutogradError, Backend, CpuBackend, SafetensorsRegistry, Tape, TensorId, TensorStore,
-    ops::mul_scalar, optim::AdamW,
+    AutogradError, Backend, ConstantLr, CpuBackend, Result as AutogradResult, SafetensorsRegistry,
+    Tape, TensorId, TensorStore, optim::AdamW,
 };
+use qwen3_spec::Qwen3Config;
 use serde_json::json;
 use thiserror::Error;
 use train::{
+    EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig,
+    checkpoint::write_latest_symlink,
+    cli_args::{ArgError, next_value, parse_value},
     dataset::LcgRng,
-    qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
+    grad_clip::{GlobalNorm, GradClip, NoClip},
+    qwen3::{Qwen3Error, Qwen3Model},
     tokenizer::ChatTokenizer,
-    trainer::{clip_grad_norm, cross_entropy_loss},
+    trainer::cross_entropy_loss,
 };
 
 // Qwen3 tokenizer defaults — infer/Config requires both fields.
@@ -103,6 +114,7 @@ struct CliArgs {
     tie_word_embeddings: bool,
     bos_token_id: u32,
     eos_token_id: u32,
+    metrics_jsonl: Option<PathBuf>,
 }
 
 impl Default for CliArgs {
@@ -138,6 +150,44 @@ impl Default for CliArgs {
             tie_word_embeddings: true,
             bos_token_id: DEFAULT_BOS_TOKEN_ID,
             eos_token_id: DEFAULT_EOS_TOKEN_ID,
+            metrics_jsonl: None,
+        }
+    }
+}
+
+/// Phase 3 migration choice: `Trainer<O, C, S>` is generic on the clip policy,
+/// so `--no-grad-clip` vs `--grad-clip N` needs to collapse to a single
+/// concrete `C`. We keep `NoClip` + `GlobalNorm` as the real impls and
+/// forward through this enum so we don't have to monomorphise the Trainer
+/// twice. Mirrors `pretrain.rs::PretrainClip` (kept inline since it's a
+/// CLI-adapter type, not a library surface).
+enum PretrainClip {
+    None(NoClip),
+    Norm(GlobalNorm),
+}
+
+impl GradClip for PretrainClip {
+    fn clip(&mut self, store: &mut TensorStore, params: &[TensorId]) -> AutogradResult<f32> {
+        match self {
+            Self::None(c) => c.clip(store, params),
+            Self::Norm(c) => c.clip(store, params),
+        }
+    }
+}
+
+/// `Qwen3Model::forward` returns `Result<_, Qwen3Error>`, but the Trainer
+/// step/eval closures must return `Result<_, AutogradError>`. `Qwen3Error`
+/// has `From<AutogradError>` (one-way), so unwrap the inner autograd error
+/// when possible and otherwise stash the display string on stderr and
+/// surface a generic TapeInvariant so the outer loop can still unwind.
+fn qwen3_to_autograd(err: Qwen3Error) -> AutogradError {
+    match err {
+        Qwen3Error::Autograd(inner) => inner,
+        other => {
+            eprintln!("[pretrain_qwen3] qwen3 forward error: {other}");
+            AutogradError::TapeInvariant(
+                "pretrain_qwen3: qwen3 forward returned non-autograd error",
+            )
         }
     }
 }
@@ -152,12 +202,8 @@ enum CliError {
     Qwen3(#[from] Qwen3Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    #[error("unknown flag {0}")]
-    UnknownFlag(String),
-    #[error("missing value for flag {0}")]
-    MissingValue(String),
-    #[error("invalid value for {flag}: {value}")]
-    InvalidValue { flag: String, value: String },
+    #[error(transparent)]
+    Arg(#[from] ArgError),
     #[error("{0}")]
     Custom(String),
 }
@@ -175,7 +221,7 @@ fn main() -> Result<(), CliError> {
         hidden_size: args.hidden_size,
         num_hidden_layers: args.num_hidden_layers,
         num_attention_heads: args.num_attention_heads,
-        num_kv_heads: args.num_kv_heads,
+        num_key_value_heads: args.num_kv_heads,
         head_dim: args.head_dim,
         intermediate_size: args.intermediate_size,
         max_position_embeddings: args.max_position_embeddings,
@@ -198,7 +244,7 @@ fn main() -> Result<(), CliError> {
         cfg.hidden_size,
         cfg.num_hidden_layers,
         cfg.num_attention_heads,
-        cfg.num_kv_heads,
+        cfg.num_key_value_heads,
         cfg.head_dim,
         cfg.intermediate_size,
         cfg.max_position_embeddings,
@@ -291,148 +337,261 @@ fn main() -> Result<(), CliError> {
         param_count as f64 / 1_000_000.0
     );
 
-    let mut optimizer = AdamW::new(args.lr, DEFAULT_BETAS, DEFAULT_EPS, DEFAULT_WEIGHT_DECAY);
+    // ---- Trainer setup ----
+    // AdamW with the historical pretrain_qwen3 defaults (betas=(0.9,0.999),
+    // eps=1e-8, wd=0.01). Preserve bit-for-bit against the pre-migration run.
+    let optim = AdamW::new(args.lr, DEFAULT_BETAS, DEFAULT_EPS, DEFAULT_WEIGHT_DECAY);
+
+    // Codex review 2026-04-20 on 6bd0211 (M1): pre-migration
+    // `clip_grad_norm(params, max_norm <= 0.0, store)` returned early as a
+    // no-op, so `--grad-clip 0 / NaN / inf` were legal and effectively
+    // disabled clipping. The migrated path routes through
+    // `GlobalNorm::new`, which panics on non-positive / non-finite
+    // `max_norm`. Preserve legacy semantics by treating those values as
+    // NoClip with a one-shot warning.
+    let clip = match args.grad_clip {
+        Some(max_norm) if max_norm > 0.0 && max_norm.is_finite() => {
+            PretrainClip::Norm(GlobalNorm::new(max_norm))
+        }
+        Some(max_norm) => {
+            eprintln!(
+                "[pretrain_qwen3] warning: --grad-clip {max_norm} is non-positive/non-finite; disabling gradient clipping"
+            );
+            PretrainClip::None(NoClip)
+        }
+        None => PretrainClip::None(NoClip),
+    };
+    let schedule = ConstantLr(args.lr);
+    let metrics = train::metrics::open_sink(args.metrics_jsonl.as_deref(), true)
+        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+
+    // Resume relative-step note: the hand-written loop logged absolute step
+    // numbers (`start_step + step_offset`). The Trainer's internal `self.step`
+    // starts at 0 and counts `1..=total_steps` regardless of where weights
+    // were loaded from (no public API to advance the internal counter).
+    // Compromise: set `total_steps = args.steps` and treat Trainer's step as
+    // relative — the model-weight checkpoint writer below reconstructs the
+    // absolute step as `start_step + trainer_step` so the on-disk
+    // `step_<N>/` directories stay numbered absolutely. Per-step metric
+    // samples will show the relative step number, which is a minor
+    // deviation from the old log format; accept it (same choice as
+    // `pretrain.rs`, which has no resume at all).
+    //
+    // `save_every` / `save_dir` are left `None` on purpose: the Trainer's
+    // built-in save pipeline writes `trainer_state.json +
+    // optimizer.safetensors` into `step_<N>/`, which is NEW state this
+    // binary didn't persist before the migration. Adding it is a deliberate
+    // follow-up; the existing weight-only save runs from `on_step_end`
+    // instead so `step_<N>/` stays bit-compatible with pre-migration output.
+    let trainer_cfg = TrainerConfig {
+        total_steps: args.steps as u64,
+        grad_accum_steps: args.batch.max(1) as u64,
+        log_every: args.log_every.max(1) as u64,
+        eval_every: if eval_tokens.is_empty() || args.eval_every == 0 {
+            None
+        } else {
+            Some(args.eval_every as u64)
+        },
+        save_every: None,
+        save_dir: None,
+        resume_from: None,
+        rng_seed: args.seed,
+    };
+    let mut trainer = Trainer::new(optim, clip, schedule, metrics, trainer_cfg);
+
+    // `param_names` — synthetic stable names. The Trainer requires a
+    // `(TensorId, String)` map for optimizer state persistence; since
+    // `save_every` is None (no trainer_state.json yet), these names are
+    // never written. When optimizer persistence lands, swap these for the
+    // real `model.param_name_map()` entries.
+    let param_names: Vec<(TensorId, String)> = params
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, format!("param.{i:04}")))
+        .collect();
+
+    // `keep_extra`: every model tensor id the Trainer's cleanup should leave
+    // alive. The hand-written `retained_ids(&model_ids, &params, ...)`
+    // returned `model_ids ∪ params ∪ grads`; the Trainer already keeps
+    // `params ∪ grads` itself, so we pass `model_ids` as the extra set.
+    let keep_extra: HashSet<TensorId> = model_ids.clone();
+
+    // Codex review 2026-04-20 on bd5e277 (High): the eval closure needs its
+    // own copy of `params` and the model-id set so it can call
+    // `train::cleanup_after_backward` per eval window. Clone before the
+    // Trainer consumes `params` / `keep_extra`.
+    let eval_keep: Vec<TensorId> = params.clone();
+    let eval_model_ids: HashSet<TensorId> = model_ids.clone();
+
+    // Sampler RNGs live outside the closures so their state persists across
+    // step_fn invocations. The seed derivations match the hand-written loop
+    // exactly: `args.seed ^ start_step` for train windows,
+    // `args.seed ^ 0x4556_414C_5F50_5245` (ASCII "EVAL_PRE") for eval.
     let mut rng = LcgRng::seed(args.seed ^ start_step as u64);
     let mut eval_rng = LcgRng::seed(args.seed ^ 0x4556_414C_5F50_5245);
     let window = args.seq + 1;
     let upper = train_tokens.len().saturating_sub(window) + 1;
+    let eval_upper = eval_tokens.len().saturating_sub(window) + 1;
+    let position_ids: Vec<u32> = (0..args.seq as u32).collect();
+    let token_count_per_micro = args.seq as u64;
 
-    for step_offset in 0..args.steps {
-        let step = start_step + step_offset;
-        let step_start = Instant::now();
-        optimizer.zero_grad(&params, &mut store);
+    // Borrow everything the closures need by reference; the borrow checker
+    // enforces their lifetimes against `trainer.run_*`.
+    let model_ref = &model;
+    let train_tokens_ref: &[u32] = &train_tokens;
+    let eval_tokens_ref: &[u32] = &eval_tokens;
+    let position_ids_ref: &[u32] = &position_ids;
 
-        let mut step_loss = 0.0_f32;
-        let loss_scale = 1.0_f32 / args.batch.max(1) as f32;
+    let step_fn = |ctx: &mut StepCtx<'_>| -> AutogradResult<StepOutcome> {
+        // Sample one training window per micro-batch. The Trainer's internal
+        // micro-batch loop invokes this closure `grad_accum_steps` times per
+        // optimizer step — matches the hand-written `for _micro in
+        // 0..args.batch` exactly.
+        let start = (rng.next_u64() % upper as u64) as usize;
+        let slice = &train_tokens_ref[start..start + window];
+        let input_ids: Vec<u32> = slice[..args.seq].to_vec();
+        let targets: Vec<usize> = slice[1..].iter().map(|&t| t as usize).collect();
 
-        for _micro in 0..args.batch {
-            let start = (rng.next_u64() % upper as u64) as usize;
-            let slice = &train_tokens[start..start + window];
-            let input_ids: Vec<u32> = slice[..args.seq].to_vec();
-            let targets: Vec<usize> = slice[1..].iter().map(|&t| t as usize).collect();
-            let position_ids: Vec<u32> = (0..args.seq as u32).collect();
+        let logits = model_ref
+            .forward(ctx.store, ctx.tape, &input_ids, position_ids_ref)
+            .map_err(qwen3_to_autograd)?;
+        let loss_id = cross_entropy_loss(logits, &targets, ctx.store, ctx.tape)?;
+        // Return the *unscaled* loss — the Trainer applies
+        // `loss_scale = 1/grad_accum_steps` via `mul_scalar` before backward.
+        Ok(StepOutcome {
+            loss_id,
+            token_count: token_count_per_micro,
+        })
+    };
 
-            tape.entries.clear();
-            tape.set_enabled(true);
-
-            let logits = model.forward(&mut store, &mut tape, &input_ids, &position_ids)?;
-            let loss_id = cross_entropy_loss(logits, &targets, &mut store, &mut tape)?;
-            let loss_value = store.to_host(loss_id)?[0];
-            step_loss += loss_value;
-
-            let backward_id = if (loss_scale - 1.0).abs() > f32::EPSILON {
-                mul_scalar(loss_id, loss_scale, &mut store, &mut tape)?
-            } else {
-                loss_id
-            };
-            tape.backward(backward_id, &mut store)?;
-
-            tape.entries.clear();
-            tape.set_enabled(true);
-            let keep = retained_ids(&model_ids, &params, &store);
-            store.retain_ids(&keep);
+    // Eval closure — runs `args.eval_windows` held-out windows and returns
+    // mean loss. The hand-written `run_eval` also toggled `tape.set_enabled`
+    // around the forward; we replicate the same no-grad pattern here. The
+    // Trainer's internal cleanup runs after the closure returns.
+    let eval_windows = args.eval_windows;
+    let seq = args.seq;
+    let eval_fn = move |store: &mut TensorStore, tape: &mut Tape| -> AutogradResult<EvalOutcome> {
+        if eval_upper == 0 || eval_tokens_ref.is_empty() {
+            return Ok(EvalOutcome {
+                loss: f32::NAN,
+                token_count: 0,
+            });
         }
-
-        if let Some(max_norm) = args.grad_clip {
-            clip_grad_norm(&params, max_norm, &mut store);
-        }
-        optimizer.step(&params, &mut store);
-
+        // Disable the tape for eval so we don't build a graph for a
+        // backward pass that never comes. Re-enable on the way out so the
+        // Trainer's next train step finds the tape live.
+        let mut sum = 0.0_f32;
+        let mut count: u64 = 0;
         tape.entries.clear();
+        tape.set_enabled(false);
+        for _ in 0..eval_windows {
+            let start = (eval_rng.next_u64() % eval_upper as u64) as usize;
+            let slice = &eval_tokens_ref[start..start + window];
+            let input_ids: Vec<u32> = slice[..seq].to_vec();
+            let targets: Vec<usize> = slice[1..].iter().map(|&t| t as usize).collect();
+
+            let logits = model_ref
+                .forward(store, tape, &input_ids, position_ids_ref)
+                .map_err(qwen3_to_autograd)?;
+            let loss_id = cross_entropy_loss(logits, &targets, store, tape)?;
+            sum += store.to_host(loss_id)?[0];
+            count += 1;
+            tape.entries.clear();
+            // Codex review 2026-04-20 on bd5e277 (High): without this prune,
+            // the forward graph for every eval window accumulates in the
+            // store, so `--eval-windows N` with a large `--seq` OOMs.
+            // `cleanup_after_backward` re-enables the tape internally (it
+            // was designed for the training-path post-backward call site);
+            // flip it back off for the next window.
+            train::cleanup_after_backward(store, tape, &eval_keep, &eval_model_ids);
+            tape.set_enabled(false);
+        }
         tape.set_enabled(true);
-        let keep = retained_ids(&model_ids, &params, &store);
-        store.retain_ids(&keep);
+        Ok(EvalOutcome {
+            loss: sum / count.max(1) as f32,
+            token_count: count * seq as u64,
+        })
+    };
 
-        let mean_loss = step_loss / args.batch as f32;
-        if step_offset % args.log_every == 0 || step_offset + 1 == args.steps {
-            println!(
-                "step {} loss {:.4} ms {:.2}",
-                step,
-                mean_loss,
-                step_start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-
-        if args.eval_every > 0
-            && !eval_tokens.is_empty()
-            && ((step_offset + 1) % args.eval_every == 0 || step_offset + 1 == args.steps)
-        {
-            let eval_loss = run_eval(
-                &model,
-                &mut store,
-                &mut tape,
-                &eval_tokens,
-                args.seq,
-                args.eval_windows,
-                &mut eval_rng,
-                &model_ids,
-                &params,
-            )?;
-            println!(
-                "eval @ step {} loss {:.4} windows {}",
-                step, eval_loss, args.eval_windows
-            );
-        }
-
-        if (step_offset + 1) % args.save_every == 0 || step_offset + 1 == args.steps {
+    // `on_step_end` drives the model-weight save pipeline. Absolute step =
+    // `start_step + trainer_step`, matching the pre-migration
+    // `step_<N>/` directory numbering. Force-save on the final step so a
+    // run that ends between save boundaries still leaves a resumable
+    // checkpoint on disk (parity with `trainer.save_every`'s own
+    // is_final logic).
+    let save_every = args.save_every as u64;
+    let total_steps = args.steps as u64;
+    let out_dir = args.out.clone();
+    let tokenizer_path = args.tokenizer.clone();
+    let bos_token_id = args.bos_token_id;
+    let eos_token_id = args.eos_token_id;
+    let save_dtype = args.save_dtype;
+    let cfg_ref = cfg.clone();
+    let registry_ref = &registry;
+    let on_step_end = |trainer_step: u64, store: &mut TensorStore| -> AutogradResult<()> {
+        let abs_step = start_step as u64 + trainer_step;
+        let is_final = trainer_step == total_steps;
+        if trainer_step.is_multiple_of(save_every) || is_final {
             save_checkpoint(
-                &args.out,
-                step + 1,
-                &registry,
-                &mut store,
-                &cfg,
-                &args.tokenizer,
-                args.bos_token_id,
-                args.eos_token_id,
-                args.save_dtype,
-            )?;
+                &out_dir,
+                abs_step as usize,
+                registry_ref,
+                store,
+                &cfg_ref,
+                &tokenizer_path,
+                bos_token_id,
+                eos_token_id,
+                save_dtype,
+            )
+            .map_err(|err| {
+                // save_checkpoint returns CliError; funnel non-autograd
+                // failures through TapeInvariant with stderr context so the
+                // Trainer Result<()> stays AutogradError-shaped.
+                if let CliError::Autograd(e) = err {
+                    return e;
+                }
+                eprintln!("[pretrain_qwen3] save_checkpoint failed: {err}");
+                AutogradError::TapeInvariant("pretrain_qwen3: save_checkpoint failed")
+            })?;
         }
+        Ok(())
+    };
+
+    // Dispatch: eval-and-hooks when eval is configured, otherwise just hooks
+    // (Trainer's eval branch is gated on `cfg.eval_every`, but we pick the
+    // narrower API when possible to document intent and avoid a dead closure).
+    let has_eval = !eval_tokens.is_empty() && args.eval_every > 0;
+    if has_eval {
+        trainer.run_with_eval_and_hooks(
+            &mut store,
+            &mut tape,
+            params,
+            param_names,
+            keep_extra,
+            step_fn,
+            eval_fn,
+            on_step_end,
+        )?;
+    } else {
+        trainer.run_with_hooks(
+            &mut store,
+            &mut tape,
+            params,
+            param_names,
+            keep_extra,
+            step_fn,
+            on_step_end,
+        )?;
     }
 
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_eval(
-    model: &Qwen3Model,
-    store: &mut TensorStore,
-    tape: &mut Tape,
-    eval_tokens: &[u32],
-    seq: usize,
-    windows: usize,
-    rng: &mut LcgRng,
-    model_ids: &HashSet<TensorId>,
-    params: &[TensorId],
-) -> Result<f32, CliError> {
-    let window = seq + 1;
-    let upper = eval_tokens.len().saturating_sub(window) + 1;
-    if upper == 0 {
-        return Ok(f32::NAN);
-    }
-    let position_ids: Vec<u32> = (0..seq as u32).collect();
-    let mut sum = 0.0_f32;
-    let mut count = 0;
-    for _ in 0..windows {
-        let start = (rng.next_u64() % upper as u64) as usize;
-        let slice = &eval_tokens[start..start + window];
-        let input_ids: Vec<u32> = slice[..seq].to_vec();
-        let targets: Vec<usize> = slice[1..].iter().map(|&t| t as usize).collect();
-
-        tape.entries.clear();
-        tape.set_enabled(false);
-        let logits = model.forward(store, tape, &input_ids, &position_ids)?;
-        let loss_id = cross_entropy_loss(logits, &targets, store, tape)?;
-        sum += store.to_host(loss_id)?[0];
-        count += 1;
-
-        tape.entries.clear();
-        let keep = retained_ids(model_ids, params, store);
-        store.retain_ids(&keep);
-    }
-    tape.set_enabled(true);
-    Ok(sum / count.max(1) as f32)
-}
-
+// Phase 3 migration note: `run_eval(..)` was inlined into the eval closure
+// handed to `Trainer::run_with_eval_and_hooks`. `retained_ids(..)` was
+// removed because the Trainer's internal `cleanup_after_backward` performs
+// the equivalent `keep_extra ∪ params ∪ grads` retention itself. See the
+// closure in `main` for the reconstructed eval body.
 fn resume_from_checkpoint(
     resume_dir: &Path,
     registry: &mut SafetensorsRegistry,
@@ -449,15 +608,26 @@ fn resume_from_checkpoint(
 
     // Verify the checkpoint's config.json matches the requested config so a
     // silent shape mismatch doesn't surface as a mid-training crash.
+    // Codex review 429efc3 (Medium): missing config.json was previously a
+    // silent skip, which reopened the tied/untied silent-corruption path
+    // whenever the checkpoint lacked a config file. Hard-error instead.
     let cfg_path = resume_dir.join("config.json");
-    if cfg_path.exists() {
+    if !cfg_path.exists() {
+        return Err(CliError::Custom(format!(
+            "resume path {} has no config.json; refuse to resume without a config-match check \
+             (would otherwise silently miss tie_word_embeddings / shape drift). \
+             Regenerate config.json from the expected live Qwen3Config or fresh-start.",
+            resume_dir.display()
+        )));
+    }
+    {
         let file_cfg: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cfg_path)?)?;
-        let mismatches: Vec<String> = [
+        let mut mismatches: Vec<String> = [
             ("hidden_size", cfg.hidden_size as i64),
             ("intermediate_size", cfg.intermediate_size as i64),
             ("num_hidden_layers", cfg.num_hidden_layers as i64),
             ("num_attention_heads", cfg.num_attention_heads as i64),
-            ("num_key_value_heads", cfg.num_kv_heads as i64),
+            ("num_key_value_heads", cfg.num_key_value_heads as i64),
             ("head_dim", cfg.head_dim as i64),
             ("vocab_size", cfg.vocab_size as i64),
         ]
@@ -467,6 +637,26 @@ fn resume_from_checkpoint(
             _ => None,
         })
         .collect();
+
+        // Codex review feb715f (High): `tie_word_embeddings` determines
+        // whether `embed_tokens.weight` and `lm_head.weight` alias to one
+        // TensorId or stay distinct. An untied checkpoint loaded into a
+        // tied live config would pass the numeric-shape check, then
+        // silently merge two file tensors into one live slot.
+        // `load_into_strict` below also rejects missing names, but we
+        // fail fast on the config flag so the error points at the root
+        // cause (config divergence) rather than at a missing tensor.
+        if let Some(saw) = file_cfg
+            .get("tie_word_embeddings")
+            .and_then(|v| v.as_bool())
+            && saw != cfg.tie_word_embeddings
+        {
+            mismatches.push(format!(
+                "tie_word_embeddings: ckpt={saw} cli={}",
+                cfg.tie_word_embeddings
+            ));
+        }
+
         if !mismatches.is_empty() {
             return Err(CliError::Custom(format!(
                 "resume config mismatch: {}",
@@ -475,10 +665,15 @@ fn resume_from_checkpoint(
         }
     }
 
-    registry.load_into(store, &weights)?;
+    registry.load_into_strict(store, &weights)?;
 
     // Derive absolute step from the dir name `step_<N>` if present; otherwise 0.
-    let start_step = resume_dir
+    // `--resume <out>/latest` is a DX-1 symlink; canonicalize so file_name()
+    // resolves to the `step_NNNNNN` target, not the literal "latest" string.
+    let canonical = resume_dir
+        .canonicalize()
+        .unwrap_or_else(|_| resume_dir.to_path_buf());
+    let start_step = canonical
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(|s| s.strip_prefix("step_"))
@@ -514,18 +709,18 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--no-grad-clip" => args.grad_clip = None,
             "--backend" => {
                 args.backend = next_value(&mut iter, &flag)?.parse().map_err(|value| {
-                    CliError::InvalidValue {
+                    CliError::Arg(ArgError::InvalidValue {
                         flag: flag.clone(),
                         value,
-                    }
+                    })
                 })?;
             }
             "--save-dtype" => {
                 args.save_dtype = next_value(&mut iter, &flag)?.parse().map_err(|value| {
-                    CliError::InvalidValue {
+                    CliError::Arg(ArgError::InvalidValue {
                         flag: flag.clone(),
                         value,
-                    }
+                    })
                 })?;
             }
             "--vocab-size" => {
@@ -555,7 +750,10 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--eos-token-id" => {
                 args.eos_token_id = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
-            _ => return Err(CliError::UnknownFlag(flag)),
+            "--metrics-jsonl" => {
+                args.metrics_jsonl = Some(PathBuf::from(next_value(&mut iter, &flag)?));
+            }
+            _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
     }
     Ok(args)
@@ -586,37 +784,25 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
         ("--max-pos", args.max_position_embeddings),
     ] {
         if value == 0 {
-            return Err(CliError::InvalidValue {
+            return Err(CliError::Arg(ArgError::InvalidValue {
                 flag: flag.into(),
                 value: "0".into(),
-            });
+            }));
         }
     }
     if !(0.0..1.0).contains(&args.eval_frac) {
-        return Err(CliError::InvalidValue {
+        return Err(CliError::Arg(ArgError::InvalidValue {
             flag: "--eval-frac".into(),
             value: args.eval_frac.to_string(),
-        });
+        }));
     }
     if args.eval_every > 0 && args.eval_windows == 0 {
-        return Err(CliError::InvalidValue {
+        return Err(CliError::Arg(ArgError::InvalidValue {
             flag: "--eval-windows".into(),
             value: "0".into(),
-        });
+        }));
     }
     Ok(())
-}
-
-fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, CliError> {
-    iter.next()
-        .ok_or_else(|| CliError::MissingValue(flag.to_string()))
-}
-
-fn parse_value<T: FromStr>(flag: &str, value: String) -> Result<T, CliError> {
-    value.parse::<T>().map_err(|_| CliError::InvalidValue {
-        flag: flag.to_string(),
-        value,
-    })
 }
 
 fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
@@ -672,21 +858,6 @@ fn live_tensor_ids(store: &TensorStore) -> HashSet<TensorId> {
         .collect()
 }
 
-fn retained_ids(
-    model_ids: &HashSet<TensorId>,
-    params: &[TensorId],
-    store: &TensorStore,
-) -> HashSet<TensorId> {
-    let mut keep = model_ids.clone();
-    for &param_id in params {
-        keep.insert(param_id);
-        if let Some(grad_id) = store.get(param_id).and_then(|t| t.grad) {
-            keep.insert(grad_id);
-        }
-    }
-    keep
-}
-
 #[allow(clippy::too_many_arguments)]
 fn save_checkpoint(
     out_dir: &Path,
@@ -699,7 +870,12 @@ fn save_checkpoint(
     eos_token_id: u32,
     save_dtype: SaveDtype,
 ) -> Result<(), CliError> {
-    let step_dir = out_dir.join(format!("step_{step}"));
+    // DX-1: zero-padded 6-digit to match Trainer::save_checkpoint and
+    // train_sft::save_checkpoint_via_registry. Consistent padding makes
+    // resume-path lookup a single glob + lex-max pattern instead of
+    // per-binary branches.
+    let step_basename = format!("step_{step:06}");
+    let step_dir = out_dir.join(&step_basename);
     fs::create_dir_all(&step_dir)?;
 
     let config_json = json!({
@@ -709,7 +885,7 @@ fn save_checkpoint(
         "intermediate_size": cfg.intermediate_size,
         "num_hidden_layers": cfg.num_hidden_layers,
         "num_attention_heads": cfg.num_attention_heads,
-        "num_key_value_heads": cfg.num_kv_heads,
+        "num_key_value_heads": cfg.num_key_value_heads,
         "head_dim": cfg.head_dim,
         "vocab_size": cfg.vocab_size,
         "rms_norm_eps": cfg.rms_norm_eps,
@@ -731,6 +907,10 @@ fn save_checkpoint(
         SaveDtype::F32 => registry.save_from(store, &weights_path)?,
         SaveDtype::Bf16 => registry.save_from_bf16(store, &weights_path)?,
     }
+    // DX-1: refresh `<out>/latest` symlink after weights write so the
+    // just-written step becomes directly addressable for `infer` / resume.
+    write_latest_symlink(out_dir, &step_basename)?;
+
     println!(
         "[pretrain_qwen3] saved step {} to {} (dtype: {:?})",
         step,
