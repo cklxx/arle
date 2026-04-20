@@ -109,6 +109,17 @@ pub(crate) struct MixedBatchBuffers {
     act_out: HiddenStates,
     logits: HiddenStates,
     token_ids_gpu: CudaSlice<i32>,
+    /// Host-side scratch for concatenated decode + prefill token ids (reused
+    /// across ticks). Capacity = `max_tokens`; `.clear()`'d each entry.
+    token_ids_scratch: Vec<i32>,
+    /// Pre-allocated per-prefill page-table GPU buffers — one slot per
+    /// prefill req, each sized to the worst-case slot page count. Replaces
+    /// the per-tick `memcpy_stod` (which allocated a fresh CudaSlice every
+    /// mixed step — the single biggest per-tick alloc on the mixed path).
+    /// Outer len = `MIXED_PREFILL_MAX_REQS`; inner capacity = `max_pages_per_slot`.
+    prefill_page_table_gpu: Vec<CudaSlice<i32>>,
+    /// Matching host-side scratch; re-used per prefill per tick.
+    prefill_page_table_scratch: Vec<Vec<i32>>,
     max_tokens: usize,
 }
 
@@ -118,10 +129,24 @@ impl MixedBatchBuffers {
         ctx: &DeviceContext,
         model_config: &Config,
         max_batch_size: usize,
+        max_pages_per_slot: usize,
     ) -> Result<Self> {
         let max_tokens = max_batch_size + MIXED_PREFILL_CAP;
         let q_dim = model_config.num_attention_heads * model_config.head_dim;
         let kv_dim = model_config.num_key_value_heads * model_config.head_dim;
+
+        let mut prefill_page_table_gpu: Vec<CudaSlice<i32>> =
+            Vec::with_capacity(MIXED_PREFILL_MAX_REQS);
+        for _ in 0..MIXED_PREFILL_MAX_REQS {
+            let slot = ctx
+                .stream
+                .alloc_zeros::<i32>(max_pages_per_slot)
+                .map_err(|e| anyhow::anyhow!("Alloc mixed prefill_page_table_gpu failed: {e}"))?;
+            prefill_page_table_gpu.push(slot);
+        }
+        let prefill_page_table_scratch: Vec<Vec<i32>> = (0..MIXED_PREFILL_MAX_REQS)
+            .map(|_| Vec::with_capacity(max_pages_per_slot))
+            .collect();
 
         Ok(Self {
             embedding_out: HiddenStates::zeros(ctx, model_config.hidden_size, max_tokens)?,
@@ -142,6 +167,9 @@ impl MixedBatchBuffers {
                 .stream
                 .alloc_zeros(max_tokens)
                 .map_err(|e| anyhow::anyhow!("Alloc mixed token_ids_gpu failed: {e}"))?,
+            token_ids_scratch: Vec::with_capacity(max_tokens),
+            prefill_page_table_gpu,
+            prefill_page_table_scratch,
             max_tokens,
         })
     }
@@ -257,13 +285,14 @@ impl BatchDecodeBuffers {
     fn mixed_buffers_mut(
         &mut self,
         model: &Qwen3Model,
-        _kv_pool: &PagedKVPool,
+        kv_pool: &PagedKVPool,
     ) -> Result<&mut MixedBatchBuffers> {
         if self.mixed.is_none() {
             self.mixed = Some(MixedBatchBuffers::new(
                 &model.ctx,
                 &model.config,
                 self.max_batch_size,
+                kv_pool.max_total_pages,
             )?);
         }
         Ok(self.mixed.as_mut().unwrap())
@@ -396,6 +425,7 @@ impl Qwen3Model {
                 &self.ctx,
                 &self.config,
                 bufs.max_batch_size,
+                paged_kv_pool.max_total_pages,
             )?);
         }
         // Disjoint-field borrow: the mixed path reuses `bufs.metadata` (the
@@ -419,14 +449,20 @@ impl Qwen3Model {
         }
         mixed.set_seq_len(total_tokens);
 
-        let mut combined_tokens = Vec::with_capacity(total_tokens);
-        combined_tokens.extend(decode_tokens.iter().map(|&tok| tok as i32));
+        // Reuse per-step host scratch instead of a fresh `Vec::with_capacity`
+        // per tick (one heap alloc per mixed step, observable at c=16).
+        mixed.token_ids_scratch.clear();
+        mixed
+            .token_ids_scratch
+            .extend(decode_tokens.iter().map(|&tok| tok as i32));
         for p in prefills {
-            combined_tokens.extend(p.tokens.iter().map(|&tok| tok as i32));
+            mixed
+                .token_ids_scratch
+                .extend(p.tokens.iter().map(|&tok| tok as i32));
         }
         self.ctx
             .stream
-            .memcpy_htod(&combined_tokens, &mut mixed.token_ids_gpu)
+            .memcpy_htod(&mixed.token_ids_scratch, &mut mixed.token_ids_gpu)
             .map_err(|e| anyhow::anyhow!("H2D mixed token_ids: {e}"))?;
 
         // `update_mixed_multi` may reallocate `metadata.kv_indices` when the
@@ -466,17 +502,29 @@ impl Qwen3Model {
             &mut mixed.embedding_out,
         )?;
 
-        // H2D-upload each prefill slot's page table. K small transfers per
-        // tick (N ≤ MIXED_PREFILL_MAX_REQS = 4); not pooled yet — see spec.
-        #[allow(deprecated)]
-        let prefill_page_table_devs: Vec<_> = prefills
-            .iter()
-            .map(|p| {
-                self.ctx.stream.memcpy_stod(p.page_table_host).map_err(|e| {
-                    anyhow::anyhow!("H2D prefill_page_table[slot {}]: {e}", p.slot_idx)
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // H2D-upload each prefill slot's page table into its pre-allocated
+        // `MixedBatchBuffers::prefill_page_table_gpu` slot. Replaces the
+        // per-tick `memcpy_stod` (which allocated a fresh `CudaSlice` every
+        // mixed step — the single biggest per-tick alloc on the mixed path,
+        // and a CUDA-graph-capture blocker per
+        // `docs/plans/roi2-mixed-cuda-graph.md` §Allocation hoist audit #7).
+        for (i, p) in prefills.iter().enumerate() {
+            let src_len = p.page_table_host.len();
+            let slot_cap = mixed.prefill_page_table_gpu[i].len();
+            if src_len > slot_cap {
+                return Err(anyhow::anyhow!(
+                    "prefill[{}] page_table len {} exceeds pre-alloc slot cap {} (slot_idx {})",
+                    i,
+                    src_len,
+                    slot_cap,
+                    p.slot_idx,
+                ));
+            }
+            self.ctx
+                .stream
+                .memcpy_htod(p.page_table_host, &mut mixed.prefill_page_table_gpu[i])
+                .map_err(|e| anyhow::anyhow!("H2D prefill_page_table[slot {}]: {e}", p.slot_idx))?;
+        }
 
         let hidden_ptr = &raw mut mixed.embedding_out;
         let eps = self.config.rms_norm_eps;
@@ -618,7 +666,8 @@ impl Qwen3Model {
                         cos_ptr as *const ffi::Half,
                         sin_ptr as *const ffi::Half,
                         {
-                            let (ptr, _g) = prefill_page_table_devs[i].device_ptr(&self.ctx.stream);
+                            let (ptr, _g) =
+                                mixed.prefill_page_table_gpu[i].device_ptr(&self.ctx.stream);
                             ptr as *const i32
                         },
                         page_size as i32,
