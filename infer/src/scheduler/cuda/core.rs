@@ -294,10 +294,13 @@ impl<M: ModelForward> Scheduler<M> {
                 // `PoolExhausted` on a later valid restore.
                 warn!(
                     "install_restored_kv: fingerprint={fingerprint:?} \
-                     copy_pages_from_host failed: {err}; releasing {} detached pages",
+                     copy_pages_from_host failed: {err}; returning {} detached pages to free list",
                     pages.len(),
                 );
-                self.paged_kv_pool.release_pages(&pages);
+                // Detached pages have refcount 0 by construction — use
+                // `free_detached_pages`, not `release_pages`, which would
+                // panic the `debug_assert!(cur > 0)` invariant.
+                self.paged_kv_pool.free_detached_pages(&pages);
                 continue;
             }
 

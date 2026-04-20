@@ -763,6 +763,34 @@ impl TokenKVPool {
         newly_freed
     }
 
+    /// Return pages from [`Self::alloc_detached_pages`] straight back to
+    /// the free list without touching the external refcount.
+    ///
+    /// Detached pages never had an external retain in the first place —
+    /// `alloc_detached_pages` pops them off the free list and hands them
+    /// to the caller who is expected to bind them to a slot (or abandon
+    /// them). `release_pages` cannot be used to undo the detach because
+    /// it asserts `page_ref_count > 0` (refcount is 0 on detached
+    /// allocs), so it panics in debug builds instead of cleanly
+    /// recovering.
+    ///
+    /// Use this on every error path where
+    /// `alloc_detached_pages` succeeded but the follow-up copy/commit
+    /// failed (e.g. `Scheduler::install_restored_kv` payload mismatch,
+    /// T1 promote-back H→D failure).
+    pub fn free_detached_pages(&mut self, pages: &[u32]) {
+        for &idx in pages {
+            let usize_idx = idx as usize;
+            debug_assert!(
+                self.page_ref_count[usize_idx] == 0,
+                "free_detached_pages: page {idx} has refcount {} (expected 0 — detached pages \
+                 should never carry external retains)",
+                self.page_ref_count[usize_idx],
+            );
+            self.free_pages.push(idx);
+        }
+    }
+
     /// Number of pages currently pinned by an external reference
     /// (i.e. `page_ref_count > 0`). M2 observability: the scheduler
     /// `/v1/stats` endpoint will want this alongside `free_count` so
