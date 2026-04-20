@@ -20,7 +20,9 @@ tracker.
 | **ROI#2 C2 — mixed CUDA graph capture** | 🚧 planned | `plans/roi2-mixed-cuda-graph.md` §Commit 2 |
 | **ROI#2 C3/C4 — raise MIXED_PREFILL_CAP 64 → 128 → 256** | 🚧 planned | `plans/roi2-mixed-cuda-graph.md` §Commit 3-4 |
 | **Gap #5 C1 — `PagedKVPool::copy_pages_*` real impl** | ✅ shipped | `dfb16bb` + `wins/2026-04-20-gap5-c1-paged-kv-copy-pages.md` |
-| **Gap #5 C2-5 — T1 demote + prefix promote-back** | 🚧 planned | `plans/gap5-kv-tier-demote-prefetch.md` |
+| **Gap #5 C2 — Demote command/event shape freeze + architecture decision (Option A: scheduler-owns-copy)** | ✅ shipped | `a35790a` + `plans/gap5-c2-byte-path-architecture.md` |
+| **Gap #5 C3 — scheduler demote hook in `evict_prefix_cache_if_pressured`** | 🚧 planned | `plans/gap5-kv-tier-demote-prefetch.md` §C3 (simplified: no coordinator copy stream, scheduler uses `copy_pages_to_host` directly) |
+| **Gap #5 C4-5 — promote-back + `/v1/stats` counters + repeated-prefix bench** | 🚧 planned | `plans/gap5-kv-tier-demote-prefetch.md` §C4-C5 |
 | **Drift bisect — 128 → 98 tok/s environmental** | ✅ resolved | `errors/2026-04-20-bench-drift-environmental-not-code.md` |
 
 Bench anchor (L4 / Qwen3-4B BF16 / c=16 × 4096 × 256 /
@@ -88,6 +90,20 @@ Three failures during this workstream traced to "function returns
 Rule: a silent fallback path is a latent bug. Every fallback logs at
 `warn!` or bumps a counter. Unit tests cover the happy path; the
 error path gets observability.
+
+### A5'. Tier-aware scheduler, not coordinator (Gap #5 C2 decision)
+
+Architectural fork closed 2026-04-20: the T0↔T1 byte copy lives on the
+*scheduler* thread (using the existing `PagedKVPool::copy_pages_*`
+helpers + the compute stream), not on a coordinator thread with its
+own copy stream and a shared pool handle. The coordinator is pure
+telemetry — one `DemoteQueued`/`DemoteCompleted` pair per demote
+event, no byte movement. Full trade-off in
+`plans/gap5-c2-byte-path-architecture.md`. Rule: an "async" value that's
+<1 % of the tick budget doesn't justify a 3-5× implementation cost
+and a big correctness surface (Arc<Mutex>, cross-stream refcount
+ordering). Migration to coordinator-owned copy stays local and open;
+the frozen command/event shapes support both paths.
 
 ### A5. Tier-aware scheduler, not tier-aware kernels
 
@@ -230,18 +246,25 @@ Blocking decisions that will surface once ROI#2 C2 hits implementation:
 
 ## Sequencing
 
-Recommended next-commit order, constrained by dependency chain:
+Recommended next-commit order, constrained by dependency chain
+(updated 2026-04-20 post-C2 architecture decision):
 
 1. **ROI#2 C2** — unblocks the real perf win the last 4 days of
    probes forecast. Biggest dollar value. ~350 LoC.
-2. **Gap #5 C2** — coordinator Demote byte-path scaffold on top of
-   dfb16bb. Not user-visible yet but unblocks C3/C4. ~150 LoC.
+2. **Gap #5 C3** — scheduler demote hook + `t1_write_through_threshold`
+   config. Uses `PagedKVPool::copy_pages_to_host` directly (Option A
+   decision closed in C2). ~150-200 LoC, lower complexity than the
+   original plan estimate thanks to the scheduler-owns-copy
+   simplification. Gated behind `INFER_T1_DEMOTE_ENABLED=false`
+   default. ✅ Gap #5 C2 frozen shapes ready.
 3. **ROI#2 C3/C4** — cap raise ladder. Depends on C2. Ship each
    raise as its own commit with bench gate. ~30 LoC + bench.
-4. **Gap #5 C3/C4** — scheduler demote hook + promote-back. Ship
-   behind `INFER_T1_DEMOTE_ENABLED=false` default until bench
-   proves win on the repeated-prefix workload.
-5. **E1 prefix-aware admission wire** — quick win once C4 flows
+4. **Gap #5 C4** — promote-back in `install_restored_kv`-style path,
+   coupled with `lookup_or_stage` returning `StagingFromHost` with
+   the matching host region. Uses `copy_pages_from_host`. ~200 LoC.
+5. **Gap #5 C5** — flip `INFER_T1_DEMOTE_ENABLED=true` default +
+   `/v1/stats` counters + repeated-prefix bench harness.
+6. **E1 prefix-aware admission wire** — quick win once C4 flows
    T1 matches into `prefix_hit_tokens`.
 
 Everything else (E2-E6) is post-parity. The quarter's budget is
