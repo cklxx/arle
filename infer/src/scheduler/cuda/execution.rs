@@ -1,10 +1,5 @@
+use super::decode::MIXED_PREFILL_MAX_REQS;
 use super::{ModelForward, Phase, Scheduler, info};
-
-/// Maximum number of prefill requests fused into one mixed decode+prefill
-/// tick. Mirrors the model-side `MIXED_PREFILL_MAX_REQS` — kept in sync by
-/// hand; `FlashInferDecodeMetadata.qo_indptr` is sized for B + this many
-/// + 1 entries in `model::qwen3::batch_decode::BatchDecodeBuffers::new`.
-const MIXED_PREFILL_MAX_REQS: usize = 4;
 
 impl<M: ModelForward> Scheduler<M> {
     pub(super) fn step(&mut self) {

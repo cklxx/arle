@@ -22,3 +22,8 @@ mod weights;
 pub use config::Config;
 pub use forward::Qwen3State;
 pub use weights::{ModelRuntimeConfig, Qwen3Model};
+
+/// Re-exported so the scheduler-side `MIXED_PREFILL_MAX_REQS` in
+/// `scheduler/cuda/decode.rs` can assert equality at compile time.
+#[cfg(feature = "cuda")]
+pub(crate) use batch_decode::MIXED_PREFILL_MAX_REQS as BATCH_DECODE_MIXED_PREFILL_MAX_REQS;
