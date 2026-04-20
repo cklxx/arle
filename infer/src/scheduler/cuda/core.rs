@@ -145,6 +145,17 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) coordinator_handle: crate::kv_tier::CoordinatorHandle,
     pub(super) coordinator_events: crossbeam_channel::Receiver<crate::kv_tier::CoordinatorEvent>,
     pub(super) coordinator_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    /// Host-pinned T1 KV tier. Sized at startup from
+    /// `config.t1_host_pinned_bytes` iff `config.t1_demote_min_hits >
+    /// 0` (demote enabled); else `None`. Alloc failure at startup
+    /// logs warn + leaves None; demote falls back to "free outright".
+    /// Owned by the single-writer scheduler thread per the A5'
+    /// scheduler-owns-copy decision (`docs/plans/gap5-c2-byte-path-architecture.md`).
+    /// `#[allow(dead_code)]` until the C3 evict hook reads this; the
+    /// CI strict mode (`-D warnings`, see `.github/workflows/ci.yml`)
+    /// would otherwise treat the unused field as a build break.
+    #[allow(dead_code)]
+    pub(super) host_pinned_pool: Option<crate::kv_tier::HostPinnedPool>,
     pub(super) stage_waiting: HashMap<crate::kv_tier::StageTicket, StagedAdmission>,
     pub(super) coordinator_unavailable: bool,
     pub(super) page_lifecycle: crate::kv_tier::coordinator::PageLifecycle,
@@ -470,6 +481,40 @@ impl<M: ModelForward> Scheduler<M> {
         let (coordinator, coordinator_handle, coordinator_events) =
             crate::kv_tier::Coordinator::new(config.max_slots.max(16));
         let coordinator_thread = Some(coordinator.spawn("infer-tiered-kv-coord"));
+
+        // T1 host-pinned KV tier (Gap #5 scheduler-owns-copy
+        // architecture). Skipped when demote is disabled
+        // (`t1_demote_min_hits == 0`) or `t1_host_pinned_bytes == 0`.
+        // Alloc failure is non-fatal — log warn and leave `None`; the
+        // demote hook falls back to "free pages outright" so the
+        // scheduler stays available.
+        let host_pinned_pool = if config.t1_demote_min_hits == 0 || config.t1_host_pinned_bytes == 0
+        {
+            info!(
+                "T1 host-pinned pool disabled (t1_demote_min_hits={}, t1_host_pinned_bytes={})",
+                config.t1_demote_min_hits, config.t1_host_pinned_bytes,
+            );
+            None
+        } else {
+            match crate::kv_tier::HostPinnedPool::new(config.t1_host_pinned_bytes) {
+                Ok(pool) => {
+                    info!(
+                        "T1 host-pinned pool allocated: {:.2} GiB",
+                        config.t1_host_pinned_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    );
+                    Some(pool)
+                }
+                Err(err) => {
+                    warn!(
+                        "T1 host-pinned pool alloc failed ({} bytes): {err}; demote will free \
+                         pages outright on eviction",
+                        config.t1_host_pinned_bytes,
+                    );
+                    None
+                }
+            }
+        };
+
         let scheduler = Self {
             config: config.clone(),
             metrics,
@@ -489,6 +534,7 @@ impl<M: ModelForward> Scheduler<M> {
             coordinator_handle,
             coordinator_events,
             coordinator_thread,
+            host_pinned_pool,
             stage_waiting: HashMap::new(),
             coordinator_unavailable: false,
             page_lifecycle,

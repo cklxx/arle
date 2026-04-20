@@ -93,13 +93,24 @@ struct Args {
     /// demoted to the host-pinned T1 tier on GPU-pool eviction. Default
     /// 2 — a block must have been re-matched at least once to be worth
     /// keeping warm in T1. `0` disables demote (free outright on
-    /// eviction, pre-Gap-#5 behaviour); `1` always demotes (debug /
-    /// repeated-prefix workloads). Maps to sglang's
-    /// `HiRadixCache.write_through_threshold` with clearer naming.
-    /// Reserved for Gap #5 C3 wiring; ignored in HEAD until the demote
-    /// hook lands.
+    /// eviction, pre-Gap-#5 behaviour) and skips the T1 pool alloc;
+    /// `1` always demotes (debug / repeated-prefix workloads). Maps
+    /// to sglang's `HiRadixCache.write_through_threshold` with clearer
+    /// naming. Reserved for Gap #5 C3 wiring; ignored in HEAD until
+    /// the demote hook lands.
     #[arg(long, default_value_t = 2)]
     t1_demote_min_hits: u32,
+
+    /// Capacity (MB) of the host-pinned T1 KV tier. Allocated via
+    /// `cuMemAllocHost_v2` at scheduler init when `t1_demote_min_hits
+    /// > 0`. Default 2048 MB — fits the typical c=16 × 4096-token
+    /// working set. Reduce on shared / containerised hosts where
+    /// pinned RAM is constrained. `0` skips the alloc (also implied
+    /// when `t1_demote_min_hits = 0`). Alloc failure at startup logs
+    /// a warning and falls back to "free pages outright" rather than
+    /// failing to launch.
+    #[arg(long, default_value_t = 2048)]
+    t1_host_pinned_mb: usize,
 }
 
 #[tokio::main]
@@ -164,6 +175,7 @@ async fn main() {
             kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
             mixed_prefill_max_reqs: args.mixed_prefill_max_reqs,
             t1_demote_min_hits: args.t1_demote_min_hits,
+            t1_host_pinned_bytes: args.t1_host_pinned_mb.saturating_mul(1024 * 1024),
             ..SchedulerConfig::runtime_defaults(num_slots)
         },
         seed: 42,

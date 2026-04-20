@@ -302,6 +302,13 @@ impl RadixCache {
     /// `evict_prefix_cache_if_pressured` — only blocks that have been
     /// matched ≥ N times are demoted to T1 on eviction. Returns
     /// `None` if the block is unknown to the radix.
+    ///
+    /// `#[allow(dead_code)]` while the C3 evict hook lands across
+    /// multiple commits — CI runs `RUSTFLAGS="-D warnings"` (see
+    /// `.github/workflows/ci.yml`) so an unused `pub(crate)` accessor
+    /// is a build break, not a warning. Remove the attribute once
+    /// `evict_prefix_cache_if_pressured` calls into this.
+    #[allow(dead_code)]
     pub(crate) fn hit_count_of(&self, block: BlockId) -> Option<u32> {
         let idx = *self.block_index.get(&block)?;
         self.nodes.get(idx).map(|node| node.hit_count)

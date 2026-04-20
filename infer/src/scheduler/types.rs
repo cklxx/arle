@@ -110,7 +110,7 @@ pub struct SchedulerConfig {
     /// Default 2 — a block has to have been re-matched at least once
     /// to be worth demoting. Tuning:
     /// - `0`: disable demote entirely (every eviction frees outright;
-    ///   pre-Gap-#5 behaviour)
+    ///   pre-Gap-#5 behaviour). Also skips the `HostPinnedPool` alloc.
     /// - `1`: always demote on eviction (debug / repeated-prefix
     ///   workloads)
     /// - `2..`: only demote popular blocks
@@ -121,6 +121,18 @@ pub struct SchedulerConfig {
     /// hook (not yet wired in HEAD; this field is shape-only ahead
     /// of C3).
     pub t1_demote_min_hits: u32,
+    /// Capacity (bytes) of the host-pinned T1 pool. Allocated at
+    /// scheduler init via `cuMemAllocHost_v2` iff
+    /// `t1_demote_min_hits > 0`; otherwise the pool is `None` and
+    /// demote becomes a no-op. Default 2 GiB — comfortably absorbs
+    /// the working set of a c=16 × 4096 × 256 workload (≈3 GiB
+    /// total KV per BF16 Qwen3-4B 16-token block ≈ 147 KiB).
+    /// On hosts where pinned RAM is constrained (containers, shared
+    /// nodes), shrink via `--t1-host-pinned-bytes`. Alloc failure at
+    /// startup logs a warning and leaves the pool `None`; the
+    /// scheduler falls back to today's "free pages outright" behaviour
+    /// instead of refusing to start.
+    pub t1_host_pinned_bytes: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -154,6 +166,7 @@ impl Default for SchedulerConfig {
             disk_store_root: std::env::temp_dir().join("infer-kv"),
             mixed_prefill_max_reqs: 2,
             t1_demote_min_hits: 2,
+            t1_host_pinned_bytes: 2 * 1024 * 1024 * 1024, // 2 GiB
         }
     }
 }
