@@ -246,7 +246,24 @@ impl<M: ModelForward> Scheduler<M> {
         let block_id = self.prefix_cache.block_id_for_fingerprint(fingerprint)?;
         let pages = self.block_to_pages.get(&block_id)?;
         let stream = &self.model.device_context().stream;
-        self.paged_kv_pool.copy_pages_to_host(pages, stream).ok()
+        // Don't silently drop copy failures: the caller
+        // (`save_session`) serialises the radix separately and would
+        // produce a half-consistent manifest if we returned `None` for
+        // a block that actually exists. Today this triggers for any
+        // non-BF16 pool (FP8 / INT8 / TurboQuant) because Gap #5 C1's
+        // `copy_pages_to_host` errors on those formats. Warn loud so
+        // a 200-OK `/v1/sessions/{id}/save` with dropped blocks is
+        // observable instead of silent.
+        match self.paged_kv_pool.copy_pages_to_host(pages, stream) {
+            Ok(bytes) => Some(bytes),
+            Err(err) => {
+                warn!(
+                    "read_block_payload: fingerprint={fingerprint:?} block_id={block_id:?} \
+                     copy_pages_to_host failed: {err}"
+                );
+                None
+            }
+        }
     }
 
     pub fn install_restored_kv(
@@ -265,11 +282,22 @@ impl<M: ModelForward> Scheduler<M> {
             let Ok(pages) = self.paged_kv_pool.alloc_detached_pages(pages_per_block) else {
                 break;
             };
-            if self
+            if let Err(err) = self
                 .paged_kv_pool
                 .copy_pages_from_host(&pages, payload, &stream)
-                .is_err()
             {
+                // Copy failed (payload/geometry mismatch, unsupported
+                // format, PCIe error). The detached pages are still on
+                // our books — release them back to the free list before
+                // moving on, otherwise one bad block permanently shrinks
+                // the pool and the caller sees a misleading
+                // `PoolExhausted` on a later valid restore.
+                warn!(
+                    "install_restored_kv: fingerprint={fingerprint:?} \
+                     copy_pages_from_host failed: {err}; releasing {} detached pages",
+                    pages.len(),
+                );
+                self.paged_kv_pool.release_pages(&pages);
                 continue;
             }
 
