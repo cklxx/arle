@@ -27,11 +27,21 @@ use cuda_kernels::prelude::{
 
 #[allow(dead_code)]
 pub(crate) const MIXED_PREFILL_CAP: usize = 64;
-/// Maximum number of prefill requests the mixed path fuses per tick. Gates
-/// `FlashInferDecodeMetadata` sizing (`qo_indptr` needs `B + N + 1` entries)
-/// and the scheduler-side `MIXED_PREFILL_MAX_REQS`.
+/// **Compile-time upper bound** on the number of prefill requests that can
+/// be fused into a single mixed decode+prefill tick. Drives static
+/// allocation sizes: `MixedBatchBuffers::prefill_page_table_gpu` (one
+/// `CudaSlice` slot per prefill req × `max_pages_per_slot`) and the
+/// `FlashInferDecodeMetadata.qo_indptr` sizing (`B + N + 1` entries).
+///
+/// The **runtime cap** is `SchedulerConfig::mixed_prefill_max_reqs`,
+/// exposed as the `--mixed-prefill-max-reqs` CLI flag. Today the tested
+/// Pareto-optimal is 2 (the default). Raising it past
+/// `MIXED_PREFILL_MAX_REQS_ALLOC_CAP` requires bumping this const (and
+/// rebuilding) to grow the static allocations. Keep the const ≥ any
+/// plausible CLI value; 8 comfortably covers K=4 stretch probes on the
+/// ROI#2 roadmap.
 #[allow(dead_code)]
-pub(crate) const MIXED_PREFILL_MAX_REQS: usize = 2;
+pub(crate) const MIXED_PREFILL_MAX_REQS_ALLOC_CAP: usize = 8;
 
 /// Pre-allocated buffers for batched decode, reused across steps.
 /// Allocated once for `max_batch_size`; smaller batches set `seq_len` on HiddenStates.
@@ -136,15 +146,15 @@ impl MixedBatchBuffers {
         let kv_dim = model_config.num_key_value_heads * model_config.head_dim;
 
         let mut prefill_page_table_gpu: Vec<CudaSlice<i32>> =
-            Vec::with_capacity(MIXED_PREFILL_MAX_REQS);
-        for _ in 0..MIXED_PREFILL_MAX_REQS {
+            Vec::with_capacity(MIXED_PREFILL_MAX_REQS_ALLOC_CAP);
+        for _ in 0..MIXED_PREFILL_MAX_REQS_ALLOC_CAP {
             let slot = ctx
                 .stream
                 .alloc_zeros::<i32>(max_pages_per_slot)
                 .map_err(|e| anyhow::anyhow!("Alloc mixed prefill_page_table_gpu failed: {e}"))?;
             prefill_page_table_gpu.push(slot);
         }
-        let prefill_page_table_scratch: Vec<Vec<i32>> = (0..MIXED_PREFILL_MAX_REQS)
+        let prefill_page_table_scratch: Vec<Vec<i32>> = (0..MIXED_PREFILL_MAX_REQS_ALLOC_CAP)
             .map(|_| Vec::with_capacity(max_pages_per_slot))
             .collect();
 
@@ -249,7 +259,7 @@ impl BatchDecodeBuffers {
             // MIXED_PREFILL_MAX_REQS, so the sizing has to cover both.
             metadata: FlashInferDecodeMetadata::new(
                 ctx,
-                max_batch_size + MIXED_PREFILL_CAP + MIXED_PREFILL_MAX_REQS,
+                max_batch_size + MIXED_PREFILL_CAP + MIXED_PREFILL_MAX_REQS_ALLOC_CAP,
                 max_total_pages + MIXED_PREFILL_CAP,
                 num_qheads,
             )?,
@@ -394,7 +404,7 @@ impl Qwen3Model {
         }
         if paged_kv_pool.format != KVFormat::BF16
             || prefill_token_total > MIXED_PREFILL_CAP
-            || n > MIXED_PREFILL_MAX_REQS
+            || n > MIXED_PREFILL_MAX_REQS_ALLOC_CAP
         {
             return Ok(false);
         }

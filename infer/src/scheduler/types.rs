@@ -91,6 +91,17 @@ pub struct SchedulerConfig {
     pub t1_host_pinned_keepalive_ticks: u64,
     /// Root directory used by the session snapshot disk store.
     pub disk_store_root: PathBuf,
+    /// Maximum number of prefill requests fused into a single mixed
+    /// decode+prefill tick (CUDA path, Qwen3). Default 2 — the
+    /// tested Pareto-optimal at today's kernel shape per
+    /// `docs/research/2026-04-19-sglang-gap-analysis.md`. The
+    /// compile-time upper bound is
+    /// `model::qwen3::MIXED_PREFILL_MAX_REQS_ALLOC_CAP` (buffer
+    /// sizing); the CLI flag `--mixed-prefill-max-reqs` writes this.
+    /// Raising past the alloc cap requires a rebuild. Use this to
+    /// A/B test K=1 / K=3 / K=4 probes without re-benching the
+    /// alloc sizes.
+    pub mixed_prefill_max_reqs: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -122,6 +133,7 @@ impl Default for SchedulerConfig {
             t1_host_pinned_low_water: 0.70,
             t1_host_pinned_keepalive_ticks: 128,
             disk_store_root: std::env::temp_dir().join("infer-kv"),
+            mixed_prefill_max_reqs: 2,
         }
     }
 }
@@ -169,6 +181,21 @@ impl SchedulerConfig {
         }
         if !(0.0 < self.admission_new_token_ratio && self.admission_new_token_ratio <= 1.0) {
             anyhow::bail!("admission_new_token_ratio must be in (0, 1]");
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let alloc_cap = crate::model::qwen3::MIXED_PREFILL_MAX_REQS_ALLOC_CAP;
+            if self.mixed_prefill_max_reqs == 0 || self.mixed_prefill_max_reqs > alloc_cap {
+                anyhow::bail!(
+                    "mixed_prefill_max_reqs must be in 1..={alloc_cap} (compile-time alloc cap)",
+                );
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            if self.mixed_prefill_max_reqs == 0 {
+                anyhow::bail!("mixed_prefill_max_reqs must be ≥ 1");
+            }
         }
         if !(0.0 < self.prefix_cache_high_water && self.prefix_cache_high_water < 1.0) {
             anyhow::bail!("prefix_cache_high_water must be in (0, 1)");

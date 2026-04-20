@@ -13,17 +13,6 @@ use crate::scheduler::cuda::core::{PendingDecode, PendingPrefillChunk};
 /// distributed across the queue. K=2 splits 32 tokens per req → 2 reqs
 /// advance per tick instead of 1.
 const MIXED_PREFILL_CAP: usize = 64;
-/// Maximum number of prefill requests fused per tick. Single source of
-/// truth for the scheduler side; `scheduler/cuda/execution.rs` imports
-/// this via `super::decode::MIXED_PREFILL_MAX_REQS` rather than keeping
-/// its own copy. Must equal `model::qwen3::batch_decode::MIXED_PREFILL_MAX_REQS`
-/// — the compile-time assertion below catches a drift.
-pub(super) const MIXED_PREFILL_MAX_REQS: usize = 2;
-
-const _MIXED_PREFILL_MAX_REQS_MATCHES_MODEL: () = assert!(
-    MIXED_PREFILL_MAX_REQS == crate::model::qwen3::BATCH_DECODE_MIXED_PREFILL_MAX_REQS,
-    "scheduler-side MIXED_PREFILL_MAX_REQS must match model-side",
-);
 
 /// Per-req chunk fused into the current mixed tick. Owns the host-side
 /// token slice + page-table scratch so the model-facing
@@ -109,7 +98,9 @@ impl<M: ModelForward> Scheduler<M> {
         // `Phase::Prefilling` with remaining work are folded in. If none of
         // the candidate prefill reqs have remaining work, fall through to the
         // plain decode path.
-        let k = prefill_indices.len().clamp(1, MIXED_PREFILL_MAX_REQS);
+        let k = prefill_indices
+            .len()
+            .clamp(1, self.config.mixed_prefill_max_reqs);
         let base_per_req = (MIXED_PREFILL_CAP / k).max(16);
         let base_per_req = base_per_req - (base_per_req % 16).min(base_per_req); // round down to 16
         let base_per_req = if base_per_req == 0 { 16 } else { base_per_req };
@@ -158,7 +149,7 @@ impl<M: ModelForward> Scheduler<M> {
                 total,
                 tokens,
             });
-            if candidates.len() >= MIXED_PREFILL_MAX_REQS {
+            if candidates.len() >= self.config.mixed_prefill_max_reqs {
                 break;
             }
         }

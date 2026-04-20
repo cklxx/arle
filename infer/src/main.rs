@@ -80,6 +80,14 @@ struct Args {
     /// cache in BF16 and quantize when migrating into the paged token pool.
     #[arg(long, default_value = "bf16")]
     kv_cache_dtype: String,
+
+    /// Maximum number of prefill requests fused into one mixed
+    /// decode+prefill tick (CUDA path, Qwen3). Default 2 — the tested
+    /// Pareto-optimal at today's kernel shape. Compile-time upper bound
+    /// is 8. Use this to A/B test K=1 / K=3 / K=4 probes without a
+    /// rebuild. See `docs/research/2026-04-19-sglang-gap-analysis.md`.
+    #[arg(long, default_value_t = 2)]
+    mixed_prefill_max_reqs: usize,
 }
 
 #[tokio::main]
@@ -142,6 +150,7 @@ async fn main() {
             admission_new_token_ratio: args.admission_new_token_ratio,
             min_seq_len: args.min_seq_len,
             kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
+            mixed_prefill_max_reqs: args.mixed_prefill_max_reqs,
             ..SchedulerConfig::runtime_defaults(num_slots)
         },
         seed: 42,

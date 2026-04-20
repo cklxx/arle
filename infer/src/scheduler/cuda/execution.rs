@@ -1,4 +1,3 @@
-use super::decode::MIXED_PREFILL_MAX_REQS;
 use super::{ModelForward, Phase, Scheduler, info};
 
 impl<M: ModelForward> Scheduler<M> {
@@ -33,7 +32,7 @@ impl<M: ModelForward> Scheduler<M> {
         self.pending_mixed_prefill_idxs.clear();
         let decode_launch_us = if has_decode {
             let t = std::time::Instant::now();
-            // Round-robin selection of up to MIXED_PREFILL_MAX_REQS prefill
+            // Round-robin selection of up to config.mixed_prefill_max_reqs prefill
             // requests to fuse with the decode batch. Starts at
             // `last_mixed_prefill_cursor` so a busy request doesn't starve
             // a late-admitted one; cursor advances by the number actually
@@ -49,7 +48,7 @@ impl<M: ModelForward> Scheduler<M> {
                         matches!(self.active[i].phase, Phase::Prefilling { .. })
                             && !self.active[i].delta_tx.is_closed()
                     })
-                    .take(MIXED_PREFILL_MAX_REQS)
+                    .take(self.config.mixed_prefill_max_reqs)
                     .collect()
             };
             if mixed_prefill_idxs.is_empty() {
