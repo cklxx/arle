@@ -223,7 +223,6 @@ infer/src/
 │   ├── generation_state.rs  # Per-request mutable state
 │   ├── qwen3/               # Qwen3: weights, forward, prefill, decode, batch_decode
 │   ├── qwen35/              # Qwen3.5: hybrid linear + full attention
-│   └── glm4/                # GLM4
 ├── backend.rs + backend/    # InferenceBackend trait + submodules
 │   ├── cuda.rs              # Thin `pub use infer_cuda_kernels::*;` re-export shim
 │   ├── cuda/bootstrap.rs    # Model loading, runtime config, scheduler bring-up

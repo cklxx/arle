@@ -904,8 +904,6 @@ pub(crate) fn detect_family(model_id: &str) -> &'static str {
         "qwen2.5"
     } else if lc.contains("qwen3") {
         "qwen3"
-    } else if lc.contains("glm4") || lc.contains("glm-4") {
-        "glm4"
     } else {
         "other"
     }
@@ -1351,7 +1349,6 @@ mod tests {
         assert_eq!(detect_family("Qwen/Qwen3-4B"), "qwen3");
         assert_eq!(detect_family("Qwen/Qwen3.5-4B"), "qwen3.5");
         assert_eq!(detect_family("Qwen/Qwen2.5-7B"), "qwen2.5");
-        assert_eq!(detect_family("THUDM/glm-4-9b-chat"), "glm4");
         assert_eq!(detect_family("something-else"), "other");
     }
 

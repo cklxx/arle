@@ -42,7 +42,6 @@ Notes:
 | --- | --- | --- |
 | Qwen3 | Supported | Primary supported family. |
 | Qwen3.5 | Supported | Supported on normal runtime paths; Metal live runtime now has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Metal DFlash is Beta; see §4a for the current validation note. |
-| GLM4 | Limited support | Present in project state, but less established than Qwen paths. |
 | Llama 3/4 | Planned | Not yet supported. |
 | DeepSeek-V3/R1 | Planned | Not yet supported. |
 | Mistral / Mixtral / Gemma / Phi | Planned | Not yet supported. |

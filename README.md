@@ -59,7 +59,6 @@ Four axes, each answering one question. Authoritative matrix lives in
 |-------|-----------|:----:|:-----:|
 | Qwen3 (0.6B – 72B) | GQA | ✅ | ✅ |
 | Qwen3.5-4B | Hybrid (linear + full) | ✅ | ✅ |
-| GLM4 | GQA | ✅ | — |
 | Llama 3 / 4 | GQA | *planned* | *planned* |
 | DeepSeek V3 / R1 | MLA | *planned* | *planned* |
 
@@ -209,7 +208,6 @@ allocator caps. Full DFlash reference and supported model pairs:
 |-------|-----------|:------:|
 | Qwen3 (0.5B-72B) | GQA | :white_check_mark: |
 | Qwen3.5-4B | Hybrid (linear + full attention) | :white_check_mark: |
-| GLM4 | GQA | :white_check_mark: |
 | Llama 3 / 4 | GQA | Planned |
 | DeepSeek-V3 / R1 | MLA | Planned |
 

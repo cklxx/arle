@@ -13,7 +13,6 @@
 >   [`../experience/wins/2026-04-08-weight-quantization.md`](../experience/wins/2026-04-08-weight-quantization.md)
 >   and `turboquant-integration.md` §Phase 2 (Weight track).
 > - **Phase 3 — Fused decode attention with quantized KV** — **shipped** for all
->   3 production models (Qwen3, Qwen3.5, GLM4). See
 >   [`../experience/wins/2026-04-08-int8-kv-batched-decode.md`](../experience/wins/2026-04-08-int8-kv-batched-decode.md)
 >   and `turboquant-integration.md` §Phase 3.
 > - **Track 1 — FP8 native FlashInfer + BF16→FP8 quantize-on-write** —

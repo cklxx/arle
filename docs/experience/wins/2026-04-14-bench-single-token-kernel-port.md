@@ -8,7 +8,6 @@ After rebasing the remote L4 tree onto `origin/main`, `cargo build -p infer
 kernels + finish Route-A doc cleanup` (`d3136ba`) deleted two Triton AOT
 kernels that were still being called from the live Rust single-token
 decode path (`infer::ops::attention::fused_attention_decode_into`,
-reached from `qwen3/decode.rs:120` and `glm4/decode.rs:126` on every
 single-request step) — see the commit message of `fix(cuda): restore
 single-token split-KV decode kernels` (`132bc84`) for the full write-up.
 

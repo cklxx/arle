@@ -68,7 +68,6 @@ there's an existing caller that can't hold the buffer.
    custom split-KV kernel with FP32 cast. The selector is `KVFormat`, not
    the model — adding a fourth format means a fourth path.
 6. **Prefill dispatches on head dim:** HD128 → `flashinfer_batch_forward_with_layout`,
-   HD256 → `flashinfer_batch_forward_hd256`. Qwen3/GLM4 = HD128;
    Qwen3.5 full-attention = HD256.
 7. **Single-token decode** uses the Triton AOT kernel that fuses QK-norm +
    RoPE + split-KV attention + online softmax + merge in one launch. Don't

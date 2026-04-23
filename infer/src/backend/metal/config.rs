@@ -453,7 +453,7 @@ mod tests {
     fn rejects_non_qwen_metal_config_instead_of_silently_falling_back() {
         let dir = write_config_file(
             r#"{
-                "architectures": ["ChatGLMModel"],
+                "architectures": ["LlamaForCausalLM"],
                 "hidden_size": 4096,
                 "num_attention_heads": 32
             }"#,
@@ -464,7 +464,7 @@ mod tests {
             err.contains("supports Qwen3/Qwen3.5/Qwen3.6 only"),
             "err={err}"
         );
-        assert!(err.contains("GLM-4"), "err={err}");
+        assert!(err.contains("Llama"), "err={err}");
     }
 
     #[test]

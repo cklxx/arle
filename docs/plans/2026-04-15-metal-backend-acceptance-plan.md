@@ -430,7 +430,6 @@ Acceptance:
 
 Acceptance:
 
-- GLM4 moves from limited to supported or is explicitly deferred with a clear
   rationale
 
 ### `M2.3` Capture ergonomics

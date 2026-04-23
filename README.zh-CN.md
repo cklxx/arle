@@ -59,7 +59,6 @@
 |------|--------|:----:|:-----:|
 | Qwen3 (0.6B – 72B) | GQA | ✅ | ✅ |
 | Qwen3.5-4B | 混合（线性 + 全注意力） | ✅ | ✅ |
-| GLM4 | GQA | ✅ | — |
 | Llama 3 / 4 | GQA | *规划中* | *规划中* |
 | DeepSeek V3 / R1 | MLA | *规划中* | *规划中* |
 
@@ -197,7 +196,6 @@ curl http://localhost:8000/v1/chat/completions \
 |------|--------|:----:|
 | Qwen3 (0.6B–72B) | GQA | :white_check_mark: |
 | Qwen3.5-4B | 混合（线性 + 全注意力） | :white_check_mark: |
-| GLM4 | GQA | :white_check_mark: |
 | Llama 3 / 4 | GQA | 规划中 |
 | DeepSeek-V3 / R1 | MLA | 规划中 |
 

@@ -262,7 +262,6 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
   by composing existing `ops::{linear, norm, attention, embedding}` with
   a config-driven layer graph. No new CUDA kernels required per model.
 - **Why**: `model_registry::is_implemented` covers 3 architectures
-  (`Qwen3 | Qwen35 | GLM4`). Agent ecosystem demands Llama / Mistral /
   Gemma / Phi / DeepSeek. The fast path stays specialized; the slow path
   is the on-ramp.
 - **Where**:

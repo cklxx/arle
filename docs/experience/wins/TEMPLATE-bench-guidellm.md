@@ -30,7 +30,6 @@ Invoked via: `scripts/bench_guidellm.sh <backend-label> [--target URL] [--model 
 ## Environment
 
 - **Backend:** <cuda | metal>
-- **Model:** <Qwen/Qwen3-4B | Qwen/Qwen3.5-4B | THUDM/GLM-4 | ...>
 - **Hardware:** <GPU model / SoC, VRAM, CUDA or Metal version>
 - **Commit:** <short sha>
 - **Feature set:** `cargo build --release <features>`
