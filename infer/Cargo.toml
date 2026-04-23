@@ -10,7 +10,7 @@ tokenizers = "0.22"
 safetensors = "0.7"
 anyhow = "1.0"
 thiserror = "2"
-ndarray = "0.16"
+ndarray = "0.17"
 blake3 = { workspace = true }
 postcard = { workspace = true }
 half = { version = "2.4", features = ["num-traits"] }
