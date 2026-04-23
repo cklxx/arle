@@ -21,7 +21,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokenizers = { workspace = true }
-ureq = { version = "2.12", features = ["json"] }
+ureq = { version = "3.3", features = ["json"] }
 qwen3-spec = { path = "../qwen3-spec" }
 qwen35-spec = { path = "../qwen35-spec" }
 chat = { path = "../chat" }
