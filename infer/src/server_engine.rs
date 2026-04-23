@@ -1321,7 +1321,6 @@ impl InferenceEngine for LoadedInferenceEngine {
             Self::Qwen35(engine) => engine.model_id(),
             #[cfg(feature = "cuda")]
             Self::Qwen35Moe(engine) => engine.model_id(),
-            #[cfg(feature = "cuda")]
             #[cfg(feature = "metal")]
             Self::Metal(engine) => engine.model_id(),
             #[cfg(feature = "cpu")]
@@ -1337,7 +1336,6 @@ impl InferenceEngine for LoadedInferenceEngine {
             Self::Qwen35(engine) => engine.complete(req),
             #[cfg(feature = "cuda")]
             Self::Qwen35Moe(engine) => engine.complete(req),
-            #[cfg(feature = "cuda")]
             #[cfg(feature = "metal")]
             Self::Metal(engine) => engine.complete(req),
             #[cfg(feature = "cpu")]
@@ -1357,7 +1355,6 @@ impl InferenceEngine for LoadedInferenceEngine {
             Self::Qwen35(engine) => engine.complete_stream(req, tx),
             #[cfg(feature = "cuda")]
             Self::Qwen35Moe(engine) => engine.complete_stream(req, tx),
-            #[cfg(feature = "cuda")]
             #[cfg(feature = "metal")]
             Self::Metal(engine) => engine.complete_stream(req, tx),
             #[cfg(feature = "cpu")]
