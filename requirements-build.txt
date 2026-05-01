@@ -9,4 +9,4 @@ flashinfer-python==0.6.9
 triton==3.6.0
 
 # HuggingFace Hub: model weight download.
-huggingface_hub==0.36.2
+huggingface_hub==1.13.0
