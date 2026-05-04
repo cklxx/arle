@@ -182,11 +182,67 @@ fn bench_coordinator_full_cycle(size: usize) -> (f64, usize) {
             CoordinatorEvent::FetchCompleted { blocks, .. } => blocks,
             other => panic!("unexpected event: {other:?}"),
         };
-        let _ = pool.read_region(fetched[0].host_region).unwrap();
+        // Note: the production fetch path stops here — the prefill kernel
+        // consumes the host region in place via paged_kv. We deliberately
+        // skip a verification `read_region` inside the timed loop; the
+        // warm-up round below validates correctness once.
         pool.release_region(fetched[0].host_region).unwrap();
     };
 
-    do_one(0); // warm-up
+    // Warm-up + correctness check: do one full cycle and verify byte-equality.
+    do_one(0);
+    {
+        let region = {
+            let mut p = pool.lock().unwrap();
+            let r = p.reserve(size).unwrap().unwrap();
+            p.as_mut_slice(r).copy_from_slice(&payload);
+            r
+        };
+        let warm_fp = BlockFingerprint([0xFE; 16]);
+        let st = handle
+            .submit_store(vec![StoreRequest {
+                block_id: BlockId(1),
+                fingerprint: warm_fp,
+                kv_format_tag: 1,
+                host_pool: pool.clone(),
+                host_region: region,
+                target: StoreTarget::Disk,
+            }])
+            .unwrap();
+        assert!(coordinator.run_once().unwrap());
+        let _ = events.recv().unwrap();
+        let plen = match events.recv().unwrap() {
+            CoordinatorEvent::StoreCompleted { ticket, locations } => {
+                assert_eq!(ticket, st);
+                match &locations[0].1 {
+                    BlockLocation::Disk { payload_len, .. } => *payload_len,
+                    other => panic!("warm-up: expected disk location, got {other:?}"),
+                }
+            }
+            other => panic!("warm-up: unexpected store event: {other:?}"),
+        };
+        pool.release_region(region).unwrap();
+        let _ = handle
+            .submit_fetch(vec![FetchRequest {
+                block_id: BlockId(1),
+                source: BlockLocation::Disk {
+                    fingerprint: warm_fp,
+                    payload_len: plen,
+                },
+                byte_len: usize::try_from(plen).unwrap(),
+                host_pool: pool.clone(),
+            }])
+            .unwrap();
+        assert!(coordinator.run_once().unwrap());
+        let _ = events.recv().unwrap();
+        let fetched = match events.recv().unwrap() {
+            CoordinatorEvent::FetchCompleted { blocks, .. } => blocks,
+            other => panic!("warm-up: unexpected fetch event: {other:?}"),
+        };
+        let bytes = pool.read_region(fetched[0].host_region).unwrap();
+        assert_eq!(bytes, payload, "warm-up cycle byte-equality failed");
+        pool.release_region(fetched[0].host_region).unwrap();
+    }
 
     let iters = iters_for(size);
     let start = Instant::now();
