@@ -520,16 +520,32 @@ impl DiskStore {
         file_bytes.extend_from_slice(payload);
 
         let path = self.block_path_for(fingerprint)?;
-        if fsync_each_block {
-            kv_native_sys::write_block_atomic(self.root(), fingerprint.0, &file_bytes)?;
-        } else {
-            let tmp_path = path.with_extension("kv.tmp");
-            let write_result = std::fs::write(&tmp_path, &file_bytes)
-                .and_then(|()| std::fs::rename(&tmp_path, &path));
-            if let Err(err) = write_result {
-                let _ = std::fs::remove_file(&tmp_path);
-                return Err(err);
+        let do_write = || -> io::Result<()> {
+            if fsync_each_block {
+                kv_native_sys::write_block_atomic(self.root(), fingerprint.0, &file_bytes)
+            } else {
+                let tmp_path = path.with_extension("kv.tmp");
+                let result = std::fs::write(&tmp_path, &file_bytes)
+                    .and_then(|()| std::fs::rename(&tmp_path, &path));
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
+                result
             }
+        };
+
+        match do_write() {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                // Self-heal: the cache root may have been deleted while the
+                // process was running (operator purge, tmp cleanup, remount).
+                // Force-recreate and retry once. The hot path stays fast
+                // because the AtomicBool short-circuit keeps every successful
+                // subsequent write at zero syscalls.
+                self.create_root()?;
+                do_write()?;
+            }
+            Err(err) => return Err(err),
         }
 
         Ok(DiskBlockLocation {
@@ -850,6 +866,51 @@ mod tests {
             payload
         );
         assert!(!location.path.with_extension("kv.tmp").exists());
+    }
+
+    #[test]
+    fn put_block_self_heals_when_root_deleted_externally() {
+        // Regression test for the create_root AtomicBool cache (commit
+        // 701c76a). After a successful first write, the cache short-
+        // circuits create_dir_all on every subsequent put. If the cache
+        // root gets deleted externally (operator purge / tmp cleanup /
+        // remount), the next put would fail with NotFound and stall
+        // T1→T2 spill until restart. The put path must self-heal:
+        // detect NotFound from the inner write, force-recreate the
+        // root, retry once.
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("kv-store-root");
+        let store = DiskStore::new(&root);
+        let kv_format_tag = 9;
+
+        // First write — exercises the create_root path; flips the
+        // AtomicBool to true.
+        let payload_a = b"first-write-creates-root".to_vec(); // len 24
+        let fp_a = fingerprint_for_payload(&payload_a, kv_format_tag);
+        store
+            .put_block_with_fsync(fp_a, kv_format_tag, &payload_a, false)
+            .expect("first put creates root");
+        assert!(root.exists());
+
+        // External purge: blow away the cache root completely. After
+        // this, the AtomicBool still says true but the directory is
+        // gone — the next put MUST recreate it instead of failing.
+        std::fs::remove_dir_all(&root).expect("remove root");
+        assert!(!root.exists());
+
+        // Second write — should self-heal and succeed. Length 32 (div 4).
+        let payload_b = b"second-write-must-self-heal-OKOK".to_vec();
+        let fp_b = fingerprint_for_payload(&payload_b, kv_format_tag);
+        let location = store
+            .put_block_with_fsync(fp_b, kv_format_tag, &payload_b, false)
+            .expect("self-heal recreates the root and succeeds");
+        assert!(root.exists());
+        assert_eq!(
+            store
+                .get_block(&location, Some(fp_b))
+                .expect("get after self-heal"),
+            payload_b
+        );
     }
 
     #[test]
