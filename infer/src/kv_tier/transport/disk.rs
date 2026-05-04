@@ -275,8 +275,27 @@ impl DiskStore {
     /// **cannot** influence the final path by tampering with a stored
     /// `DiskBlockLocation`. This is the defense against session
     /// snapshot–driven path traversal (M4 review finding B2).
+    ///
+    /// Formats the 32-hex-char + ".kv" filename in Rust directly (no
+    /// FFI/alloc trip into the Zig substrate) — this is the per-write
+    /// and per-read hot path. The byte-for-byte output matches Zig's
+    /// `blockFilenameAlloc` (same nibble→hex table, lowercase, same
+    /// suffix), so blocks written via either path are mutually
+    /// readable.
     pub fn block_path_for(&self, fingerprint: BlockFingerprint) -> io::Result<PathBuf> {
-        kv_native_sys::block_path(self.root(), fingerprint.0)
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut filename = [0u8; 35];
+        for (idx, byte) in fingerprint.0.iter().enumerate() {
+            filename[idx * 2] = HEX[(byte >> 4) as usize];
+            filename[idx * 2 + 1] = HEX[(byte & 0x0f) as usize];
+        }
+        filename[32] = b'.';
+        filename[33] = b'k';
+        filename[34] = b'v';
+        // Safety: HEX table only emits ASCII digits/letters and the suffix
+        // is ASCII; the result is valid UTF-8.
+        let filename_str = unsafe { std::str::from_utf8_unchecked(&filename) };
+        Ok(self.root.join(filename_str))
     }
 
     pub fn contains_block(&self, fingerprint: BlockFingerprint) -> io::Result<bool> {
