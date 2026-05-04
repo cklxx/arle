@@ -139,6 +139,101 @@ on this VM is highly variable.)
 - Production NVMe (low variance) should make the savings visible
   across all medium-large sizes.
 
+## Iteration 2 — bigger wins from skipping the wrong defaults
+
+After Iteration 1's marginal-impact micro-optimizations, profile-by-
+inspection of the small-block bench (4 KiB cycle stuck at ~5 MiB/s,
+~95% of cycle in non-disk overhead) led to looking at fsync. The
+bench gained a **`T2 put+get (no-fsync)` column** to make the cost
+visible per row.
+
+### What the new column showed
+
+| size    | T2 fsync (default) | T2 no-fsync | Speedup |
+|---------|--------------------|-------------|---------|
+| 4 KiB   | 19.1 MiB/s         | 361.5 MiB/s | **18.9×** |
+| 64 KiB  | 255.6 MiB/s        | 3117 MiB/s  | **12.2×** |
+| 1 MiB   | 1165 MiB/s         | 4704 MiB/s  | **4.0×**  |
+| 16 MiB  | 1812 MiB/s         | 3697 MiB/s  | **2.0×**  |
+| 256 MiB | 582 MiB/s          | 923 MiB/s   | **1.6×**  |
+
+Conclusion: `DiskStore::put_block` defaults to `fsync_each_block=true`
+which forces TWO fsync syscalls per write (data file + parent dir).
+For a CACHE — where blocks are recomputable on miss — this is
+over-conservative. We want atomicity (no partial files) but NOT
+durability (a crash that loses recent cache entries is fine).
+
+### Optimization C: Coordinator hot-path skips fsync (commit 06b6bf9)
+
+Switched `Coordinator::handle_store` to `put_block_with_fsync(false)`.
+Atomicity preserved via the existing temp-file + rename. Production
+durability-sensitive callers still reach the fsync path through
+`DiskStore::put_block_with_fsync(true)` directly.
+
+### Optimization D: Skip create_dir_all syscall per write (commit 701c76a)
+
+Added `AtomicBool root_created` on `DiskStore`. The first put_block
+calls `create_dir_all`; subsequent puts read the atomic and skip.
+Eliminates ~1 stat syscall per write. Below the noise floor on this
+VM but compounds with C and D.
+
+### Optimization E: Inline block_path_for hex formatting in Rust (commit e6286d2)
+
+`block_path_for` was hopping into Zig FFI for what is just hex-format
+of a 16-byte fingerprint into a 35-char filename. Replaced with
+stack-allocated [u8;35] formatted in pure Rust. Net per-call savings:
+1 FFI + 1 Zig alloc + 1 Rust alloc + 1 memcpy + 1 free. Below noise
+floor individually; compounds with C and D.
+
+### Cumulative coord-cycle improvement (median of 3 final runs)
+
+| size    | baseline (no THP, no Vec-opt) | final (B+C+D+E) | Speedup |
+|---------|-------------------------------|-----------------|---------|
+| 4 KiB   | 5.6 MiB/s                     | 31.0 MiB/s      | **5.5×** |
+| 64 KiB  | 62.7 MiB/s                    | 343.0 MiB/s     | **5.5×** |
+| 1 MiB   | 259 MiB/s                     | 1800 MiB/s      | **6.9×** |
+| 16 MiB  | 254 MiB/s                     | 2603 MiB/s      | **10.3×** |
+| 256 MiB | 188 MiB/s                     | 718 MiB/s       | **3.8×** |
+
+ops/s view (more meaningful for small-op latency):
+
+| size    | ops/s baseline | ops/s final | Speedup |
+|---------|----------------|-------------|---------|
+| 4 KiB   | ~720           | ~3970       | **5.5×** |
+| 64 KiB  | ~500           | ~2744       | **5.5×** |
+| 1 MiB   | ~125           | ~900        | **7.2×** |
+| 16 MiB  | ~7.9           | ~81         | **10.3×** |
+| 256 MiB | ~0.37          | ~1.40       | **3.8×** |
+
+The 16 MiB jump (10.3×) is the standout — that block size is
+large enough for fsync's per-write ~10ms cost to dominate at
+baseline (2 fsyncs × ~10ms = 20+ms overhead per write, on top
+of the ~9ms actual write), so removing it gives the biggest
+proportional speedup. Small sizes (4 KiB, 64 KiB) are now
+limited by per-op channel/event/dispatch overhead, not disk.
+
+### Where the remaining headroom is
+
+After C+D+E, the gap between Coord cycle and T2 no-fsync (the
+underlying disk ceiling, in MiB/s):
+
+| size    | Coord cycle | T2 no-fsync | Coord/Ceiling |
+|---------|-------------|-------------|---------------|
+| 4 KiB   | 31          | 361         | 8.6%          |
+| 64 KiB  | 343         | 3117        | 11.0%         |
+| 1 MiB   | 1800        | 4704        | 38.3%         |
+| 16 MiB  | 2603        | 3697        | 70.4%         |
+| 256 MiB | 718         | 923         | 77.8%         |
+
+Medium-large (16 MiB+) sizes are within striking distance of the
+disk ceiling. Small (4-64 KiB) sizes have ~10× remaining headroom,
+all in per-op overhead (channel comm + event dispatch + atomic
+counters + mutex acquire). Closing that gap requires either
+**batching multiple ops per coordinator round** (a usage-pattern
+change — `submit_store` already accepts `Vec<StoreRequest>`) or
+restructuring the coordinator's command-channel path. Out of scope
+for this session.
+
 ### Three readable signals from the bench
 
 1. **T1 self-copy is memcpy-bandwidth-bound.** 14–35 GiB/s for medium
