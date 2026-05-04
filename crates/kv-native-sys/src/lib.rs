@@ -940,6 +940,44 @@ mod tests {
     }
 
     #[test]
+    fn read_block_owned_roundtrips_payload_via_zig_owned_buffer() {
+        let dir = tempdir().unwrap();
+        let fp = [0xC7u8; 16];
+        let payload = b"payload-bytes-for-owned-roundtrip-test";
+        write_block_atomic(dir.path(), fp, payload).unwrap();
+
+        // The owning guard should expose the same bytes as `read_block` and
+        // free the Zig-allocated buffer on Drop without panicking.
+        let owned = read_block_owned(dir.path(), fp).unwrap();
+        assert_eq!(owned.as_slice(), payload);
+        assert_eq!(owned.len(), payload.len());
+        assert!(!owned.is_empty());
+        let slice: &[u8] = &owned;
+        assert_eq!(slice, payload);
+        drop(owned);
+
+        // After dropping the guard, a fresh `read_block` call must still
+        // succeed against the same on-disk file (verifies guard owns the
+        // buffer and doesn't disturb the underlying storage).
+        let again = read_block(dir.path(), fp).unwrap();
+        assert_eq!(again, payload);
+    }
+
+    #[test]
+    fn read_block_owned_returns_empty_for_empty_payload() {
+        let dir = tempdir().unwrap();
+        let fp = [0x9Fu8; 16];
+        write_block_atomic(dir.path(), fp, b"").unwrap();
+
+        let owned = read_block_owned(dir.path(), fp).unwrap();
+        assert!(owned.is_empty());
+        assert_eq!(owned.len(), 0);
+        assert_eq!(owned.as_slice(), &[] as &[u8]);
+        let slice: &[u8] = &owned;
+        assert!(slice.is_empty());
+    }
+
+    #[test]
     #[ignore = "microbench: cargo test -p kv-native-sys host_arena_bench --release -- --ignored --nocapture"]
     fn host_arena_bench_reserved_bytes_fragmented() {
         const REGION_LEN: usize = 64;
