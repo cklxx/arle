@@ -549,9 +549,7 @@ impl Coordinator {
             .as_ref()
             .ok_or_else(|| "coordinator disk store not configured".to_string())?;
         let location = DiskBlockLocation {
-            path: disk_store
-                .block_path_for(fingerprint)
-                .map_err(|e| e.to_string())?,
+            path: disk_store.block_path_for(fingerprint),
             payload_len,
             fingerprint,
         };

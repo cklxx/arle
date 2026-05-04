@@ -90,7 +90,7 @@ fn store_roundtrip_through_disk_store() {
                     fingerprint,
                     payload_len,
                 } => crate::kv_tier::transport::disk::DiskBlockLocation {
-                    path: disk_store.block_path_for(fingerprint).unwrap(),
+                    path: disk_store.block_path_for(fingerprint),
                     fingerprint,
                     payload_len,
                 },

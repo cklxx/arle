@@ -282,7 +282,13 @@ impl DiskStore {
     /// `blockFilenameAlloc` (same nibble→hex table, lowercase, same
     /// suffix), so blocks written via either path are mutually
     /// readable.
-    pub fn block_path_for(&self, fingerprint: BlockFingerprint) -> io::Result<PathBuf> {
+    pub fn block_path_for(&self, fingerprint: BlockFingerprint) -> PathBuf {
+        // Defence: the 35-byte stack buffer below assumes a 16-byte
+        // fingerprint (32 hex chars + ".kv"). If `BlockFingerprint`
+        // ever widens, fail at compile time instead of silently
+        // truncating the filename.
+        const _: () = assert!(std::mem::size_of::<BlockFingerprint>() == 16);
+
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut filename = [0u8; 35];
         for (idx, byte) in fingerprint.0.iter().enumerate() {
@@ -295,11 +301,11 @@ impl DiskStore {
         // Safety: HEX table only emits ASCII digits/letters and the suffix
         // is ASCII; the result is valid UTF-8.
         let filename_str = unsafe { std::str::from_utf8_unchecked(&filename) };
-        Ok(self.root.join(filename_str))
+        self.root.join(filename_str)
     }
 
     pub fn contains_block(&self, fingerprint: BlockFingerprint) -> io::Result<bool> {
-        self.block_path_for(fingerprint)?.try_exists()
+        self.block_path_for(fingerprint).try_exists()
     }
 
     /// Visits every valid fingerprint-named block file currently under
@@ -329,7 +335,7 @@ impl DiskStore {
                 continue;
             };
 
-            let canonical = self.block_path_for(fingerprint)?;
+            let canonical = self.block_path_for(fingerprint);
             if !same_existing_path(&path, &canonical) {
                 return Err(invalid_data(
                     "disk store: discovered block path outside canonical root",
@@ -404,7 +410,7 @@ impl DiskStore {
                 continue;
             };
 
-            let canonical = self.block_path_for(fingerprint)?;
+            let canonical = self.block_path_for(fingerprint);
             if !same_existing_path(&path, &canonical) {
                 return Err(invalid_data(
                     "disk store: discovered block path outside canonical root",
@@ -519,7 +525,7 @@ impl DiskStore {
         file_bytes.extend_from_slice(&header_bytes);
         file_bytes.extend_from_slice(payload);
 
-        let path = self.block_path_for(fingerprint)?;
+        let path = self.block_path_for(fingerprint);
         let do_write = || -> io::Result<()> {
             if fsync_each_block {
                 kv_native_sys::write_block_atomic(self.root(), fingerprint.0, &file_bytes)
@@ -577,7 +583,7 @@ impl DiskStore {
                 "disk store: fingerprint mismatch (location vs expected)",
             ));
         }
-        let canonical = self.block_path_for(location.fingerprint)?;
+        let canonical = self.block_path_for(location.fingerprint);
         if location.path != canonical {
             return Err(invalid_data(
                 "disk store: refused location.path outside canonical root",
@@ -610,7 +616,7 @@ impl DiskStore {
     /// advisory `location.path` is not trusted (same reasoning as
     /// [`DiskStore::get_block`]).
     pub fn delete_block(&self, location: &DiskBlockLocation) -> io::Result<()> {
-        let canonical = self.block_path_for(location.fingerprint)?;
+        let canonical = self.block_path_for(location.fingerprint);
         if location.path != canonical {
             return Err(invalid_data(
                 "disk store: refused location.path outside canonical root",
@@ -634,9 +640,7 @@ impl DiskStore {
                 fingerprint,
                 payload_len,
             } => {
-                let path = self
-                    .block_path_for(*fingerprint)
-                    .map_err(|err| disk_error(&err))?;
+                let path = self.block_path_for(*fingerprint);
                 Ok(DiskBlockLocation {
                     path,
                     payload_len: *payload_len,
@@ -1021,11 +1025,7 @@ mod tests {
             kv_format_tag: 1,
             payload_len: 1024,
         };
-        write_raw_block(
-            &store.block_path_for(fingerprint).unwrap(),
-            &header,
-            &payload,
-        );
+        write_raw_block(&store.block_path_for(fingerprint), &header, &payload);
 
         let mut visited = 0usize;
         store
@@ -1062,7 +1062,7 @@ mod tests {
 
         let malformed_fingerprint = BlockFingerprint([0x11; 16]);
         store.create_root().unwrap();
-        let malformed_path = store.block_path_for(malformed_fingerprint).unwrap();
+        let malformed_path = store.block_path_for(malformed_fingerprint);
         fs::write(malformed_path, b"not a disk block").unwrap();
 
         let mut visited = Vec::new();
