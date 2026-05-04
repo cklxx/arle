@@ -847,3 +847,90 @@ fn allocated_regions_no_release_when_committed() {
     // Cleanup — release the original region so the pool is tidy.
     pool.release(region).unwrap();
 }
+
+#[test]
+fn t1_t2_full_swap_cycle_release_then_readmit() {
+    // End-to-end T1→T2→release→T1 byte-equality. The existing
+    // store_roundtrip_through_disk_store and fetch_from_disk_*
+    // tests cover only the legs in isolation; this one closes
+    // the full eviction-then-readmission cycle that production
+    // session-resume depends on. Bytes must survive the host
+    // region being released between persist and readmit.
+    let dir = tempdir().unwrap();
+    let disk_store = Arc::new(DiskStore::new(dir.path()));
+    let (coordinator, handle, events) = CoordinatorBuilder::new(4)
+        .disk_store(disk_store.clone())
+        .build();
+    let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
+        crate::kv_tier::HostPinnedPool::new(256).unwrap(),
+    );
+
+    let original: &[u8] = b"layer-block-payload-bytes";
+    let initial_region = {
+        let mut pool = host_pool.lock().unwrap();
+        let region = pool.reserve(original.len()).unwrap().unwrap();
+        pool.as_mut_slice(region).copy_from_slice(original);
+        region
+    };
+    let fingerprint = BlockFingerprint([0xCD; 16]);
+
+    let store_ticket = handle
+        .submit_store(vec![StoreRequest {
+            block_id: BlockId(101),
+            fingerprint,
+            kv_format_tag: 7,
+            host_pool: host_pool.clone(),
+            host_region: initial_region,
+            target: StoreTarget::Disk,
+        }])
+        .unwrap();
+    assert!(coordinator.run_once().unwrap());
+    match events.recv().unwrap() {
+        CoordinatorEvent::StoreQueued { ticket, .. } => assert_eq!(ticket, store_ticket),
+        other => panic!("unexpected store-queued event: {other:?}"),
+    }
+    let payload_len = match events.recv().unwrap() {
+        CoordinatorEvent::StoreCompleted { locations, .. } => match &locations[0].1 {
+            BlockLocation::Disk { payload_len, .. } => *payload_len,
+            other => panic!("expected disk location, got {other:?}"),
+        },
+        other => panic!("unexpected store-completed event: {other:?}"),
+    };
+
+    host_pool.release_region(initial_region).unwrap();
+
+    let fetch_ticket = handle
+        .submit_fetch(vec![FetchRequest {
+            block_id: BlockId(101),
+            source: BlockLocation::Disk {
+                fingerprint,
+                payload_len,
+            },
+            byte_len: usize::try_from(payload_len).unwrap(),
+            host_pool: host_pool.clone(),
+        }])
+        .unwrap();
+    assert!(coordinator.run_once().unwrap());
+    match events.recv().unwrap() {
+        CoordinatorEvent::FetchQueued { ticket, .. } => assert_eq!(ticket, fetch_ticket),
+        other => panic!("unexpected fetch-queued event: {other:?}"),
+    }
+    let fetched = match events.recv().unwrap() {
+        CoordinatorEvent::FetchCompleted { blocks, .. } => blocks,
+        other => panic!("unexpected fetch-completed event: {other:?}"),
+    };
+
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].block_id, BlockId(101));
+    assert!(
+        fetched[0].release_after_promote,
+        "disk-readmitted regions must be marked temporary by contract",
+    );
+    assert_eq!(
+        host_pool.read_region(fetched[0].host_region).unwrap(),
+        original,
+        "T1→T2→release→T1 round-trip must preserve bytes byte-equal",
+    );
+
+    host_pool.release_region(fetched[0].host_region).unwrap();
+}
