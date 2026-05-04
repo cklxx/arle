@@ -527,8 +527,14 @@ impl DiskStore {
             ));
         }
 
-        let bytes = kv_native_sys::read_block(self.root(), location.fingerprint.0)?;
-        let (header, payload) = DiskBlockHeader::decode(&bytes)?;
+        // Read directly into a Zig-owned guard, decode the header against
+        // the borrowed slice, then copy only the payload into the returned
+        // Vec. This eliminates the Zig→Vec(header+payload) memcpy that
+        // `kv_native_sys::read_block` would have done in `read_buffer`,
+        // saving one allocation + one full-block memcpy per fetch on the
+        // T2→T1 path. Net cost: 1 alloc + 1 memcpy (vs prior 2 + 2).
+        let owned = kv_native_sys::read_block_owned(self.root(), location.fingerprint.0)?;
+        let (header, payload) = DiskBlockHeader::decode(owned.as_slice())?;
 
         if header.fingerprint != location.fingerprint.0 {
             return Err(invalid_data(
