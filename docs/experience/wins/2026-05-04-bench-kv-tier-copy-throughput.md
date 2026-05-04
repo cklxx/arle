@@ -234,6 +234,86 @@ change — `submit_store` already accepts `Vec<StoreRequest>`) or
 restructuring the coordinator's command-channel path. Out of scope
 for this session.
 
+## Iteration 3 — review-driven fixes (Codex bot + self-review)
+
+After Iteration 2, the PR went through `@codex review` and a parallel
+self-review pass. Three concerns surfaced that were each addressed in
+follow-up commits.
+
+### Codex finding (P2): create_root cache breaks self-heal
+
+`disk.rs:244` review comment: after the `root_created` AtomicBool is
+set, `put_block_with_fsync` no longer calls `create_dir_all` on
+subsequent writes. If the cache root is deleted while the process is
+running (operator purge, tmp cleanup, remount, full disk forcing
+rmdir), every later store fails with NotFound until restart. Before
+the cache, each put unconditionally re-created and self-healed.
+
+**Fix (commit 26e0b23):** hot path stays fast (skip when atomic is
+true); on NotFound from the inner write, force-recreate the root and
+retry once. Common case (root exists) pays zero syscalls; rare
+disappearance pays 1 create_dir_all + 1 retry. New regression test
+`put_block_self_heals_when_root_deleted_externally` asserts: first
+put creates root, externally `remove_dir_all` the root, second put
+must succeed and content must be readable.
+
+### Self-review (Strong #1): block_path_for had dead Result
+
+After the inline-Rust rewrite (commit e6286d2), `block_path_for`
+became infallible — no syscalls, no FFI errors. The lingering
+`io::Result<PathBuf>` return type was dead error-handling ceremony
+across 11 call sites.
+
+**Fix (commit 403b594):** drop `io::Result`. Update all callers (3
+DiskStore, 1 SharedFsStore wrapper + 2 wrapper-callers, 1
+coordinator, 1 scheduler/cuda/core, 1 test). Also added
+`const _: () = assert!(size_of::<BlockFingerprint>() == 16)` inside
+the function so a future widening of `BlockFingerprint` fails at
+compile time instead of silently truncating the 35-byte stack
+filename buffer.
+
+### Self-review (Strong #3): swap-cycle test could pass on aliasing
+
+The original `t1_t2_full_swap_cycle_release_then_readmit` (commit
+9d7a2fc) used a 256-byte pool with 25-byte payload — fetch-leg
+likely reused the same pool offset the store-leg had. A regression
+where `fetch_disk_payload` returned wrong bytes — but the host pool
+happened to hold the correct bytes from the not-yet-overwritten
+initial region — would still pass byte-equality.
+
+**Fix (commit beb6829):** between release and fetch, reserve a "pin"
+region filled with `0xAB` to occupy exactly the slot the original
+released (asserted: `pin_region.offset == initial_offset`). This
+forces fetch to a different offset (asserted:
+`fetched.offset != initial_offset`). Pin region is asserted
+unchanged after fetch (proves the fetch didn't write to wrong slot).
+Now a wrong-bytes regression OR a wrong-slot-write regression both
+fail the test cleanly.
+
+### Self-review (Strong #2): C-only attribution
+
+The Iteration 2 final table conflated C (fsync removal) with D
+(create_root cache) and E (Rust block_path_for). Re-bench by
+checkout-ing commit `06b6bf9` (C only):
+
+| size    | C only (median 2 runs) | C+D+E (final)  | Δ from D+E |
+|---------|------------------------|----------------|------------|
+| 4 KiB   | 30.6 MiB/s            | 30.3 MiB/s     | noise (variance ±300%) |
+| 64 KiB  | 338 MiB/s             | 343 MiB/s      | +1.5%      |
+| 1 MiB   | 1741 MiB/s            | 1800 MiB/s     | +3.4%      |
+| 16 MiB  | 2499 MiB/s            | 2603 MiB/s     | +4.2%      |
+| 256 MiB | 543 MiB/s             | 718 MiB/s      | +32% (high variance both ways) |
+
+**Honest reading:** **C (fsync removal) does ~all of the heavy
+lifting; D and E are micro-optimizations whose individual signal
+sits below this VM's noise floor at most sizes.** The 32% delta at
+256 MiB is consistent with a real D+E contribution but the variance
+is too large to claim it conclusively. Production NVMe (low
+variance) should expose D+E's cumulative ~1 alloc + 2 memcpy + 1
+syscall savings per cycle clearly; on this VM, only commit C is
+provably responsible for the 5.5–10.3× cumulative speedup reported
+in the Iteration 2 final table.
+
 ### Three readable signals from the bench
 
 1. **T1 self-copy is memcpy-bandwidth-bound.** 14–35 GiB/s for medium
