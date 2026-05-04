@@ -99,13 +99,15 @@ fn bench_t1_self_copy(size: usize) -> (f64, usize) {
     (start.elapsed().as_secs_f64(), iters)
 }
 
-fn bench_t2_disk_roundtrip(size: usize) -> (f64, usize) {
+fn bench_t2_disk_roundtrip(size: usize, fsync_each_block: bool) -> (f64, usize) {
     let dir = tempdir().unwrap();
     let store = DiskStore::new(dir.path());
     let payload: Vec<u8> = (0..size).map(|i| ((i * 31) & 0xFF) as u8).collect();
 
     let warm_fp = BlockFingerprint([0xAA; 16]);
-    let warm_loc = store.put_block(warm_fp, 1, &payload).unwrap();
+    let warm_loc = store
+        .put_block_with_fsync(warm_fp, 1, &payload, fsync_each_block)
+        .unwrap();
     let _ = store.get_block(&warm_loc, Some(warm_fp)).unwrap();
     store.delete_block(&warm_loc).unwrap();
 
@@ -116,7 +118,9 @@ fn bench_t2_disk_roundtrip(size: usize) -> (f64, usize) {
         fp_bytes[0] = (i & 0xFF) as u8;
         fp_bytes[1] = ((i >> 8) & 0xFF) as u8;
         let fp = BlockFingerprint(fp_bytes);
-        let loc = store.put_block(fp, 1, &payload).unwrap();
+        let loc = store
+            .put_block_with_fsync(fp, 1, &payload, fsync_each_block)
+            .unwrap();
         let read = store.get_block(&loc, Some(fp)).unwrap();
         std::hint::black_box(&read);
         store.delete_block(&loc).unwrap();
@@ -264,37 +268,52 @@ fn bench_kv_tier_copy_throughput() {
     println!("All paths exercised through actual ARLE types — no mock substrate.");
     println!();
     println!(
-        "| {:^11} | {:^7} | {:^21} | {:^21} | {:^21} | {:^21} |",
-        "size", "iters", "T1 self-copy", "T2 put+get", "Coord. T1→T2→T1", "(coord ops/s)"
+        "| {:^11} | {:^7} | {:^21} | {:^21} | {:^21} | {:^21} | {:^21} |",
+        "size",
+        "iters",
+        "T1 self-copy",
+        "T2 put+get (fsync)",
+        "T2 put+get (no-fsync)",
+        "Coord. T1→T2→T1",
+        "(coord ops/s)"
     );
     println!(
-        "|{:-<13}|{:-<9}|{:-<23}|{:-<23}|{:-<23}|{:-<23}|",
-        "", "", "", "", "", ""
+        "|{:-<13}|{:-<9}|{:-<23}|{:-<23}|{:-<23}|{:-<23}|{:-<23}|",
+        "", "", "", "", "", "", ""
     );
     for &size in SIZES_BYTES {
         let (t1_secs, t1_iters) = bench_t1_self_copy(size);
-        let (t2_secs, t2_iters) = bench_t2_disk_roundtrip(size);
+        let (t2_secs, t2_iters) = bench_t2_disk_roundtrip(size, true);
+        let (t2_nf_secs, t2_nf_iters) = bench_t2_disk_roundtrip(size, false);
         let (cyc_secs, cyc_iters) = bench_coordinator_full_cycle(size);
 
         let t1_total = (size as u128) * (t1_iters as u128) * 2; // write + read
         let t2_total = (size as u128) * (t2_iters as u128) * 2; // put + get
+        let t2_nf_total = (size as u128) * (t2_nf_iters as u128) * 2;
         let cyc_total = (size as u128) * (cyc_iters as u128) * 2; // store-leg + fetch-leg
 
         let cyc_ops_per_s = cyc_iters as f64 / cyc_secs;
         println!(
-            "| {} | {:>7} | {} | {} | {} | {:>14.2} ops/s |",
+            "| {} | {:>7} | {} | {} | {} | {} | {:>14.2} ops/s |",
             fmt_size(size),
             t1_iters.max(t2_iters).max(cyc_iters),
             fmt_bandwidth(t1_total, t1_secs),
             fmt_bandwidth(t2_total, t2_secs),
+            fmt_bandwidth(t2_nf_total, t2_nf_secs),
             fmt_bandwidth(cyc_total, cyc_secs),
             cyc_ops_per_s,
         );
-        // Also print µs-per-op for the coordinator cycle (latency view).
-        let _ = (fmt_avg_us(t1_secs, t1_iters), fmt_avg_us(t2_secs, t2_iters));
+        // Latency view (currently unused but kept for ad-hoc inspection).
+        let _ = (
+            fmt_avg_us(t1_secs, t1_iters),
+            fmt_avg_us(t2_secs, t2_iters),
+            fmt_avg_us(t2_nf_secs, t2_nf_iters),
+        );
     }
     println!();
     println!("Throughput convention: each row counts BOTH directions of the round-trip");
     println!("(write+read for T1, put+get for T2, store-leg+fetch-leg for coordinator),");
     println!("so the MiB/s value is the byte-volume throughput of the full cycle.");
+    println!("T2 (fsync) is `put_block` default (atomic write + fsync data + fsync parent dir);");
+    println!("T2 (no-fsync) is `put_block_with_fsync(false)` (rename-only, no fsync).");
 }
