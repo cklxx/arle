@@ -166,6 +166,12 @@ fn disk_location_error(message: impl Into<String>) -> TransportError {
 #[derive(Debug)]
 pub struct DiskStore {
     root: PathBuf,
+    // Tracks whether `create_root()` has succeeded at least once, so the
+    // hot put_block path can skip the per-write `create_dir_all` syscall
+    // (an idempotent but still-stat-ing call). The first put pays the
+    // cost, every subsequent put on the same DiskStore instance reads
+    // the atomic and skips.
+    root_created: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -184,7 +190,10 @@ impl DiskStore {
     /// directory — call [`DiskStore::create_root`] if it might not
     /// exist yet.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            root_created: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     /// Root directory used by this store.
@@ -220,7 +229,20 @@ impl DiskStore {
 
     /// Ensures the store root exists.
     pub fn create_root(&self) -> io::Result<()> {
-        std::fs::create_dir_all(&self.root)
+        std::fs::create_dir_all(&self.root)?;
+        self.root_created
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Like [`create_root`] but a no-op if a previous call succeeded on
+    /// this `DiskStore` instance. Used by the hot write path to skip the
+    /// per-write `create_dir_all` stat syscall after the first success.
+    fn ensure_root_created(&self) -> io::Result<()> {
+        if self.root_created.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        self.create_root()
     }
 
     // ── Keyed API ────────────────────────────────────────────────────
@@ -467,7 +489,7 @@ impl DiskStore {
         payload: &[u8],
         fsync_each_block: bool,
     ) -> io::Result<DiskBlockLocation> {
-        self.create_root()?;
+        self.ensure_root_created()?;
 
         let payload_len = u64::try_from(payload.len())
             .map_err(|_| invalid_data("disk store: payload too large"))?;
