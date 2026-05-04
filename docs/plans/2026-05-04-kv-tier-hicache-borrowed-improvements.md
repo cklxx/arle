@@ -37,7 +37,7 @@ Map the 7 HiCache optimizations onto ARLE's existing `kv_tier` skeleton, identif
 
 ### P0 — Foundation (this commit + 1-2 follow-ups)
 
-**P0.0 (this commit):** Pure refactor — move `PrefetchMode` / `WriteBackMode` from `infer/src/scheduler/cuda/policy.rs` to a new `infer/src/kv_tier/policy.rs`, rename to `PrefetchPolicy` / `WritePolicy` (HiCache-aligned names), bump visibility to `pub`. Zero behavior change. Foundation for P0.1 and P0.2.
+**P0.0 (LANDED 2026-05-04):** Pure refactor — moved `PrefetchMode` / `WriteBackMode` from `infer/src/scheduler/cuda/policy.rs` to `infer/src/kv_tier/policy.rs`, renamed to `PrefetchPolicy` / `WritePolicy` (HiCache-aligned names), visibility bumped to `pub`. Zero behavior change; foundation for P0.1 and P0.2. All 536 lib tests + 65 kv_tier tests pass. Re-exported from `kv_tier.rs` root.
 
 **P0.1 (follow-up):** Add `WritePolicy::WriteBack` variant.
 - Coordinator suppresses `submit_store` calls in `WriteBack` mode at produce time; instead, registers a deferred-persist hook on the block.
@@ -61,6 +61,7 @@ Map the 7 HiCache optimizations onto ARLE's existing `kv_tier` skeleton, identif
 - Stacks multiplicatively with A8 (smaller per-layer transfer × better hide ratio).
 - Touchpoints: `kv_tier/transport/local_cuda.rs`, `backend/cuda/forward.rs` (or equivalent), event channel in `kv_tier/coordinator.rs`.
 - Acceptance: 80-layer model (Qwen3-32B class) readmission TTFT drops ≥ `min(transfer_ms, compute_ms)` per layer × N layers; targeting 50–70% of pure-transfer baseline hidden.
+- **Viability confirmed by 2026-05-04 bench**: `docs/experience/wins/2026-05-04-bench-kv-tier-copy-throughput.md` measures host-memcpy ceiling at 12 GiB/s (medium blocks), giving per-layer T1→T0 transfer ≈ 1.3 ms vs ≈ 5–15 ms layer compute on Qwen3-32B class — overlap hides essentially all transfer time. Same arithmetic on T1↔T2 disk gives 36 ms per layer (far larger than compute); confirms the design choice that **layer-wise overlap applies to T1↔T0 only, not T1↔T2** — matches HiCache's split between L1↔L2 layer-wise overlap and L2↔L3 prefetch+timeout.
 
 **P1.2: Cross-tier KV layout abstraction (HiCache 6.3).**
 - `KVPayload` gains `layout: KVLayout::{LayerFirst, PageFirst}`.
