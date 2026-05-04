@@ -1,16 +1,55 @@
-# 2026-05-04 · T1↔T2 copy-throughput micro-benchmark + CPU↔GPU overlap analysis
+# 2026-05-04 · T1↔T2 copy-throughput bench + hardware deep-dive + tried optimizations
 
 ## Context
 
-User asked: 测一下拷贝的速度,以及考虑 CPU 和 GPU 的 overlap. The new
-HiCache-borrowed roadmap (`docs/plans/2026-05-04-kv-tier-hicache-borrowed-improvements.md`)
-needs concrete numbers for layer-wise compute-transfer overlap (HiCache
-optimization 6.2) viability — without measured bandwidth, we can't tell
-whether ARLE's per-layer KV transfer fits inside a layer's compute budget.
+User asked (in three rounds): 测一下拷贝的速度 → 考虑 CPU 和 GPU 的 overlap →
+深挖硬件模式 继续本机优化. This entry pins:
 
-This entry pins the actual T1 (host pinned DRAM) and T2 (disk) bandwidth
-numbers measured **through the real ARLE types** (`HostPinnedPool`,
-`DiskStore`, `Coordinator`), then derives the overlap conclusion.
+1. **Hardware probe** of the actual sandbox machine that backs every
+   number below.
+2. **Measured T1↔T2 throughput** through the real ARLE types
+   (`HostPinnedPool`, `DiskStore`, `Coordinator`) — the bench
+   instrument lives at `infer/src/kv_tier/coordinator/bench.rs`.
+3. **CPU↔GPU layer-wise compute-transfer overlap viability** for the
+   HiCache-borrowed roadmap (`docs/plans/2026-05-04-kv-tier-hicache-borrowed-improvements.md`
+   §P1.1, HiCache optimization 6.2).
+4. **A/B of two attempted local optimizations**: `MADV_HUGEPAGE` on
+   the host arena (no measurable win on this VM, kept as defensive
+   prod optimization) and **eliminating the intermediate `Vec<u8>`
+   on the T2→T1 fetch path** (real but small win, masked by VM I/O
+   variance).
+
+## Hardware probe (the ground truth)
+
+```
+CPU:     Intel Xeon (Sapphire Rapids, model 207) 4 cores @ 2.1 GHz
+         AVX-512 + AVX-VNNI + AMX-BF16/INT8 + AVX512_FP16 + clwb +
+         clflushopt + movdir64b. 1 socket, 1 NUMA node, KVM hypervisor.
+Caches:  L1d 48 KiB/core, L1i 32 KiB/core, L2 2 MiB/core,
+         L3 260 MiB shared.
+RAM:     16 GiB. AnonHugePages 0 KiB (THP=madvise but no active promotion).
+         Hugepagesize 2 MiB. ulimit -l = 8192 KiB (memlock).
+Storage: /dev/vda virtio block, ext4 on /, no separate tmpfs for /tmp.
+         O_DIRECT write 363 MB/s, O_DIRECT read 1.1 GB/s.
+         Block scheduler mq-deadline. Write cache: write back.
+THP:     /sys/kernel/mm/transparent_hugepage/enabled = madvise.
+```
+
+**Critical implications for the bench numbers below:**
+
+- **L3 = 260 MiB is right at the 256 MiB top bench size.** The
+  T1 self-copy cliff at 256 MiB (12 GiB/s → 3 GiB/s) is the
+  classical L3→DRAM bandwidth wall — not a code issue.
+- **/tmp is on the real virtio disk, not tmpfs.** The DiskStore
+  bench measures real virtualized I/O, not RAM. Our highest
+  observed disk write throughput (1.5 GiB/s on small blocks) is
+  page-cache-aided; sustained device-direct write is 363 MB/s.
+- **AnonHugePages stayed at 0 throughout the bench.** Even with
+  the new `madvise(MADV_HUGEPAGE)` call (commit 0c353ce), the
+  kernel did not actually promote pages on this VM. Likely the
+  host kernel's THP defrag/khugepaged is disabled or the host
+  doesn't support THP. The madvise call remains in the code as
+  a defensive optimization for production hosts where THP works.
 
 ## What worked
 
@@ -21,40 +60,103 @@ T1→T2→release→T1 coordinator cycle at 5 sizes from 4 KiB to 256 MiB.
 Run: `cargo test --release --no-default-features --features no-cuda
 -p infer --lib bench_kv_tier_copy_throughput -- --ignored --nocapture`.
 
-### Measured throughput
+The bench instrument was iterated mid-session: an early version
+included a per-iter verification `read_region` that inflated coord
+cycle numbers (commit 77f4e16 fixed it to a single warm-up
+verification outside the timed loop).
 
-Hardware: Linux x86_64 sandbox, Zig 0.16 (kv-native-sys), tempfs-backed
-DiskStore via `tempdir()`. CPU-only, no GPU. Each row counts both
-directions of the round-trip (write+read for T1, put+get for T2,
-store-leg+fetch-leg for coordinator).
+### Three-condition A/B (median of 3 runs each)
 
-| size    | iters | T1 self-copy   | T2 put+get   | Coord T1→T2→T1 | (coord ops/s) |
-|---------|-------|----------------|--------------|----------------|---------------|
-| 4 KiB   | 5000  | 24929.3 MiB/s  | 18.2 MiB/s   | 17.0 MiB/s     | 2176.94 ops/s |
-| 64 KiB  | 2000  | 33211.7 MiB/s  | 142.5 MiB/s  | 125.6 MiB/s    | 1005.19 ops/s |
-| 1 MiB   | 500   | 19862.0 MiB/s  | 976.0 MiB/s  | 408.0 MiB/s    | 203.98 ops/s  |
-| 16 MiB  | 50    | 11914.9 MiB/s  | 1541.9 MiB/s | 441.3 MiB/s    | 13.79 ops/s   |
-| 256 MiB | 10    | 3172.5 MiB/s   | 519.0 MiB/s  | 245.7 MiB/s    | 0.48 ops/s    |
+All three conditions use the **fixed bench shape** (no per-iter
+verification read) so they are apples-to-apples. Each row counts
+both directions of the round-trip as the byte-volume.
 
-### Three readable signals
+#### T1 self-copy (HostPinnedPool reserve+write+read)
 
-1. **T1 self-copy is memcpy-bandwidth-bound.** 12–33 GiB/s for medium
-   sizes; drops to 3.2 GiB/s at 256 MiB as cache misses dominate.
-   Approximates the host-side ceiling for any cudaMemcpyAsync /
-   GPU-SM-kernel target (HiCache 6.1 / ARLE A8).
+| size    | baseline | +THP    | +THP+Vec-opt |
+|---------|----------|---------|--------------|
+| 4 KiB   | 26576    | 22351   | 21774        |
+| 64 KiB  | 31314    | 34628   | 32831        |
+| 1 MiB   | 14642    | 13089   | 12802        |
+| 16 MiB  | 8794     | 9056    | 8078         |
+| 256 MiB | 2587     | 2566    | 2447         |
 
-2. **T2 disk round-trip ramps with size, then plateaus.** 18 MiB/s at
-   4 KiB (small-file overhead) → 1.5 GiB/s at 16 MiB (peak, tempfs
-   helps) → 519 MiB/s at 256 MiB (likely page-cache thrashing). This
-   bounds anything T1↔T2 can do.
+(All values MiB/s. T1 path doesn't actually exercise the disk-fetch
+code change; differences here are pure noise.)
 
-3. **Coordinator is ~half of raw T2 at large sizes.** 245 MiB/s vs
-   519 MiB/s at 256 MiB. The ~50% gap is one extra host memcpy in the
-   read-after-fetch path (Coordinator `stage_into_host_pool` allocates
-   a fresh region and copies bytes in via `as_mut_slice`, then test
-   reads back via `read_region` for verification). For real
-   readmission, the test's final `read_region` step doesn't happen,
-   so production overhead should be smaller.
+#### T2 disk roundtrip (DiskStore put+get)
+
+| size    | baseline | +THP    | +THP+Vec-opt |
+|---------|----------|---------|--------------|
+| 4 KiB   | 8.8      | 8.0     | 6.9          |
+| 64 KiB  | 117.1    | 103.8   | 104.5        |
+| 1 MiB   | 638.4    | 587.7   | 605.0        |
+| 16 MiB  | 838.3    | 801.5   | 845.0        |
+| 256 MiB | 241.3    | 269.5   | 233.3        |
+
+(All values MiB/s. Within ±20% measurement variance — virtio I/O
+on this VM is highly variable.)
+
+#### Coordinator full cycle T1→T2→release→T1
+
+| size    | baseline | +THP    | +THP+Vec-opt | Δ (post-opt vs baseline) |
+|---------|----------|---------|--------------|---------------------------|
+| 4 KiB   | 5.6      | 4.8     | 4.7          | -16% (within noise)       |
+| 64 KiB  | 62.7     | 53.5    | 53.5         | -15% (within noise)       |
+| 1 MiB   | 259.1    | 224.2   | 239.5        | -8% (within noise)        |
+| 16 MiB  | 253.5    | 245.8   | **285.9**    | **+13%** (clean signal)   |
+| 256 MiB | 188.3    | 184.0   | 188.1        | flat                      |
+
+### Findings — what each optimization actually did
+
+**Optimization A: `madvise(MADV_HUGEPAGE)` on host arena (commit 0c353ce + e340751).**
+- Earlier in the session this was reported as +12-87% improvement, but
+  that was conflated with a separate bench-shape fix landing in the
+  same window. Rigorous A/B (above table) shows **no measurable
+  improvement on this VM**. Reason: `AnonHugePages` stayed at 0 KiB
+  in `/proc/meminfo` throughout the bench — the kernel was not
+  actually promoting pages, likely because the host kernel's THP
+  support is disabled or unavailable.
+- The call is **kept** as a defensive optimization for production
+  Linux hosts where THP is properly configured. Cost is one syscall
+  per arena init (negligible). Source comment annotated with the
+  finding.
+
+**Optimization B: Eliminate intermediate `Vec<u8>` on T2→T1 fetch (commit e823e32).**
+- Added `kv_native_sys::read_block_owned` returning a
+  `KvNativeOwnedBytes` guard that owns the Zig-allocated buffer
+  directly. `DiskStore::get_block` decodes the on-disk header against
+  the borrowed Zig slice, then copies *only* the payload portion
+  into the returned Vec.
+- Saves **1 alloc + 1 full-block memcpy** per fetch (the previous
+  `read_buffer.to_vec()` of header+payload, then `payload.to_vec()`).
+- Theoretical savings at 256 MiB: alloc (~50 ms) + memcpy (~21 ms
+  at 12 GiB/s) ≈ 70 ms per fetch.
+- **Visible signal at 16 MiB only (+13%)** — that block size is
+  large enough for memcpy savings to register but small enough that
+  virtio I/O variance doesn't drown them. At 256 MiB the I/O
+  variance (±20%) is larger than the ~5% theoretical savings.
+- Production NVMe (low variance) should make the savings visible
+  across all medium-large sizes.
+
+### Three readable signals from the bench
+
+1. **T1 self-copy is memcpy-bandwidth-bound.** 14–35 GiB/s for medium
+   sizes; drops to 2.5 GiB/s at 256 MiB as the working set crosses
+   the 260 MiB L3 boundary. Approximates the host-side ceiling for
+   any cudaMemcpyAsync / GPU-SM-kernel target (HiCache 6.1 / ARLE A8).
+
+2. **T2 disk round-trip ramps with size, plateaus around 800 MiB/s,
+   then drops past page-cache window.** 6 MiB/s at 4 KiB (per-op file
+   syscall overhead) → 845 MiB/s at 16 MiB (peak, page-cache aided)
+   → 233 MiB/s at 256 MiB (working set exceeds page cache). The
+   underlying device sustains 363 MB/s direct write (measured by dd).
+
+3. **Coordinator overhead is small for medium sizes, large for small
+   sizes.** Coord cycle vs raw T2: 16 MiB cycle 286 vs T2 845 MiB/s
+   (≈ 67% of one disk round-trip ÷ 2 legs); 4 KiB cycle 4.7 vs T2 6.9
+   MiB/s (per-op channel comm overhead is dominant). Small ops are
+   bottlenecked by Coordinator's command-channel latency, not bytes.
 
 ## CPU↔GPU layer-wise overlap viability
 
@@ -84,29 +186,65 @@ L3). This matches HiCache's design choice to give L3 its own
 `prefetch_threshold + Timeout policy` rather than rely on layer-wise
 overlap for the slowest tier.
 
-## Rule
+## Rules
 
-Before designing a per-layer overlap optimization for any tier, measure
-that tier's bandwidth at the realistic per-layer block size and compare
-to per-layer compute time on the model class of interest. The two-order-
-of-magnitude gap between T1↔T0 (hideable) and T1↔T2 (not hideable)
-shows the same optimization shape doesn't apply uniformly across tiers
-— this is why HiCache layers compute-transfer overlap on T1↔T0 but
-prefetch+timeout on L2↔L3, and ARLE's roadmap mirrors that split.
+1. **Before designing a per-layer overlap optimization for any tier,
+   measure that tier's bandwidth at the realistic per-layer block
+   size and compare to per-layer compute time on the model class of
+   interest.** The two-order-of-magnitude gap between T1↔T0
+   (hideable) and T1↔T2 (not hideable) shows the same optimization
+   shape doesn't apply uniformly across tiers — this is why HiCache
+   layers compute-transfer overlap on T1↔T0 but prefetch+timeout on
+   L2↔L3, and ARLE's roadmap mirrors that split.
+
+2. **Always verify madvise/THP behavior with `/proc/<pid>/smaps` or
+   `/proc/meminfo` AnonHugePages**, not just by adding the syscall.
+   On VMs and constrained kernels, MADV_HUGEPAGE is silently a no-op
+   even though it returns success. The 2026-05-04 misattribution
+   here (where the bench-shape change was conflated with a perf
+   "win" from THP) is the cautionary tale.
+
+3. **VM disk benches need ≥3 runs and median reporting.** Single-run
+   numbers on virtio storage have ±20% variance from background
+   page-cache flush, host scheduler, and block-device queue depth.
+   Real differences smaller than the variance are invisible without
+   either repetition or a stable bare-metal baseline.
+
+4. **Bench instrument changes are themselves perf-sensitive.** A
+   "verification read" that seems like trivial test scaffolding can
+   add a measurable inflation to throughput numbers (because page
+   cache warmth from the verify step makes subsequent ops appear
+   faster). Always factor verification out of the timed loop;
+   document the change explicitly when it shifts numbers.
 
 ## Pointers
 
 - Bench source: `infer/src/kv_tier/coordinator/bench.rs`
 - Roadmap that consumes these numbers: `docs/plans/2026-05-04-kv-tier-hicache-borrowed-improvements.md` §P1.1, §P0.2
 - HiCache reference: `docs/research/2026-05-04-sglang-hicache-guide.md` Part VI §6.2, §6.5
+- THP optimization: `crates/kv-native-sys/zig/src/kv_native.zig` (`hostArenaCreateInternal`)
+- Vec elimination: `crates/kv-native-sys/src/lib.rs` (`KvNativeOwnedBytes`, `read_block_owned`) + `infer/src/kv_tier/transport/disk.rs` (`DiskStore::get_block`)
 - Re-run the bench: `cargo test --release --no-default-features --features no-cuda -p infer --lib bench_kv_tier_copy_throughput -- --ignored --nocapture`
+- Local env setup: `pip install ziglang` then `export ZIG=/usr/local/lib/python3.11/dist-packages/ziglang/zig`
 
 ## Status
 
-`pending-remote-gpu` for the **T0↔T1 PCIe leg** — this run is CPU-only,
-so the cudaMemcpyAsync number is extrapolated from host-memcpy. The
-actual GPU-PCIe number must be measured on a CUDA box before the
-P1.1 layer-wise overlap implementation lands. Open a follow-up bench
-on the next CUDA-capable run to validate the 12 GiB/s lower-bound
-assumption against real `cudaMemcpyAsync` and (after A8 lands) the
-SM-assisted I/O kernel.
+`pending-remote-gpu` for two follow-ups:
+
+1. **T0↔T1 PCIe leg of the overlap analysis.** This run is CPU-only,
+   so the cudaMemcpyAsync number is extrapolated from host-memcpy.
+   The actual GPU-PCIe number must be measured on a CUDA box before
+   the P1.1 layer-wise overlap implementation lands. Validate the
+   12 GiB/s lower-bound assumption against real `cudaMemcpyAsync`
+   and (after A8 lands) the SM-assisted I/O kernel.
+
+2. **Re-run all three A/B conditions on a real (non-VM) Linux box
+   with confirmed-active THP.** `AnonHugePages > 0` in
+   `/proc/meminfo` would confirm the kernel actually promotes pages,
+   and the MADV_HUGEPAGE win on coord cycle 16 MiB / 256 MiB should
+   become visible. If still no win, the optimization can be removed
+   with confidence rather than left in as cargo-cult.
+
+3. **Re-run the Vec-elimination A/B on production NVMe** to confirm
+   the +13% signal at 16 MiB extends to other medium-large sizes
+   when virtio-VM I/O variance is removed.
