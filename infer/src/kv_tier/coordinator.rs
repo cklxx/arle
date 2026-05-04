@@ -636,3 +636,7 @@ impl Coordinator {
 #[cfg(test)]
 #[path = "coordinator/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "coordinator/bench.rs"]
+mod bench;
