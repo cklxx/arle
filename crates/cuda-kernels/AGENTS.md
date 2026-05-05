@@ -42,7 +42,7 @@ crates/cuda-kernels/
 │   ├── prelude.rs       — **the proto-API contract** (7 types; see Prelude discipline)
 │   ├── ffi.rs + ffi/    — extern "C" declarations, grouped by domain (see FFI domain layout below)
 │   ├── flashinfer.rs    — FlashInferWorkspace + metadata staging
-│   ├── paged_kv.rs      — PagedKVPool, TokenKVPool, plus the CUDA graph capture/replay pool used by decode-graph reuse
+│   ├── paged_kv.rs      — PagedKVPool, TokenKVPool
 │   ├── tensor.rs        — DeviceContext, DeviceVec, DeviceMatrix, HiddenStates, RawDevicePtr
 │   ├── collective.rs    — `CollectiveBackend` trait + `NcclBackend` skeleton (F0 multi-GPU). F7 adds CustomAR / mscclpp / quick_ar / symm_mem behind the same trait. Method set is taken from actual F1+ callers (LayerCommunicator AR, PP send/recv, MoE all-to-all via group_start/end).
 │   ├── kv_quant.rs      — KV quant state/dispatch
